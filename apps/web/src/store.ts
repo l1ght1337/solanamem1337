@@ -51,54 +51,95 @@ const b58 = (s: string) => s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/)?.[0] || null
 const MEMO_PROGRAM_ID = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr')
 
 // ——— PumpPortal helpers ———
+// ——— PumpPortal helpers (через бэкенд) ———
+const API_BASE = ((import.meta.env as any).VITE_API_BASE || '').replace(/\/+$/, ''); // например: https://<worker>.workers.dev
+// приоритет источников: 1) твой воркер (/x/pump), 2) заданный VITE_PUMP_API, 3) прямой pumpportal
 const PUMP_BASES = [
-  (import.meta.env as any).VITE_PUMP_API || 'https://pumpportal.fun',
-  '/x/pump'
-];
-async function fetchFirstOk(path: string, init: RequestInit) {
+  API_BASE ? `${API_BASE}/x/pump` : '',                                // твой бекенд
+  ((import.meta.env as any).VITE_PUMP_API || '').replace(/\/+$/, ''),  // если явно задан
+  'https://pumpportal.fun'                                             // запасной
+].filter(Boolean);
+
+// общий fetch с таймаутом
+function withTimeout<T>(p: Promise<T>, ms = 10_000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('fetch timeout')), ms);
+    p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
+}
+
+// пробуем последовательно несколько баз с ретраями
+async function fetchFirstOk(path: string, init: RequestInit, retries = 2) {
   let lastErr: any;
   for (const base of PUMP_BASES) {
-    try {
-      const url = `${base.replace(/\/$/,'')}${path}`;
-      const r = await fetch(url, init);
-      if (r.ok) return r;
-    } catch (e) { lastErr = e }
+    const url = `${base.replace(/\/$/,'')}${path}`;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const r = await withTimeout(fetch(url, init), 12_000);
+        if (r.ok) return r;
+        // если 4xx/5xx, читаем тело для дебага и пробуем следующий base
+        const txt = await r.text().catch(()=>'');
+        lastErr = new Error(`${r.status} ${r.statusText}: ${txt || url}`);
+        break; // переходим к следующей базе
+      } catch (e) {
+        lastErr = e;
+        // небольшая пауза между ретраями на этой же базе
+        await new Promise(res => setTimeout(res, 300 + attempt * 300));
+      }
+    }
   }
   throw lastErr || new Error('All pump endpoints failed');
 }
+
+// POST /api/trade-local -> VersionedTransaction (Uint8Array)
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
   const res = await fetchFirstOk('/api/trade-local', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
   const raw = new Uint8Array(await res.arrayBuffer());
   return VersionedTransaction.deserialize(raw);
 }
+
+// Создание токена: пробуем разные пути, т.к. инсталляции PumpPortal отличаются
 async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransaction, mint?: string }> {
   const paths = ['/api/create-token-local', '/api/create-token', '/api/create'];
   let lastErr: any;
   for (const p of paths) {
     try {
       const r = await fetchFirstOk(p, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
       });
       const ct = r.headers.get('content-type') || '';
-      if (ct.includes('application/json')) {
-        const j = await r.json();
-        if (j?.serializedTransaction) {
-          const raw = Uint8Array.from(atob(j.serializedTransaction), c => c.charCodeAt(0));
-          return { tx: VersionedTransaction.deserialize(raw), mint: j.mint || j.token || j.tokenAddress };
-        }
-        if (j?.mint && j?.tx) {
-          const raw = Uint8Array.from(atob(j.tx), c => c.charCodeAt(0));
-          return { tx: VersionedTransaction.deserialize(raw), mint: j.mint };
-        }
+
+      // 1) чистый vtx бинарём
+      if (!ct.includes('application/json')) {
+        const raw = new Uint8Array(await r.arrayBuffer());
+        return { tx: VersionedTransaction.deserialize(raw) };
       }
-      const raw = new Uint8Array(await r.arrayBuffer());
-      return { tx: VersionedTransaction.deserialize(raw) };
-    } catch (e) { lastErr = e }
+
+      // 2) JSON-варианты
+      const j = await r.json();
+      if (j?.serializedTransaction) {
+        const raw = Uint8Array.from(atob(j.serializedTransaction), c => c.charCodeAt(0));
+        return { tx: VersionedTransaction.deserialize(raw), mint: j.mint || j.token || j.tokenAddress };
+      }
+      if (j?.mint && j?.tx) {
+        const raw = Uint8Array.from(atob(j.tx), c => c.charCodeAt(0));
+        return { tx: VersionedTransaction.deserialize(raw), mint: j.mint };
+      }
+
+      lastErr = new Error('Unknown create-token response format');
+    } catch (e) {
+      lastErr = e;
+    }
   }
   throw lastErr || new Error('Pump create endpoint failed');
 }
+
 
 // ==== helper: создать ATA кошелька (комиссию платит сам кошелёк через Phantom)
 async function ensureWalletAta(connection: Connection, walletPubkey: string, mint: string) {
