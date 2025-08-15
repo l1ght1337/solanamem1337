@@ -1,15 +1,27 @@
-name = "meme-backend-01"
-main = "src/worker.ts"
-compatibility_date = "2025-08-15"
-workers_dev = true
+name = "meme-bundler-backend"
+main = "src/index.ts"
+compatibility_date = "2024-08-15"
+node_compat = true
 
-# Привяжем публичные роуты к твоему домену (можешь оставить только те, что нужны)
-routes = [
-  { pattern = "app.cryptolaunchbot.uk/rpc*",    zone_name = "cryptolaunchbot.uk" },
-  { pattern = "app.cryptolaunchbot.uk/x/pump*", zone_name = "cryptolaunchbot.uk" }
-]
+# если используешь Pages → можно как standalone worker (Pages Functions не нужен)
+# если хочешь поддомены типа api.cryptolaunchbot.uk — привяжи route ниже
 
-# Если нужно хранить ключи/состояние — создадим KV и укажем тут ID
-# kv_namespaces = [
-#   { binding = "KEYS", id = "XXXXXXXX", preview_id = "YYYYYYYY" }
-# ]
+[vars]
+RPC_PRIMARY = "https://app.cryptolaunchbot.uk/rpc"         # можно сразу твой QuickNode
+RPC_FALLBACK = "https://api.mainnet-beta.solana.com"
+PUMP_BASE = "https://pumpportal.fun"                       # базовый PumpPortal
+CORS_ORIGINS = "https://app.cryptolaunchbot.uk,https://solanamem1337.pages.dev"
+
+# Durable Object (бот-менеджер)
+[[durable_objects.bindings]]
+name = "BOT_MANAGER"
+class_name = "BotManager"
+
+# Хранилище Durable Object
+[[migrations]]
+tag = "v1"
+new_classes = ["BotManager"]
+
+# Если хочешь привязать воркер к домену (Workers Routes)
+# [routes]
+# patterns = ["api.cryptolaunchbot.uk/*"]
