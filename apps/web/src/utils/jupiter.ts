@@ -1,0 +1,89 @@
+import { Connection, VersionedTransaction, Keypair } from '@solana/web3.js'
+
+export const WSOL = 'So11111111111111111111111111111111111111112'
+
+export type JupQuote = {
+  inputMint: string
+  outputMint: string
+  inAmount: string
+  outAmount: string
+  otherAmountThreshold: string
+  priceImpactPct?: number
+  routePlan?: any[]
+}
+
+async function jupFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const r = await fetch(url, init)
+  if (!r.ok) throw new Error(`Jupiter HTTP ${r.status}`)
+  return r.json() as Promise<T>
+}
+
+export async function getJupiterQuote(opts: {
+  inputMint: string
+  outputMint: string
+  amount: number // input units (lamports for SOL / raw amount for SPL)
+  onlyDirectRoutes?: boolean
+}): Promise<JupQuote> {
+  const { inputMint, outputMint, amount, onlyDirectRoutes } = opts
+  const u =
+    `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}` +
+    `&outputMint=${outputMint}` +
+    `&amount=${amount}` +
+    `&slippageBps=50` +
+    (onlyDirectRoutes ? `&onlyDirectRoutes=true` : '')
+  return jupFetch<JupQuote>(u)
+}
+
+export async function swapFromQuoteWithKeypair(opts: {
+  connection: Connection
+  keypair: Keypair
+  quote: JupQuote
+  slippageBps: number
+  wrapAndUnwrapSol?: boolean
+}): Promise<string> {
+  const { connection, keypair, quote, slippageBps, wrapAndUnwrapSol } = opts
+  const body = {
+    quoteResponse: quote,
+    userPublicKey: keypair.publicKey.toBase58(),
+    slippageBps,
+    wrapAndUnwrapSol: wrapAndUnwrapSol ?? true,
+    dynamicComputeUnitLimit: true,
+  }
+  const swapRes = await jupFetch<any>('https://quote-api.jup.ag/v6/swap', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const tx = VersionedTransaction.deserialize(Buffer.from(swapRes.swapTransaction, 'base64'))
+  tx.sign([keypair])
+  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 })
+  return sig
+}
+
+// Smart: подбираем slippage по impact и делаем swap
+export async function jupiterSmartSwapWithKeypair(opts: {
+  keypair: Keypair
+  connection: Connection
+  inputMint: string
+  outputMint: string
+  amount: number
+  baseSlippageBps: number
+  maxSlippageBps: number
+  alpha?: number        // множитель к impact (default 1.2)
+  minExtraBps?: number  // минимальная надбавка (default 10 bps)
+}) {
+  const {
+    keypair, connection, inputMint, outputMint, amount,
+    baseSlippageBps, maxSlippageBps, alpha = 1.2, minExtraBps = 10,
+  } = opts
+
+  const quote = await getJupiterQuote({ inputMint, outputMint, amount })
+  const impactPct = Number(quote.priceImpactPct ?? 0) // напр. 0.004 = 0.4%
+  const extraBps = Math.max(minExtraBps, Math.ceil(impactPct * 10000 * alpha))
+  const useBps = Math.min(maxSlippageBps, baseSlippageBps + extraBps)
+
+  const sig = await swapFromQuoteWithKeypair({
+    connection, keypair, quote, slippageBps: useBps, wrapAndUnwrapSol: true,
+  })
+  return { signature: sig, usedSlippageBps: useBps, priceImpactPct: impactPct }
+}

@@ -1,267 +1,380 @@
-import React, { useCallback, useMemo, useState } from 'react'
-import { clusterApiUrl, Connection, Keypair, PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js'
-import { 
-  TOKEN_PROGRAM_ID,
-  MINT_SIZE,
-  createInitializeMint2Instruction,
-  getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountInstruction,
-  createMintToInstruction,
-  getMinimumBalanceForRentExemptMint
-} from '@solana/spl-token'
-import { 
-  createCreateMetadataAccountV3Instruction,
-  PROGRAM_ID as TOKEN_METADATA_PROGRAM_ID
-} from '@metaplex-foundation/mpl-token-metadata'
+import "./polyfills"; // <— важно: полифилл до всего остального
 
-import {
-  ConnectionProvider,
-  WalletProvider,
-  useWallet
-} from '@solana/wallet-adapter-react'
-import {
-  WalletModalProvider,
-  WalletMultiButton
-} from '@solana/wallet-adapter-react-ui'
-import { PhantomWalletAdapter, SolflareWalletAdapter, SolletExtensionWalletAdapter, BackpackWalletAdapter, SolongWalletAdapter } from '@solana/wallet-adapter-wallets'
+import React, { useEffect, useMemo, useState } from 'react'
+import { useStore } from './store'
+import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from '@solana/web3.js'
+import CandleTV from './components/CandleTV'
 
-const DEFAULT_RPC = (import.meta as any).env?.VITE_RPC_URL || clusterApiUrl('devnet')
+declare global { interface Window { solana?: any } }
 
-function AppWrapper() {
-  const wallets = useMemo(() => [
-    new PhantomWalletAdapter(),
-    new SolflareWalletAdapter(),
-    new BackpackWalletAdapter(),
-    new SolongWalletAdapter(),
-    new SolletExtensionWalletAdapter(),
-  ], [])
+export default function App() {
+  const s = useStore()
 
-  return (
-    <ConnectionProvider endpoint={DEFAULT_RPC}>
-      <WalletProvider wallets={wallets} autoConnect>
-        <WalletModalProvider>
-          <App/>
-        </WalletModalProvider>
-      </WalletProvider>
-    </ConnectionProvider>
+  // RPC из .env (поддержка двух вариантов имен)
+  const rpcPrimary =
+    (import.meta.env as any).VITE_SOLANA_RPC_PRIMARY ??
+    (import.meta.env as any).VITE_RPC_PRIMARY
+  const rpcFallback =
+    (import.meta.env as any).VITE_SOLANA_RPC_FALLBACK_1 ??
+    (import.meta.env as any).VITE_RPC_FALLBACK
+
+  const rpcUrl = (rpcPrimary || rpcFallback || '') as string
+  const connection = useMemo(
+    () => (rpcUrl ? new Connection(rpcUrl, { commitment: 'processed' }) : undefined),
+    [rpcUrl]
   )
-}
 
-function App() {
-  return (
-    <div className="container">
-      <div className="header">
-        <h1>🧰 Solana Meme Bundler</h1>
-        <WalletMultiButton />
-      </div>
-      <div className="grid" style={{marginTop: 16}}>
-        <div className="card"><BundlerForm/></div>
-        <div className="card"><Logs/></div>
-      </div>
-      <p style={{opacity:.75, marginTop: 8}}>
-        Devnet only by default. Set <span className="kbd">VITE_RPC_URL</span> for a custom endpoint.
-      </p>
-    </div>
-  )
-}
+  // авто-тикеры
+  useEffect(() => {
+    if (!connection) return
+    const id  = setInterval(() => s.tickReal(), 5_000)
+    const id2 = setInterval(() => s.refreshBalances(connection), 5_000)
+    return () => { clearInterval(id); clearInterval(id2) }
+  }, [connection, s])
 
-type Log = { ts: string, level: 'info'|'ok'|'error', msg: string }
-const logQueue: Log[] = []
+  // Phantom
+  const [walletPubkey, setWalletPubkey] = useState<string>('')
+  const connectWallet = async () => {
+    const p = window.solana
+    if (!p || !p.isPhantom) { alert('Установите Phantom'); return }
+    const res = await p.connect()
+    setWalletPubkey(res.publicKey?.toString() || '')
+  }
+  const disconnectWallet = async () => { try { await window.solana?.disconnect() } catch {} ; setWalletPubkey('') }
 
-function log(level: Log['level'], msg: string) {
-  logQueue.push({ ts: new Date().toLocaleTimeString(), level, msg })
-  window.dispatchEvent(new CustomEvent('log-update'))
-}
+  const ensureConnection = () => {
+    if (!connection) { alert('RPC не задан в .env (VITE_*). Перезапустите dev-сервер после правок .env.'); return false }
+    return true
+  }
 
-function Logs() {
-  const [, setTick] = useState(0)
-  React.useEffect(() => {
-    const onUpd = () => setTick(t => t + 1)
-    window.addEventListener('log-update', onUpd)
-    return () => window.removeEventListener('log-update', onUpd)
-  }, [])
-  return (
-    <div>
-      <h3 style={{marginTop:0}}>📜 Logs</h3>
-      <div style={{maxHeight: 460, overflow: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace', fontSize: 13}}>
-        {logQueue.slice(-500).map((l, i) => (
-          <div key={i} style={{opacity: l.level==='info'?0.9:1, color: l.level==='ok' ? 'var(--success)' : l.level==='error' ? 'var(--danger)' : 'var(--text)'}}>
-            [{l.ts}] {l.msg}
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
+  // Массовое пополнение из кошелька
+  const [fundTotal, setFundTotal] = useState<number>(0)
+  const [warmAfterFund, setWarmAfterFund] = useState<boolean>(true)
 
-function BundlerForm() {
-  const wallet = useWallet()
-  const [name, setName] = useState('Meme Coin')
-  const [symbol, setSymbol] = useState('MEME')
-  const [decimals, setDecimals] = useState(6)
-  const [supply, setSupply] = useState(1_000_000)
-  const [uri, setUri] = useState('') // e.g. ipfs://... JSON with {name,symbol,description,image,attributes}
-  const [busy, setBusy] = useState(false)
-  const [mintPubkey, setMintPubkey] = useState<PublicKey | null>(null)
+  const fundAllEqually = async () => {
+    if (!ensureConnection()) return
+    if (!walletPubkey) { alert('Подключите кошелёк'); return }
+    const bots = s.bots
+    if (bots.length === 0) { alert('Нет ботов'); return }
+    if (fundTotal <= 0) { alert('Введите сумму'); return }
 
-  const connection = useMemo(() => new Connection(DEFAULT_RPC, 'confirmed'), [])
+    const perBot = fundTotal / bots.length
+    const fromPk = new PublicKey(walletPubkey)
 
-  const airdrop = useCallback(async () => {
-    if (!wallet.publicKey) return
-    log('info', 'Requesting airdrop of 1 SOL (devnet)...')
-    const sig = await connection.requestAirdrop(wallet.publicKey, 1 * LAMPORTS_PER_SOL)
-    await connection.confirmTransaction(sig, 'confirmed')
-    log('ok', 'Airdrop complete.')
-  }, [wallet.publicKey, connection])
+    for (let i=0;i<bots.length;i++) {
+      const b = bots[i]
+      const toPk = new PublicKey(b.pubkey)
+      const lamports = Math.ceil(perBot * LAMPORTS_PER_SOL)
 
-  const run = useCallback(async () => {
-    if (!wallet.publicKey || !wallet.signTransaction) {
-      log('error', 'Connect a wallet first.')
-      return
-    }
-    setBusy(true)
-    try {
-      const payer = wallet.publicKey
-      const mintKeypair = Keypair.generate()
-      log('info', `Generated mint keypair: ${mintKeypair.publicKey.toBase58()}`)
-
-      // 1) Create Mint account + initialize
-      const rent = await getMinimumBalanceForRentExemptMint(connection)
-      const tx1 = new Transaction()
-      tx1.add(SystemProgram.createAccount({
-        fromPubkey: payer,
-        newAccountPubkey: mintKeypair.publicKey,
-        lamports: rent,
-        space: MINT_SIZE,
-        programId: TOKEN_PROGRAM_ID
-      }))
-      tx1.add(createInitializeMint2Instruction(mintKeypair.publicKey, decimals, payer, payer, TOKEN_PROGRAM_ID))
-
-      tx1.feePayer = payer
-      const bh = await connection.getLatestBlockhash()
-      tx1.recentBlockhash = bh.blockhash
-      tx1.partialSign(mintKeypair)
-      const signedTx1 = await wallet.signTransaction(tx1)
-      const sig1 = await connection.sendRawTransaction(signedTx1.serialize(), { skipPreflight: false })
-      await connection.confirmTransaction({ signature: sig1, ...bh }, 'confirmed')
-      log('ok', `Mint created: ${mintKeypair.publicKey.toBase58()} | tx: ${sig1}`)
-
-      // 2) Create Metadata (optional but recommended)
-      if (uri && name && symbol) {
-        const [metadataPda] = PublicKey.findProgramAddressSync(
-          [Buffer.from('metadata'), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mintKeypair.publicKey.toBuffer()],
-          TOKEN_METADATA_PROGRAM_ID
-        )
-        const metadataIx = createCreateMetadataAccountV3Instruction({
-          metadata: metadataPda,
-          mint: mintKeypair.publicKey,
-          mintAuthority: payer,
-          payer,
-          updateAuthority: payer
-        }, {
-          createMetadataAccountArgsV3: {
-            data: {
-              name,
-              symbol,
-              uri,
-              sellerFeeBasisPoints: 0,
-              creators: null,
-              collection: null,
-              uses: null
-            },
-            isMutable: true,
-            collectionDetails: null
-          }
-        })
-
-        const tx2 = new Transaction().add(metadataIx)
-        tx2.feePayer = payer
-        const bh2 = await connection.getLatestBlockhash()
-        tx2.recentBlockhash = bh2.blockhash
-        const signedTx2 = await wallet.signTransaction(tx2)
-        const sig2 = await connection.sendRawTransaction(signedTx2.serialize(), { skipPreflight: false })
-        await connection.confirmTransaction({ signature: sig2, ...bh2 }, 'confirmed')
-        log('ok', `Metadata set | tx: ${sig2}`)
-      } else {
-        log('info', 'Metadata skipped (fill Name/Symbol/URI to enable).')
+      try {
+        const ix = SystemProgram.transfer({ fromPubkey: fromPk, toPubkey: toPk, lamports })
+        const tx = new Transaction().add(ix)
+        tx.feePayer = fromPk
+        tx.recentBlockhash = (await connection!.getLatestBlockhash()).blockhash
+        const signed = await window.solana.signTransaction(tx)
+        const sig = await connection!.sendRawTransaction(signed.serialize(), { skipPreflight: true })
+        await connection!.confirmTransaction(sig, 'confirmed')
+        s.addLog('ok', `Funded ${b.name}: ${(perBot).toFixed(6)} SOL (${sig})`)
+      } catch (e:any) {
+        s.addLog('err', `Funding error ${b.name}: ${e?.message || e}`)
       }
 
-      // 3) Create ATA for payer
-      const ata = getAssociatedTokenAddressSync(mintKeypair.publicKey, payer)
-      const ixATA = createAssociatedTokenAccountInstruction(payer, ata, payer, mintKeypair.publicKey)
-      const tx3 = new Transaction().add(ixATA)
-      tx3.feePayer = payer
-      const bh3 = await connection.getLatestBlockhash()
-      tx3.recentBlockhash = bh3.blockhash
-      const signedTx3 = await wallet.signTransaction(tx3)
-      const sig3 = await connection.sendRawTransaction(signedTx3.serialize(), { skipPreflight: false })
-      await connection.confirmTransaction({ signature: sig3, ...bh3 }, 'confirmed')
-      log('ok', `ATA created: ${ata.toBase58()} | tx: ${sig3}`)
-
-      // 4) Mint supply to payer
-      const amount = BigInt(Math.floor(supply)) * BigInt(10 ** decimals)
-      const ixMint = createMintToInstruction(mintKeypair.publicKey, ata, payer, Number(amount))
-      const tx4 = new Transaction().add(ixMint)
-      tx4.feePayer = payer
-      const bh4 = await connection.getLatestBlockhash()
-      tx4.recentBlockhash = bh4.blockhash
-      const signedTx4 = await wallet.signTransaction(tx4)
-      const sig4 = await connection.sendRawTransaction(signedTx4.serialize(), { skipPreflight: false })
-      await connection.confirmTransaction({ signature: sig4, ...bh4 }, 'confirmed')
-      log('ok', `Minted ${supply} tokens (decimals: ${decimals}) | tx: ${sig4}`)
-
-      setMintPubkey(mintKeypair.publicKey)
-      log('ok', 'Bundler complete ✅')
-    } catch (e: any) {
-      console.error(e)
-      log('error', e?.message || String(e))
-    } finally {
-      setBusy(false)
+      if (i < bots.length-1) await new Promise(r=>setTimeout(r, 30_000))
     }
-  }, [wallet.publicKey, wallet.signTransaction, connection, name, symbol, uri, decimals, supply])
+    await s.refreshBalances(connection!)
+
+    // автозапуск mainnet warm-up после пополнения (по чекбоксу)
+    if (warmAfterFund) {
+      await s.mainnetWarmupTransfers(connection!, { txPerBot: 30, lamports: 5_000, gapMs: 1200 })
+    }
+  }
+
+  const startBot = async (bId: string) => {
+    if (!ensureConnection()) return
+    await s.startBot(bId, connection!)
+  }
+
+  // MAINNET warm-up ручной запуск
+  const mainnetWarm = async () => {
+    if (!ensureConnection()) return
+    await s.mainnetWarmupTransfers(connection!, { txPerBot: 30, lamports: 5_000, gapMs: 1200 })
+  }
+
+  // Drain UI
+  const [drainTo, setDrainTo] = useState<'wallet'|'treasury'>('wallet')
+  const drainAll = async () => {
+    if (!ensureConnection()) return
+    let dest = ''
+    if (drainTo === 'wallet') {
+      if (!walletPubkey) { alert('Подключите кошелёк'); return }
+      dest = walletPubkey
+    } else {
+      const id = useStore.getState().treasuryKeyId
+      if (!id) { alert('Treasury не задан'); return }
+      try {
+        const { getKeypair } = await import('./utils/keyring')
+        dest = getKeypair(id).publicKey.toBase58()
+      } catch { alert('Не удалось получить адрес Treasury'); return }
+    }
+    await s.drainAllTo(connection!, dest)
+  }
+
+  // ===== Create on Pump.fun (новое) =====
+  const [cName, setCName] = useState('MyCoin')
+  const [cSymbol, setCSymbol] = useState('MYC')
+  const [cImage, setCImage] = useState('https://i.imgur.com/your.png')
+  const [cDesc,  setCDesc]  = useState('')
+  const [cDec,   setCDec]   = useState<number>(6)
+  const [cInitialBuy, setCInitialBuy] = useState<number>(0.02)
+
+  const createPump = async () => {
+    if (!ensureConnection()) return
+    if (!walletPubkey) { alert('Подключите Phantom — создание токена подписывается вашим кошельком'); return }
+    await s.createPumpToken(connection!, walletPubkey, {
+      name: cName.trim(),
+      symbol: cSymbol.trim(),
+      image: cImage.trim(),
+      description: cDesc.trim(),
+      decimals: cDec || 6,
+      initialBuySol: cInitialBuy || 0
+    })
+  }
 
   return (
-    <div>
-      <h3 style={{marginTop:0}}>🚀 Bundle</h3>
-      <div style={{display:'grid', gap:12}}>
-        <label>Token name
-          <input className="input" value={name} onChange={e=>setName(e.target.value)}/>
-        </label>
-        <label>Symbol
-          <input className="input" value={symbol} onChange={e=>setSymbol(e.target.value)}/>
-        </label>
-        <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:12}}>
-          <label>Decimals
-            <input className="input" type="number" min={0} max={9} value={decimals} onChange={e=>setDecimals(parseInt(e.target.value||'0'))}/>
-          </label>
-          <label>Supply (whole units)
-            <input className="input" type="number" min={0} value={supply} onChange={e=>setSupply(parseInt(e.target.value||'0'))}/>
-          </label>
+    <div style={{ padding: 16, color: '#e2e8f0', background: '#0b0e1a', minHeight: '100vh' }}>
+      {/* Header */}
+      <div style={header}>
+        <div style={{ display:'flex', gap:12, alignItems:'baseline', flexWrap:'wrap' }}>
+          <div style={{ fontWeight:700, fontSize:18 }}>Solana Meme Bundler — Real</div>
+          <div>Price <b>{s.price.toFixed(9)}</b> | Equity <b>{(s.bots.reduce((a,b)=>a+b.solBalance,0)).toFixed(3)} SOL</b></div>
+          {!rpcUrl && <span style={{ color:'#ffb86c' }}>RPC не задан в .env</span>}
         </div>
-        <label>Metadata URI (IPFS/Arweave JSON)
-          <input className="input" placeholder="ipfs://..." value={uri} onChange={e=>setUri(e.target.value)}/>
-        </label>
-        <div style={{display:'flex', gap:8, alignItems:'center'}}>
-          <button className="button" disabled={busy || !wallet.connected} onClick={run}>
-            {busy ? 'Running...' : 'Run Bundler'}
+        <div>
+          {!walletPubkey
+            ? <button onClick={connectWallet} style={btn}>Connect Phantom</button>
+            : <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+                <span>Wallet: {walletPubkey.slice(0,4)}…{walletPubkey.slice(-4)}</span>
+                <button onClick={disconnectWallet} style={btnSm}>Disconnect</button>
+              </div>
+          }
+        </div>
+      </div>
+
+      {/* Панель */}
+      <div style={{ marginTop:12, padding:12, border:'1px solid #283042', borderRadius:10, background:'#0f1325' }}>
+        <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+          <input
+            placeholder='Вставь ссылку BonkFun / LetsBonk (или mint)'
+            value={s.tokenUrl}
+            onChange={e=>s.setTokenUrl(e.target.value)}
+            style={inputWide}
+          />
+          <button onClick={()=>s.tickReal()} style={btn}>Refresh price</button>
+          <div style={{ opacity:.7 }}>{s.tokenMint ? `mint: ${s.tokenMint}` : 'mint не распознан'}</div>
+        </div>
+
+        {/* === Create Pump.fun === */}
+        <div style={{ marginTop:12, padding:10, border:'1px dashed #2a3350', borderRadius:10 }}>
+          <div style={{ fontWeight:600, marginBottom:8 }}>Create Pump.fun token + авто-покупка ботами</div>
+          <div style={row}>
+            <span>Name</span>
+            <input value={cName} onChange={e=>setCName(e.target.value)} style={{...input, width:160}}/>
+            <span>Symbol</span>
+            <input value={cSymbol} onChange={e=>setCSymbol(e.target.value)} style={{...input, width:120}}/>
+            <span>Image URL</span>
+            <input value={cImage} onChange={e=>setCImage(e.target.value)} style={{...input, width:260}}/>
+          </div>
+          <div style={row}>
+            <span>Desc</span>
+            <input value={cDesc} onChange={e=>setCDesc(e.target.value)} style={{...input, width:420}}/>
+            <span>Decimals</span>
+            <input type="number" value={cDec} onChange={e=>setCDec(+e.target.value)} style={{...input, width:80}}/>
+            <span>Initial buy (SOL)</span>
+            <input type="number" step="0.001" value={cInitialBuy} onChange={e=>setCInitialBuy(+e.target.value)} style={{...input, width:120}}/>
+            <button onClick={createPump} style={btn}>Create & Auto-buy</button>
+          </div>
+        </div>
+
+        {/* Random size / Slippage */}
+        <div style={row}>
+          <span>Slippage (bps)</span>
+          <input type="number" step="1" value={s.slippageBps} onChange={e=>useStore.setState({ slippageBps: Math.max(0, Number(e.target.value)||0) })} style={{ ...input, width:90 }} />
+          <label style={toggle}><input type="checkbox" checked={s.useRandomSize} onChange={e=>useStore.setState({ useRandomSize: e.target.checked })}/> Random trade size</label>
+          <span>min</span>
+          <input type="number" step="0.001" value={s.tradeRange.minSol} onChange={e=>useStore.setState({ tradeRange:{...s.tradeRange, minSol:Number(e.target.value)||0} })} style={{ ...input, width:90 }} />
+          <span>max</span>
+          <input type="number" step="0.001" value={s.tradeRange.maxSol} onChange={e=>useStore.setState({ tradeRange:{...s.tradeRange, maxSol:Number(e.target.value)||0} })} style={{ ...input, width:90 }} />
+        </div>
+
+        {/* Smart-MM */}
+        <div style={row}>
+          <label style={toggle}><input type="checkbox" checked={s.smartMM.enabled} onChange={e=>useStore.setState({ smartMM:{...s.smartMM, enabled: e.target.checked} })}/> Smart-MM</label>
+          <span>minBps</span>
+          <input type="number" value={s.smartMM.minBps} onChange={e=>useStore.setState({ smartMM:{...s.smartMM, minBps:+e.target.value} })} style={{ ...input, width:80 }}/>
+          <span>maxBps</span>
+          <input type="number" value={s.smartMM.maxBps} onChange={e=>useStore.setState({ smartMM:{...s.smartMM, maxBps:+e.target.value} })} style={{ ...input, width:80 }}/>
+          <span>α</span>
+          <input type="number" step="0.05" value={s.smartMM.alpha} onChange={e=>useStore.setState({ smartMM:{...s.smartMM, alpha:+e.target.value} })} style={{ ...input, width:80 }}/>
+          <span>TWAP</span>
+          <input type="number" value={s.smartMM.twapSec} onChange={e=>useStore.setState({ smartMM:{...s.smartMM, twapSec:+e.target.value} })} style={{ ...input, width:80 }}/>
+          <span>slices</span>
+          <input type="number" value={s.smartMM.twapSlices} onChange={e=>useStore.setState({ smartMM:{...s.smartMM, twapSlices:+e.target.value} })} style={{ ...input, width:80 }}/>
+          <span style={{ opacity:.75 }}>now bps: {s.getSmartBps()}</span>
+        </div>
+
+        {/* Комиссионный резерв / Treasury */}
+        <div style={row}>
+          <label style={toggle}><input type="checkbox" checked={s.autoTopUp} onChange={e=>useStore.setState({ autoTopUp: e.target.checked })}/> Auto top-up</label>
+          <span>Min fee (SOL)</span>
+          <input type="number" step="0.001" value={s.minFeeSol} onChange={e=>useStore.setState({ minFeeSol: Math.max(0,+e.target.value||0) })} style={{ ...input, width:90 }}/>
+          <span>Top-up to</span>
+          <input type="number" step="0.001" value={s.topUpToSol} onChange={e=>useStore.setState({ topUpToSol: Math.max(0,+e.target.value||0) })} style={{ ...input, width:90 }}/>
+          <TreasurySetter />
+        </div>
+
+        {/* FUND / DRAIN / WARM-UP */}
+        <div style={row}>
+          <span>Fund total (SOL)</span>
+          <input type="number" step="0.001" value={fundTotal} onChange={e=>setFundTotal(+e.target.value)} style={{ ...input, width:120 }}/>
+          <button onClick={fundAllEqually} style={btn}>Fund equally (30s gap)</button>
+
+          <label style={{ ...toggle, marginLeft: 8 }}>
+            <input type="checkbox" checked={warmAfterFund} onChange={e=>setWarmAfterFund(e.target.checked)} />
+            Warm-up after fund (mainnet)
+          </label>
+          <button onClick={mainnetWarm} style={btn}>Mainnet warm-up (30 tx/bot)</button>
+        </div>
+
+        <div style={row}>
+          <span>Drain keep (SOL)</span>
+          <input type="number" step="0.001" value={s.drainMinKeepSol} onChange={e=>useStore.setState({ drainMinKeepSol: Math.max(0, +e.target.value||0) })} style={{ ...input, width:110 }}/>
+          <label style={toggle}><input type="radio" name="drainTo" checked={drainTo==='wallet'} onChange={()=>setDrainTo('wallet')}/> to Wallet</label>
+          <label style={toggle}><input type="radio" name="drainTo" checked={drainTo==='treasury'} onChange={()=>setDrainTo('treasury')}/> to Treasury</label>
+          <button onClick={drainAll} style={btn}>Drain ALL (30s gap)</button>
+        </div>
+
+        {/* SELL ALL */}
+        <div style={row}>
+          <button
+            onClick={async () => {
+              if (!ensureConnection()) return
+              if (!walletPubkey) { alert('Подключите Phantom'); return }
+              await s.sellAllToWalletOnPump(connection!, walletPubkey)
+            }}
+            style={btn}
+          >
+            Sell ALL via my wallet
           </button>
-          <button className="button" disabled={busy || !wallet.connected} onClick={airdrop}>Airdrop 1 SOL (devnet)</button>
+          <span style={{opacity:.75}}>Боты переведут токены на твой кошелёк и кошелёк продаст всё разом</span>
         </div>
-        {mintPubkey && (
-          <div className="card" style={{marginTop:8}}>
-            <div><strong>Mint:</strong> {mintPubkey.toBase58()}</div>
-            <div style={{opacity:.8}}>Добавьте в Phantom через "Manage Token -> Add Token" по адресу.</div>
-          </div>
-        )}
-        <div className="card" style={{marginTop:8}}>
-          <div style={{opacity:.8}}>
-            Примечание: создание пула ликвидности (Raydium/иное) не входит в этот минимальный бандлер.
-            Сначала создайте токен и пополните кошелёк; затем добавляйте ликвидность через выбранную платформу.
-          </div>
+
+        {/* Глобальные действия — видны всегда */}
+        <div style={row}>
+          <button onClick={()=>s.addBot()} style={btn}>Add bot</button>
+          <ImportBot />
+          <button onClick={()=>{ if (!ensureConnection()) return; s.startAll(connection!) }} style={btn}>Start ALL</button>
+          <button onClick={()=>s.stopAll()} style={btn}>Stop ALL</button>
         </div>
+      </div>
+
+      {/* График */}
+      <div style={{ marginTop:12, border:'1px solid #283042', borderRadius:10, overflow:'hidden' }}>
+        <CandleTV candles={s.candles} price={s.price} />
+      </div>
+
+      {/* Боты */}
+      {s.bots.map((b, idx) => (
+        <div key={b.id} style={{ marginTop:12, padding:10, border:'1px solid #283042', borderRadius:10, background:'#0f1325' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+            <div style={{ width:20 }}>{idx+1}</div>
+            <div>Addr:&nbsp;<code title={b.pubkey}>{b.pubkey.slice(0,4)}…{b.pubkey.slice(-4)}</code></div>
+            <button onClick={() => navigator.clipboard.writeText(b.pubkey)} style={btnSm}>Copy</button>
+
+            <select value={b.strategy} onChange={e=>s.updateBot(b.id,{strategy:e.target.value as any})} style={select}>
+              <option value="trend">trend</option>
+              <option value="revert">revert</option>
+              <option value="scalper">scalper</option>
+            </select>
+
+            <span>Budget (SOL)</span>
+            <input type="number" step="0.001" value={b.budgetSol} onChange={e=>s.updateBot(b.id, { budgetSol: +e.target.value })} style={{ ...input, width:90, opacity: s.useRandomSize ? .75 : 1 }}/>
+
+            <span>Speed (ms)</span>
+            <input type="number" step="100" value={b.speedMs} onChange={e=>s.updateBot(b.id, { speedMs: Math.max(200, +e.target.value||0) })} style={{ ...input, width:90 }}/>
+
+            <label style={toggle}><input type="checkbox" checked={b.aiEnabled} onChange={e=>s.updateBot(b.id, { aiEnabled: e.target.checked })}/> AI</label>
+            <label style={toggle}><input type="checkbox" checked={!!b.manualLock} onChange={e=>s.updateBot(b.id, { manualLock: e.target.checked })}/> Manual lock</label>
+
+            {!b.running
+              ? <button onClick={()=>startBot(b.id)} style={btn}>Start</button>
+              : <button onClick={()=>s.stopBot(b.id)} style={btnDanger}>Stop</button>
+            }
+            <button onClick={()=>alert(s.exportBotKey(b.id) || 'no key')} style={btnSm}>Export key</button>
+            <button onClick={()=>s.removeBot(b.id)} style={btnSm}>Remove</button>
+          </div>
+
+          <div style={{ marginTop:8, fontSize:13, opacity:.85 }}>
+            fills: {b.fills} &nbsp; |
+            &nbsp; avg: {b.avgSol.toFixed(9)} &nbsp; |
+            &nbsp; realized: <span style={{ color:'#23d18b' }}>{b.realized.toFixed(5)} SOL</span> &nbsp; |
+            &nbsp; unrlzd: <span style={{ color:'#23d18b' }}>{b.unrealized.toFixed(5)} SOL</span> &nbsp; |
+            &nbsp; SOL {b.solBalance.toFixed(4)} | TOK {b.tokenBalance.toFixed(3)} &nbsp; |
+            &nbsp; last: {b.last || 'hold'}
+          </div>
+
+          {b.solBalance < s.minFeeSol && (
+            <div style={{ marginTop:6, color:'#ffb86c' }}>
+              Внимание: на боте мало SOL (есть {b.solBalance.toFixed(6)}, минимум {s.minFeeSol}). {s.autoTopUp && s.treasuryKeyId ? 'Auto top-up включён.' : 'Включите auto top-up или пополните вручную.'}
+            </div>
+          )}
+        </div>
+      ))}
+
+      {/* Логи */}
+      <div style={{ marginTop:12, padding:10, border:'1px solid #283042', borderRadius:10, background:'#0f1325', maxHeight:260, overflow:'auto' }}>
+        <div style={{ fontWeight:700, marginBottom:8 }}>Logs</div>
+        <pre style={{ margin:0, whiteSpace:'pre-wrap' }}>
+          {s.log.map((l,i)=>`[${l.ts}] ${l.level.toUpperCase()} ${l.msg}`).join('\n')}
+        </pre>
       </div>
     </div>
   )
 }
 
-export default AppWrapper
+function TreasurySetter() {
+  const s = useStore()
+  const [name, setName] = useState('Treasury')
+  const [secret, setSecret] = useState('')
+  return (
+    <>
+      <input placeholder='Treasury name' value={name} onChange={e=>setName(e.target.value)} style={{ ...input, width:160 }}/>
+      <input placeholder='Treasury secret (base58/base64)' value={secret} onChange={e=>setSecret(e.target.value)} style={{ ...input, width:260 }}/>
+      <button onClick={()=>{ s.setTreasuryFromSecret(name.trim()||'Treasury', secret.trim()); setSecret('') }} style={btn}>Set Treasury</button>
+      <span style={{ opacity:.7 }}>{s.treasuryKeyId ? 'Treasury установлен' : 'Treasury не задан'}</span>
+    </>
+  )
+}
+
+function ImportBot() {
+  const s = useStore()
+  const [name, setName] = useState('ImportedBot')
+  const [secret, setSecret] = useState('')
+  return (
+    <>
+      <input placeholder='Bot name' value={name} onChange={e=>setName(e.target.value)} style={{ ...input, width:140 }} />
+      <input placeholder='Bot secret (base58/base64)' value={secret} onChange={e=>setSecret(e.target.value)} style={{ ...input, width:260 }} />
+      <button onClick={()=>{ s.importBotFromSecret(name, secret); setSecret('')} } style={btn}>Import key</button>
+    </>
+  )
+}
+
+/* styles */
+const header: React.CSSProperties    = { display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, flexWrap:'wrap' }
+const row: React.CSSProperties       = { display:'flex', gap:8, alignItems:'center', marginTop:10, flexWrap:'wrap' }
+const input: React.CSSProperties     = { background:'#0b0e1a', border:'1px solid #283042', color:'#e2e8f0', borderRadius:8, padding:'6px 10px' }
+const inputWide: React.CSSProperties = { ...input, width:420 }
+const btn: React.CSSProperties       = { background:'#1b5cff', color:'#fff', borderRadius:8, padding:'8px 12px', cursor:'pointer', border: '1px solid #1b5cff' }
+const btnSm: React.CSSProperties     = { ...btn, padding:'6px 10px' }
+const btnDanger: React.CSSProperties = { ...btn, background:'#e25454', border: '1px solid #e25454' }
+const select: React.CSSProperties    = { ...input }
+const toggle: React.CSSProperties    = { display:'flex', gap:6, alignItems:'center', background:'#0b0e1a', border:'1px solid #283042', padding:'6px 10px', borderRadius:8 }
