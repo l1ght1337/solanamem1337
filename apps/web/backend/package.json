@@ -1,16 +1,19 @@
 {
-  "name": "rpc-proxy-worker",
-  "private": true,
+  "name": "meme-bundler-backend",
   "version": "0.1.0",
+  "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.3",
+    "@solana/spl-token": "^0.4.9",
+    "buffer": "^6.0.3"
   },
   "devDependencies": {
-    "wrangler": "^3.67.0",
     "typescript": "^5.5.4",
-    "@cloudflare/workers-types": "^4.20240722.0"
+    "wrangler": "^3.65.0"
   }
 }
