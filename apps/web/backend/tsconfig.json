@@ -1,15 +1,12 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2020",
+    "lib": ["ES2020", "WebWorker"],
     "module": "ESNext",
-    "lib": ["ES2022", "WebWorker"],
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types"],
-    "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "verbatimModuleSyntax": true
+    "types": ["@cloudflare/workers-types"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src"]
 }
