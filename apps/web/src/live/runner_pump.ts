@@ -7,7 +7,7 @@ import {
 
 // Собираем tx через PumpPortal Local API и возвращаем десериализованный VersionedTransaction
 async function buildTradeTx(body: Record<string, any>): Promise<VersionedTransaction> {
-  const res = await fetch("https://pumpportal.fun/api/trade-local", {
+  const res = await fetch("/x/pump/api/trade-local", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -19,6 +19,7 @@ async function buildTradeTx(body: Record<string, any>): Promise<VersionedTransac
   const raw = new Uint8Array(await res.arrayBuffer());
   return VersionedTransaction.deserialize(raw);
 }
+
 
 type Cfg = {
   mint: string;
