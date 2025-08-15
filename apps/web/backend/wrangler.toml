@@ -1,0 +1,15 @@
+name = "meme-backend-01"
+main = "src/worker.ts"
+compatibility_date = "2025-08-15"
+workers_dev = true
+
+# Привяжем публичные роуты к твоему домену (можешь оставить только те, что нужны)
+routes = [
+  { pattern = "app.cryptolaunchbot.uk/rpc*",    zone_name = "cryptolaunchbot.uk" },
+  { pattern = "app.cryptolaunchbot.uk/x/pump*", zone_name = "cryptolaunchbot.uk" }
+]
+
+# Если нужно хранить ключи/состояние — создадим KV и укажем тут ID
+# kv_namespaces = [
+#   { binding = "KEYS", id = "XXXXXXXX", preview_id = "YYYYYYYY" }
+# ]
