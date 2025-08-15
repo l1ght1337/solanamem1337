@@ -40,6 +40,10 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/x\/dex/, ""),
       },
+       "/x/pump": { 
+         target: "https://pumpportal.fun", 
+         changeOrigin: true, 
+         rewrite: p => p.replace(/^\/x\/pump/, "") },
     },
     // На случай «дрожащей» FS в контейнере можно включить polling:
     // watch: { usePolling: true, interval: 1000 },
