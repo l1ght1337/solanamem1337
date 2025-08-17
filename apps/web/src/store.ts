@@ -1,6 +1,6 @@
 // apps/web/src/store.ts
 import "./polyfills";
-import { confirmSigHttp } from "./utils/confirm"; // <— добавлено
+import { confirmSigHttp } from "./utils/confirm";
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import {
@@ -16,7 +16,9 @@ import {
 import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
-  createTransferInstruction,
+  createTransferCheckedInstruction,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
 import { fetchExternalPrice } from "./store-price-feeds";
 import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./utils/keyring";
@@ -86,6 +88,7 @@ async function fetchFirstOk(path: string, init: RequestInit, retries = 2) {
   throw lastErr || new Error("All pump endpoints failed");
 }
 
+/* ---------- Local API (осталось как было) ---------- */
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
   const res = await fetchFirstOk("/api/trade-local", {
     method: "POST",
@@ -131,15 +134,81 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
   throw lastErr || new Error("Pump create endpoint failed");
 }
 
-/* ---------- helper: ensure ATA на кошельке (подписывает Phantom) ---------- */
+/* ---------- Lightning API: /api/ipfs + /api/trade?action=create ---------- */
+async function uploadIpfsMeta(params: {
+  name: string; symbol: string; image: string; description?: string; website?: string; twitter?: string;
+}) {
+  const r = await fetchFirstOk("/api/ipfs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: params.name,
+      symbol: params.symbol,
+      description: params.description || "",
+      image: params.image,
+      website: params.website || "",
+      twitter: params.twitter || "",
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  const uri = j?.uri || j?.ipfsUri || j?.metadataUri;
+  if (!uri) throw new Error("IPFS upload failed (no uri)");
+  return String(uri);
+}
+
+async function buildCreateViaLightning(args: {
+  name: string; symbol: string; image: string;
+  description?: string; website?: string; twitter?: string;
+  initialBuySol?: number; slippagePct?: number; priorityFeeSol?: number;
+}) {
+  const uri = await uploadIpfsMeta({
+    name: args.name,
+    symbol: args.symbol,
+    image: args.image,
+    description: args.description,
+    website: args.website,
+    twitter: args.twitter,
+  });
+
+  const payload = {
+    action: "create",
+    tokenMetadata: { name: args.name, symbol: args.symbol, uri },
+    denominatedInSol: "true",
+    amount: Number(args.initialBuySol || 0),
+    slippage: Number(args.slippagePct ?? 10),      // проценты
+    priorityFee: Number(args.priorityFeeSol ?? 0.00001),
+    pool: "pump",
+  };
+
+  const r = await fetchFirstOk("/api/trade", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  const j = await r.json().catch(() => ({}));
+  const mint = j?.mint || j?.token || j?.tokenAddress || j?.address;
+  const signature = j?.signature || j?.txSignature || j?.sig;
+  if (!mint) throw new Error("Lightning create: no mint in response");
+  return { mint: String(mint), signature: signature ? String(signature) : undefined };
+}
+
+/* ---------- helpers: token program & ATA ---------- */
+async function detectTokenProgram(connection: Connection, mint: PublicKey) {
+  const info = await connection.getAccountInfo(mint);
+  return info?.owner?.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+}
+
+/* ---------- ensure ATA (подписывает Phantom), учитывает Token-2022 ---------- */
 async function ensureWalletAta(connection: Connection, walletPubkey: string, mint: string) {
   const ph = (window as any).solana;
   const mintPk = new PublicKey(mint);
   const walletPk = new PublicKey(walletPubkey);
-  const ata = await getAssociatedTokenAddress(mintPk, walletPk, false);
+  const programId = await detectTokenProgram(connection, mintPk);
+  const ata = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
   const info = await connection.getAccountInfo(ata);
   if (info) return ata;
-  const ix = createAssociatedTokenAccountInstruction(walletPk, ata, walletPk, mintPk);
+  const ix = createAssociatedTokenAccountInstruction(walletPk, ata, walletPk, mintPk, programId);
   const { blockhash } = await connection.getLatestBlockhash();
   const tx = new Transaction({ feePayer: walletPk, recentBlockhash: blockhash }).add(ix);
   if (!ph?.signAndSendTransaction) throw new Error("Phantom не поддерживает signAndSendTransaction");
@@ -477,11 +546,12 @@ export const useStore = create<Store>()(
           if (get().warmupCfg.ensureATA) {
             try {
               const owner = new PublicKey(bot.pubkey);
-              const ata = await getAssociatedTokenAddress(mintPk, owner, false);
+              const programId = await detectTokenProgram(connection as Connection, mintPk);
+              const ata = await getAssociatedTokenAddress(mintPk, owner, false, programId);
               const info = await connection.getAccountInfo(ata);
               if (!info) {
                 const kp = getKeypair(bot.keyId);
-                const ix = createAssociatedTokenAccountInstruction(kp.publicKey, ata, owner, mintPk);
+                const ix = createAssociatedTokenAccountInstruction(kp.publicKey, ata, owner, mintPk, programId);
                 const { blockhash } = await connection.getLatestBlockhash("finalized");
                 const tx = new Transaction({ feePayer: kp.publicKey, recentBlockhash: blockhash }).add(ix);
                 tx.sign(kp);
@@ -690,6 +760,32 @@ export const useStore = create<Store>()(
 
       // === Pump: создать токен и автопокупка ===
       async createPumpToken(connection, creatorPubkey, params) {
+        // 1) Lightning
+        try {
+          const slippagePct = (get().getSmartBps() || 50) / 100; // bps → %
+          const { mint, signature } = await buildCreateViaLightning({
+            name: params.name,
+            symbol: params.symbol,
+            image: params.image,
+            description: params.description,
+            website: params.website,
+            twitter: params.twitter,
+            initialBuySol: params.initialBuySol || 0,
+            slippagePct,
+            priorityFeeSol: 0.00001,
+          });
+
+          get().addLog("ok", `Token created (Lightning): ${mint}${signature ? ` (${signature.slice(0,8)}…)` : ""}`);
+          set(s => ({ ...s, tokenUrl: mint, tokenMint: mint, external: { ...s.external, provider: "pumpportal" } }));
+
+          await get().buyAllBotsOnPump(connection, { keepFeeSol: Math.max(0.002, get().minFeeSol) });
+          await get().refreshBalances(connection);
+          return;
+        } catch (e: any) {
+          get().addLog("warn", `Lightning create failed → fallback to Local: ${e?.message || String(e)}`);
+        }
+
+        // 2) Local (фолбэк)
         try {
           const body = {
             publicKey: creatorPubkey,
@@ -712,7 +808,7 @@ export const useStore = create<Store>()(
 
           const tokenMint = mint || get().tokenMint;
           if (tokenMint) {
-            get().addLog("ok", `Token created: ${tokenMint} (${signature.slice(0,8)}…)`);
+            get().addLog("ok", `Token created (Local): ${tokenMint} (${signature.slice(0,8)}…)`);
             set(s => ({ ...s, tokenUrl: tokenMint, tokenMint: tokenMint, external: { ...s.external, provider: "pumpportal" } }));
           } else {
             get().addLog("warn", "Token created, но API не вернул mint — укажи адрес вручную");
@@ -773,12 +869,14 @@ export const useStore = create<Store>()(
         try { await ensureWalletAta(connection as Connection, walletPubkey, s.tokenMint); }
         catch (e) { s.addLog("warn", `Ensure wallet ATA: ${String((e as any)?.message||e)}`); }
 
+        const programId = await detectTokenProgram(connection as Connection, mintPk);
+
         for (let i = 0; i < s.bots.length; i++) {
           const b = s.bots[i];
           try {
             const kp = getKeypair(b.keyId);
-            const srcAta = await getAssociatedTokenAddress(mintPk, kp.publicKey, false);
-            const dstAta = await getAssociatedTokenAddress(mintPk, walletPk, false);
+            const srcAta = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, programId);
+            const dstAta = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
 
             const raw = await getSPLBalance(connection, b.pubkey, s.tokenMint);
             const amountRaw = BigInt(raw as any);
@@ -786,8 +884,8 @@ export const useStore = create<Store>()(
 
             const tx = new Transaction();
             const dstInfo = await connection.getAccountInfo(dstAta);
-            if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk));
-            tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw));
+            if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, programId));
+            tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId));
 
             const { blockhash } = await connection.getLatestBlockhash("finalized");
             tx.feePayer = kp.publicKey;
@@ -863,7 +961,7 @@ export const useStore = create<Store>()(
         } else {
           desired = noisy
             ? [{ type: "revert", share: 0.55 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.15 }]
-            : [{ type: "revert", share: 0.6 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.1 }];
+            : [{ type: "revert", share: 0.6 }, { type: "trend", share: 0.3 }, { type: "scalпер", share: 0.1 }];
         }
 
         const bots = [...s.bots];
