@@ -100,7 +100,13 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
 }
 
 async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransaction; mint?: string }> {
-  const paths = ["/api/create-token-local", "/api/create-token", "/api/create"];
+  const paths = [
+  "/api/create-token-local",
+  "/api/create-token",
+  "/api/trade-local" // добавили корректный локальный путь
+  // "/api/trade" — это lightning, там не VTX, поэтому сюда не добавляем
+];
+
   let lastErr: any;
   for (const p of paths) {
     try {
