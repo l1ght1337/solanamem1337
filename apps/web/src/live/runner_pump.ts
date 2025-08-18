@@ -1,39 +1,29 @@
 // apps/web/src/live/runner_pump.ts
-import {
-  Connection,
-  VersionedTransaction,
-  PublicKey,
-  Keypair,
-} from '@solana/web3.js';
-import { getAssociatedTokenAddress } from '@solana/spl-token';
+import { Connection, VersionedTransaction, PublicKey, Keypair } from '@solana/web3.js';
 
 type Level = 'info' | 'ok' | 'warn' | 'err';
 
 type RunOpts = {
   mint: string;
-  slippageBps: () => number;               // bps → например 50 = 0.5%
+  slippageBps: () => number;               // bps, напр. 50 = 0.5%
   twap?: { slices: number; gapMs: number } | null;
-  price: () => number;                      // текущая цена из стора
-  change1m: () => number;                   // дельта за минуту (−0.01 … +0.01)
+  price: () => number;
+  change1m: () => number;                   // -0.01 … +0.01
   keypair: () => Keypair;                   // ключ бота
-  tokenDecimals: () => number;              // decimals токена (если не знаем — 9)
-  tradeSize: () => number;                  // сколько SOL тратить за 1 сделку
-  onLog: (lvl: Level, msg: string) => void; // логгер из стора
-  onUpdate: (bot: any) => void;             // обновляет бота в сторе
+  tokenDecimals: () => number;              // если не знаем — 9
+  tradeSize: () => number;                  // сколько SOL тратить за сделку
+  onLog: (lvl: Level, msg: string) => void;
+  onUpdate: (bot: any) => void;
 };
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-/** Аккуратно формируем базу для pump API.
- *  Если задан VITE_API_BASE (ваш воркер), добавляем /x/pump.
- *  Иначе идём напрямую на https://pumpportal.fun
- */
+/** Базовые адреса: ваш воркер (VITE_API_BASE) → /x/pump, иначе прямой pumpportal.fun */
 function getPumpBases(): string[] {
   const envBase = (import.meta as any)?.env?.VITE_API_BASE || '';
-  let base = (envBase as string).trim().replace(/\/+$/, '');
+  let base = String(envBase || '').trim().replace(/\/+$/, '');
   if (base && !/\/x\/pump$/i.test(base)) base += '/x/pump';
   const list = [base, 'https://pumpportal.fun'].filter(Boolean);
-  // uniqueness
   return [...new Set(list)];
 }
 
@@ -44,6 +34,7 @@ async function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
   });
 }
 
+/** Строим VTX через /api/trade-local (воркер или pump.fun). Возвращаем десериализованный VTX. */
 async function buildTradeVtx(body: any): Promise<VersionedTransaction> {
   const bases = getPumpBases();
   let lastErr: any;
@@ -74,60 +65,49 @@ async function buildTradeVtx(body: any): Promise<VersionedTransaction> {
   throw lastErr || new Error('trade-local failed on all bases');
 }
 
-async function sendVtx(
-  connection: Connection,
-  kp: Keypair,
-  vtx: VersionedTransaction,
-): Promise<string> {
+async function sendVtx(connection: Connection, kp: Keypair, vtx: VersionedTransaction): Promise<string> {
   vtx.sign([kp]);
   const sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
   await connection.confirmTransaction(sig, 'confirmed');
   return sig;
 }
 
+/** Узнаём uiAmount токена без spl-token: parsed accounts по mint. */
 async function getTokenUiBalance(
   connection: Connection,
   owner: PublicKey,
-  mint: PublicKey,
+  mint: PublicKey
 ): Promise<number> {
   try {
-    const ata = await getAssociatedTokenAddress(mint, owner, false);
-    const bal = await connection.getTokenAccountBalance(ata, 'processed');
-    return Number(bal?.value?.uiAmount ?? 0);
-  } catch {
-    return 0;
-  }
+    const r = await connection.getParsedTokenAccountsByOwner(owner, { mint }, 'processed');
+    const it = r.value?.[0]?.account?.data as any;
+    const ui = Number(it?.parsed?.info?.tokenAmount?.uiAmount ?? 0);
+    return isFinite(ui) ? ui : 0;
+  } catch { return 0; }
 }
 
-/** Простая логика принятия решения:
- *  - trend: покупаем на росте, продаём при развороте/профите
- *  - revert: покупаем на сильной просадке, продаём на отскоке
- *  - scalper: быстро покупаем и фиксируем мелкую прибыль
- */
-function decideAction(bot: any, change1m: number, price: number) {
-  const p = price;
-  const ch = change1m;
-  const strat = (bot.strategy || 'trend') as 'trend'|'revert'|'scalper';
-
-  // пороги — не агрессивные, чтобы не спамить
+/** Простое принятие решения */
+function decideAction(bot: any, change1m: number) {
+  const strat = (bot.strategy || 'trend') as 'trend' | 'revert' | 'scalper';
+  // Пороги умеренные, без спама
   const BUY  = { trend: +0.004, revert: -0.006, scalper: +0.0015 } as const;
   const SELL = { trend: -0.003, revert: +0.004, scalper: +0.0008 } as const;
 
+  if (!isFinite(change1m)) return 'hold';
+
   if (strat === 'revert') {
-    if (ch <= BUY.revert)  return 'buy';
-    if (ch >= SELL.revert) return 'sell';
+    if (change1m <= BUY.revert)  return 'buy';
+    if (change1m >= SELL.revert) return 'sell';
     return 'hold';
   }
-
   if (strat === 'scalper') {
-    if (ch >= BUY.scalper)  return 'buy';
-    if (ch <= -SELL.scalper) return 'sell';
+    if (change1m >= BUY.scalper)  return 'buy';
+    if (change1m <= -SELL.scalper) return 'sell';
     return 'hold';
   }
-
-  // trend (по умолчанию)
-  if (ch >= BUY.trend)  return 'buy';
-  if (ch <= SELL.trend) return 'sell';
+  // trend
+  if (change1m >= BUY.trend)  return 'buy';
+  if (change1m <= SELL.trend) return 'sell';
   return 'hold';
 }
 
@@ -155,7 +135,7 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
 
       const price = Number(opts.price() || 0);
       const ch1m  = Number(opts.change1m() || 0);
-      const action = decideAction(bot, ch1m, price);
+      const action = decideAction(bot, ch1m);
 
       if (action === 'hold') {
         opts.onUpdate({ ...bot, last: 'hold' });
@@ -165,7 +145,7 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
 
       const kp = opts.keypair();
       const mintPk = new PublicKey(opts.mint);
-      const slippagePct = Math.max(0, (opts.slippageBps() || 0) / 100); // bps → %
+      const slippagePct = Math.max(0, (opts.slippageBps() || 0) / 100);
 
       if (action === 'buy') {
         const baseSol = Math.max(0, +opts.tradeSize() || 0);
@@ -189,6 +169,7 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
           };
           const vtx = await buildTradeVtx(body);
           const sig = await sendVtx(connection, kp, vtx);
+
           bot.fills = (bot.fills || 0) + 1;
           bot.avgSol = bot.avgSol > 0 ? (bot.avgSol + price) / 2 : price;
           bot.last = `buy ${amountSol.toFixed(4)} SOL (${sig.slice(0,8)}…)`;
@@ -213,7 +194,6 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
       }
 
       if (action === 'sell') {
-        // возьмём текущий баланс токенов и продадим часть
         const uiBal = await getTokenUiBalance(connection, kp.publicKey, mintPk);
         if (uiBal <= 0) {
           opts.onLog('info', `Skip sell ${bot.name}: no tokens`);
@@ -222,7 +202,6 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
           return loop();
         }
 
-        // продаём 35% — консервативно
         const share = bot.strategy === 'scalper' ? 0.5 : 0.35;
         const dec = Math.max(0, Math.min(9, Number(opts.tokenDecimals() || 9)));
         const amountTok = +(uiBal * share).toFixed(Math.min(6, dec));
@@ -246,7 +225,6 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
         const sig = await sendVtx(connection, kp, vtx);
 
         bot.fills = (bot.fills || 0) + 1;
-        // приблизительно считаем реализованный результат по средней (не идеально, баланс уточнит refreshBalances)
         const pnl = amountTok * Math.max(0, price - (bot.avgSol || price));
         bot.realized = (bot.realized || 0) + pnl;
         bot.last = `sell ~${amountTok} TOK (${sig.slice(0,8)}…)`;
@@ -258,7 +236,6 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
         return loop();
       }
 
-      // запасной вариант
       await sleep(coolMs);
       return loop();
     } catch (e: any) {
@@ -271,10 +248,10 @@ export function runBot(connection: Connection, bot: any, opts: RunOpts) {
     }
   };
 
-  // стартуем
+  // старт
   loop();
 
-  // и возвращаем стоппер
+  // стоппер
   return () => { stopped = true; };
 }
 
