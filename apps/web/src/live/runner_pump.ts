@@ -2,304 +2,280 @@
 import {
   Connection,
   VersionedTransaction,
+  PublicKey,
   Keypair,
-} from "@solana/web3.js";
+} from '@solana/web3.js';
+import { getAssociatedTokenAddress } from '@solana/spl-token';
 
-/** ======= minimal fetch helpers (с фолбэком на воркер / прямой pump.fun) ======= */
-const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
-const PUMP_BASES = [
-  API_BASE ? `${API_BASE}/x/pump` : "",
-  ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, ""),
-  "https://pumpportal.fun",
-].filter(Boolean);
+type Level = 'info' | 'ok' | 'warn' | 'err';
 
-function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("fetch timeout")), ms);
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      }
-    );
-  });
-}
-
-async function fetchFirstOk(path: string, init: RequestInit, retries = 1) {
-  let lastErr: any;
-  for (const base of PUMP_BASES) {
-    const url = `${base.replace(/\/$/, "")}${path}`;
-    for (let a = 0; a <= retries; a++) {
-      try {
-        const r = await withTimeout(fetch(url, init), 12000);
-        if (r.ok) return r;
-        const txt = await r.text().catch(() => "");
-        lastErr = new Error(`${r.status} ${r.statusText}: ${txt || url}`);
-        break;
-      } catch (e) {
-        lastErr = e;
-        await new Promise((res) => setTimeout(res, 300 + a * 250));
-      }
-    }
-  }
-  throw lastErr || new Error("All pump endpoints failed");
-}
-
-async function buildTradeVtx(body: {
-  publicKey: string;
-  action: "buy" | "sell";
+type RunOpts = {
   mint: string;
-  denominatedInSol: "true" | "false";
-  amount: number;
-  slippage: number; // percent (например 0.5)
-  priorityFee: number;
-  pool: "auto" | "pump";
-}): Promise<VersionedTransaction> {
-  const res = await fetchFirstOk("/api/trade-local", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+  slippageBps: () => number;               // bps → например 50 = 0.5%
+  twap?: { slices: number; gapMs: number } | null;
+  price: () => number;                      // текущая цена из стора
+  change1m: () => number;                   // дельта за минуту (−0.01 … +0.01)
+  keypair: () => Keypair;                   // ключ бота
+  tokenDecimals: () => number;              // decimals токена (если не знаем — 9)
+  tradeSize: () => number;                  // сколько SOL тратить за 1 сделку
+  onLog: (lvl: Level, msg: string) => void; // логгер из стора
+  onUpdate: (bot: any) => void;             // обновляет бота в сторе
+};
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+/** Аккуратно формируем базу для pump API.
+ *  Если задан VITE_API_BASE (ваш воркер), добавляем /x/pump.
+ *  Иначе идём напрямую на https://pumpportal.fun
+ */
+function getPumpBases(): string[] {
+  const envBase = (import.meta as any)?.env?.VITE_API_BASE || '';
+  let base = (envBase as string).trim().replace(/\/+$/, '');
+  if (base && !/\/x\/pump$/i.test(base)) base += '/x/pump';
+  const list = [base, 'https://pumpportal.fun'].filter(Boolean);
+  // uniqueness
+  return [...new Set(list)];
+}
+
+async function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('fetch timeout')), ms);
+    p.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
   });
-
-  // Если апстрим отдал JSON-ошибку — бросаем понятную ошибку
-  const ct = res.headers.get("content-type") || "";
-  if (!res.ok && ct.includes("application/json")) {
-    const j = await res.json().catch(() => ({}));
-    throw new Error(j?.error || j?.message || "trade-local upstream error");
-  }
-
-  // pump.fun обычно отдаёт сырой бинарник VTX
-  const raw = new Uint8Array(await res.arrayBuffer());
-  return VersionedTransaction.deserialize(raw);
 }
 
-/** ======= простая логика принятия решений ======= */
-
-type LogFn = (lvl: "info" | "ok" | "warn" | "err", msg: string) => void;
-
-// подбираем долю продажи/покупки по стратегии и движению цены
-function decideAction(params: {
-  strategy: "trend" | "revert" | "scalper";
-  change1m: number; // относительное изменение за минуту
-  hasPosition: boolean;
-}):
-  | { type: "buy"; weight: number }   // weight в диапазоне 0..1 — доля от tradeSize()/position
-  | { type: "sell"; weight: number }
-  | { type: "hold" } {
-  const { strategy, change1m, hasPosition } = params;
-
-  // базовые триггеры
-  const up = change1m > 0.004;     // +0.4% за минуту
-  const down = change1m < -0.004;  // -0.4% за минуту
-
-  if (strategy === "trend") {
-    if (up) return { type: "buy", weight: 1 };
-    if (down && hasPosition) return { type: "sell", weight: 0.5 };
-    return { type: "hold" };
-  }
-
-  if (strategy === "revert") {
-    if (down) return { type: "buy", weight: 1 };
-    if (up && hasPosition) return { type: "sell", weight: 0.4 };
-    return { type: "hold" };
-  }
-
-  // scalper — мелкие сделки чаще
-  if (strategy === "scalper") {
-    if (Math.abs(change1m) < 0.002) {
-      return Math.random() < 0.6 ? { type: "buy", weight: 0.6 } : { type: "hold" };
-    }
-    if (up) return { type: "sell", weight: 0.5 };
-    if (down) return { type: "buy", weight: 0.7 };
-    return { type: "hold" };
-  }
-
-  return { type: "hold" };
-}
-
-// простая TP/SL логика: возвращает sell вес (0..1) или null
-function tpSlDecision(params: {
-  avgSol: number;
-  price: number;
-  hasPosition: boolean;
-}): number | null {
-  const { avgSol, price, hasPosition } = params;
-  if (!hasPosition || !avgSol || !price) return null;
-
-  const pnl = (price - avgSol) / Math.max(1e-9, avgSol);
-
-  // TP 4% — продать половину, 8% — продать 80%
-  if (pnl > 0.08) return 0.8;
-  if (pnl > 0.04) return 0.5;
-
-  // SL 4% — продать 40%
-  if (pnl < -0.04) return 0.4;
-
-  return null;
-}
-
-/** ======= основной раннер ======= */
-export function runBot(
-  connection: Connection,
-  bot: any, // тип упрощён, чтобы не тащить циклические импорты
-  ctx: {
-    mint: string;
-    slippageBps: () => number;
-    twap?: { slices: number; gapMs: number } | null;
-    price: () => number;
-    change1m: () => number;
-    keypair: () => Keypair;
-    tokenDecimals: () => number;
-    tradeSize: () => number; // желаемый размер сделки в SOL (для buy) или базовый объём для sell
-    onLog: LogFn;
-    onUpdate: (b: any) => void;
-  }
-) {
-  let stopped = false;
-  const kp = ctx.keypair();
-
-  const log = (lvl: "info" | "ok" | "warn" | "err", msg: string) =>
-    ctx.onLog(lvl, `${bot.name}: ${msg}`);
-
-  async function tradeOnce() {
-    if (stopped) return;
-
+async function buildTradeVtx(body: any): Promise<VersionedTransaction> {
+  const bases = getPumpBases();
+  let lastErr: any;
+  for (const b of bases) {
     try {
-      const price = ctx.price();
-      const ch1 = ctx.change1m();
+      const res = await withTimeout(fetch(`${b}/api/trade-local`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/octet-stream' },
+        body: JSON.stringify(body),
+      }), 15000);
 
-      // TP/SL имеет приоритет
-      const tpsl = tpSlDecision({
-        avgSol: Number(bot.avgSol || 0),
-        price,
-        hasPosition: (bot.tokenBalance || 0) > 0,
-      });
-
-      let decision:
-        | { type: "buy"; weight: number }
-        | { type: "sell"; weight: number }
-        | { type: "hold" } = { type: "hold" };
-
-      if (tpsl != null) {
-        decision = { type: "sell", weight: tpsl };
-      } else {
-        decision = decideAction({
-          strategy: bot.strategy as "trend" | "revert" | "scalper",
-          change1m: ch1,
-          hasPosition: (bot.tokenBalance || 0) > 0,
-        });
-      }
-
-      if (decision.type === "hold") {
-        bot.last = "hold";
-        ctx.onUpdate({ ...bot });
-        return;
-      }
-
-      // параметры сделки
-      const slipPct = Math.max(0, (ctx.slippageBps() || 50) / 100); // bps -> %
-      const priorityFee = 0.00001;
-
-      if (decision.type === "buy") {
-        // потратить часть от tradeSize, но не больше доступного SOL - небольшой резерв
-        const base = Math.max(0, ctx.tradeSize());
-        const spend = Math.max(
-          0,
-          Math.min(base * decision.weight, Math.max(0, (bot.solBalance || 0) - 0.001))
-        );
-
-        if (spend <= 0) {
-          bot.last = "hold";
-          ctx.onUpdate({ ...bot });
-          return;
+      if (!res.ok) {
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('application/json')) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j?.error || j?.message || `HTTP ${res.status}`);
+        } else {
+          const t = await res.text().catch(() => '');
+          throw new Error(`HTTP ${res.status} ${t || 'Bad Request'}`);
         }
-
-        const vtx = await buildTradeVtx({
-          publicKey: kp.publicKey.toBase58(),
-          action: "buy",
-          mint: ctx.mint,
-          denominatedInSol: "true",
-          amount: +spend.toFixed(6),
-          slippage: slipPct,
-          priorityFee,
-          pool: "auto",
-        });
-
-        vtx.sign([kp]);
-        const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
-        await connection.confirmTransaction(sig, "confirmed");
-
-        bot.fills = (bot.fills || 0) + 1;
-        bot.last = `buy ${spend.toFixed(4)} SOL`;
-        ctx.onUpdate({ ...bot });
-        log("ok", `buy ${spend.toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
-        return;
       }
-
-      if (decision.type === "sell") {
-        // продаём долю от текущего количества токенов
-        const posTok = Number(bot.tokenBalance || 0);
-        if (posTok <= 0) {
-          bot.last = "hold";
-          ctx.onUpdate({ ...bot });
-          return;
-        }
-
-        const sellTok = Math.max(0, +(posTok * decision.weight).toFixed(6));
-        if (sellTok <= 0) {
-          bot.last = "hold";
-          ctx.onUpdate({ ...bot });
-          return;
-        }
-
-        const vtx = await buildTradeVtx({
-          publicKey: kp.publicKey.toBase58(),
-          action: "sell",
-          mint: ctx.mint,
-          denominatedInSol: "false",
-          amount: sellTok, // в токенах
-          slippage: slipPct,
-          priorityFee,
-          pool: "auto",
-        });
-
-        vtx.sign([kp]);
-        const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
-        await connection.confirmTransaction(sig, "confirmed");
-
-        bot.fills = (bot.fills || 0) + 1;
-        bot.last = `sell ~${sellTok} TOK`;
-        ctx.onUpdate({ ...bot });
-        log("ok", `sell ~${sellTok} TOK (${sig.slice(0, 8)}…)`);
-        return;
-      }
-    } catch (e: any) {
-      const msg = e?.message || String(e);
-      bot.lastError = msg;
-      ctx.onUpdate({ ...bot });
-      log("warn", `trade error: ${msg}`);
+      const raw = new Uint8Array(await res.arrayBuffer());
+      return VersionedTransaction.deserialize(raw);
+    } catch (e) {
+      lastErr = e;
     }
   }
+  throw lastErr || new Error('trade-local failed on all bases');
+}
 
-  // основной цикл
-  let timer: any;
+async function sendVtx(
+  connection: Connection,
+  kp: Keypair,
+  vtx: VersionedTransaction,
+): Promise<string> {
+  vtx.sign([kp]);
+  const sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
+  await connection.confirmTransaction(sig, 'confirmed');
+  return sig;
+}
+
+async function getTokenUiBalance(
+  connection: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+): Promise<number> {
+  try {
+    const ata = await getAssociatedTokenAddress(mint, owner, false);
+    const bal = await connection.getTokenAccountBalance(ata, 'processed');
+    return Number(bal?.value?.uiAmount ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+/** Простая логика принятия решения:
+ *  - trend: покупаем на росте, продаём при развороте/профите
+ *  - revert: покупаем на сильной просадке, продаём на отскоке
+ *  - scalper: быстро покупаем и фиксируем мелкую прибыль
+ */
+function decideAction(bot: any, change1m: number, price: number) {
+  const p = price;
+  const ch = change1m;
+  const strat = (bot.strategy || 'trend') as 'trend'|'revert'|'scalper';
+
+  // пороги — не агрессивные, чтобы не спамить
+  const BUY  = { trend: +0.004, revert: -0.006, scalper: +0.0015 } as const;
+  const SELL = { trend: -0.003, revert: +0.004, scalper: +0.0008 } as const;
+
+  if (strat === 'revert') {
+    if (ch <= BUY.revert)  return 'buy';
+    if (ch >= SELL.revert) return 'sell';
+    return 'hold';
+  }
+
+  if (strat === 'scalper') {
+    if (ch >= BUY.scalper)  return 'buy';
+    if (ch <= -SELL.scalper) return 'sell';
+    return 'hold';
+  }
+
+  // trend (по умолчанию)
+  if (ch >= BUY.trend)  return 'buy';
+  if (ch <= SELL.trend) return 'sell';
+  return 'hold';
+}
+
+/** Основной раннер */
+export function runBot(connection: Connection, bot: any, opts: RunOpts) {
+  let stopped = false;
+  let lastTs = 0;
+  let coolMs = Math.max(800, Number(bot.speedMs) || 8000);
+
   const loop = async () => {
     if (stopped) return;
-    await tradeOnce();
-    if (stopped) return;
-    timer = setTimeout(loop, Math.max(500, Number(bot.speedMs) || 5000));
+    try {
+      if (!bot.aiEnabled) {
+        opts.onUpdate({ ...bot, last: 'hold' });
+        await sleep(coolMs);
+        return loop();
+      }
+
+      const now = Date.now();
+      if (now - lastTs < coolMs) {
+        await sleep(Math.max(200, coolMs - (now - lastTs)));
+        return loop();
+      }
+      lastTs = now;
+
+      const price = Number(opts.price() || 0);
+      const ch1m  = Number(opts.change1m() || 0);
+      const action = decideAction(bot, ch1m, price);
+
+      if (action === 'hold') {
+        opts.onUpdate({ ...bot, last: 'hold' });
+        await sleep(coolMs);
+        return loop();
+      }
+
+      const kp = opts.keypair();
+      const mintPk = new PublicKey(opts.mint);
+      const slippagePct = Math.max(0, (opts.slippageBps() || 0) / 100); // bps → %
+
+      if (action === 'buy') {
+        const baseSol = Math.max(0, +opts.tradeSize() || 0);
+        if (baseSol <= 0.0004) {
+          opts.onLog('info', `Skip buy ${bot.name}: tradeSize too small`);
+          opts.onUpdate({ ...bot, last: 'hold' });
+          await sleep(coolMs);
+          return loop();
+        }
+
+        const doBuy = async (amountSol: number) => {
+          const body = {
+            publicKey: kp.publicKey.toBase58(),
+            action: 'buy',
+            mint: mintPk.toBase58(),
+            denominatedInSol: 'true',
+            amount: amountSol,
+            slippage: slippagePct,
+            priorityFee: 0.00001,
+            pool: 'auto',
+          };
+          const vtx = await buildTradeVtx(body);
+          const sig = await sendVtx(connection, kp, vtx);
+          bot.fills = (bot.fills || 0) + 1;
+          bot.avgSol = bot.avgSol > 0 ? (bot.avgSol + price) / 2 : price;
+          bot.last = `buy ${amountSol.toFixed(4)} SOL (${sig.slice(0,8)}…)`;
+          opts.onLog('ok', `BUY ${bot.name}: ${amountSol.toFixed(6)} SOL @ ~${price.toFixed(9)} (${sig})`);
+          opts.onUpdate({ ...bot });
+        };
+
+        const plan = opts.twap;
+        if (plan && plan.slices > 1 && plan.gapMs > 200) {
+          const per = baseSol / plan.slices;
+          for (let i = 0; i < plan.slices; i++) {
+            if (stopped) break;
+            await doBuy(+per.toFixed(6));
+            if (i < plan.slices - 1) await sleep(plan.gapMs);
+          }
+        } else {
+          await doBuy(+baseSol.toFixed(6));
+        }
+
+        await sleep(coolMs);
+        return loop();
+      }
+
+      if (action === 'sell') {
+        // возьмём текущий баланс токенов и продадим часть
+        const uiBal = await getTokenUiBalance(connection, kp.publicKey, mintPk);
+        if (uiBal <= 0) {
+          opts.onLog('info', `Skip sell ${bot.name}: no tokens`);
+          opts.onUpdate({ ...bot, last: 'hold' });
+          await sleep(coolMs);
+          return loop();
+        }
+
+        // продаём 35% — консервативно
+        const share = bot.strategy === 'scalper' ? 0.5 : 0.35;
+        const dec = Math.max(0, Math.min(9, Number(opts.tokenDecimals() || 9)));
+        const amountTok = +(uiBal * share).toFixed(Math.min(6, dec));
+        if (amountTok <= 0) {
+          opts.onUpdate({ ...bot, last: 'hold' });
+          await sleep(coolMs);
+          return loop();
+        }
+
+        const body = {
+          publicKey: kp.publicKey.toBase58(),
+          action: 'sell',
+          mint: mintPk.toBase58(),
+          denominatedInSol: 'false',
+          amount: amountTok,
+          slippage: slippagePct,
+          priorityFee: 0.00001,
+          pool: 'auto',
+        };
+        const vtx = await buildTradeVtx(body);
+        const sig = await sendVtx(connection, kp, vtx);
+
+        bot.fills = (bot.fills || 0) + 1;
+        // приблизительно считаем реализованный результат по средней (не идеально, баланс уточнит refreshBalances)
+        const pnl = amountTok * Math.max(0, price - (bot.avgSol || price));
+        bot.realized = (bot.realized || 0) + pnl;
+        bot.last = `sell ~${amountTok} TOK (${sig.slice(0,8)}…)`;
+
+        opts.onLog('ok', `SELL ${bot.name}: ~${amountTok} TOK @ ~${price.toFixed(9)} (${sig})`);
+        opts.onUpdate({ ...bot });
+
+        await sleep(coolMs);
+        return loop();
+      }
+
+      // запасной вариант
+      await sleep(coolMs);
+      return loop();
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      opts.onLog('warn', `runner: ${msg}`);
+      bot.last = `err`;
+      opts.onUpdate({ ...bot });
+      await sleep(Math.max(1500, coolMs * 1.2));
+      return loop();
+    }
   };
 
-  // стратуем
+  // стартуем
   loop();
 
-  // возвращаем остановщик
-  return () => {
-    stopped = true;
-    try { clearTimeout(timer); } catch {}
-  };
+  // и возвращаем стоппер
+  return () => { stopped = true; };
 }
+
+export default runBot;
