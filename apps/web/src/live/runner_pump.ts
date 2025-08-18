@@ -1,25 +1,11 @@
 // apps/web/src/live/runner_pump.ts
-import { VersionedTransaction, PublicKey, Connection } from "@solana/web3.js";
-import { confirmSigHttp } from "../utils/confirm";
+import {
+  Connection,
+  VersionedTransaction,
+  Keypair,
+} from "@solana/web3.js";
 
-/** ============= минимальные настройки, можно подкрутить ============= */
-const CFG = {
-  // вход
-  minBuySol: 0.002,                 // меньше – не покупаем (пылинка)
-  coolDownMs: 7000,                 // пауза между сделками
-  // выход
-  takeProfitBps: 900,               // +9% — первая частичная фиксация
-  takeProfit2Bps: 1800,             // +18% — вторая частичная фиксация
-  trailBps: 350,                    // трейлинг от пика 3.5% (продажа всех)
-  stopLossBps: 800,                 // -8% от средней — стоп
-  scale1: 0.35,                     // сколько продать на TP1
-  scale2: 0.35,                     // сколько продать на TP2
-  minHoldMs: 25_000,                // минимум держим позицию (чтобы не «пилиться»)
-  priorityFee: 0.00001,             // SOL
-};
-/** =================================================================== */
-
-/** те же базисы, что и в store.ts */
+/** ======= minimal fetch helpers (с фолбэком на воркер / прямой pump.fun) ======= */
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const PUMP_BASES = [
   API_BASE ? `${API_BASE}/x/pump` : "",
@@ -27,10 +13,19 @@ const PUMP_BASES = [
   "https://pumpportal.fun",
 ].filter(Boolean);
 
-function withTimeout<T>(p: Promise<T>, ms = 12_000) {
-  return new Promise<T>((res, rej) => {
-    const t = setTimeout(() => rej(new Error("fetch timeout")), ms);
-    p.then(v => (clearTimeout(t), res(v)), e => (clearTimeout(t), rej(e)));
+function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("fetch timeout")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
   });
 }
 
@@ -38,206 +33,273 @@ async function fetchFirstOk(path: string, init: RequestInit, retries = 1) {
   let lastErr: any;
   for (const base of PUMP_BASES) {
     const url = `${base.replace(/\/$/, "")}${path}`;
-    for (let i = 0; i <= retries; i++) {
+    for (let a = 0; a <= retries; a++) {
       try {
-        const r = await withTimeout(fetch(url, init));
+        const r = await withTimeout(fetch(url, init), 12000);
         if (r.ok) return r;
-        lastErr = new Error(`${r.status} ${r.statusText}`);
+        const txt = await r.text().catch(() => "");
+        lastErr = new Error(`${r.status} ${r.statusText}: ${txt || url}`);
         break;
-      } catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 300)); }
+      } catch (e) {
+        lastErr = e;
+        await new Promise((res) => setTimeout(res, 300 + a * 250));
+      }
     }
   }
-  throw lastErr || new Error("pump endpoints failed");
+  throw lastErr || new Error("All pump endpoints failed");
 }
 
-async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
+async function buildTradeVtx(body: {
+  publicKey: string;
+  action: "buy" | "sell";
+  mint: string;
+  denominatedInSol: "true" | "false";
+  amount: number;
+  slippage: number; // percent (например 0.5)
+  priorityFee: number;
+  pool: "auto" | "pump";
+}): Promise<VersionedTransaction> {
   const res = await fetchFirstOk("/api/trade-local", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+
+  // Если апстрим отдал JSON-ошибку — бросаем понятную ошибку
+  const ct = res.headers.get("content-type") || "";
+  if (!res.ok && ct.includes("application/json")) {
+    const j = await res.json().catch(() => ({}));
+    throw new Error(j?.error || j?.message || "trade-local upstream error");
+  }
+
+  // pump.fun обычно отдаёт сырой бинарник VTX
   const raw = new Uint8Array(await res.arrayBuffer());
   return VersionedTransaction.deserialize(raw);
 }
 
-type Bot = {
-  id: string; name: string; pubkey: string; keyId: string;
+/** ======= простая логика принятия решений ======= */
+
+type LogFn = (lvl: "info" | "ok" | "warn" | "err", msg: string) => void;
+
+// подбираем долю продажи/покупки по стратегии и движению цены
+function decideAction(params: {
   strategy: "trend" | "revert" | "scalper";
-  budgetSol: number; speedMs: number; aiEnabled: boolean;
-  posToken: number; avgSol: number; last?: string;
-};
+  change1m: number; // относительное изменение за минуту
+  hasPosition: boolean;
+}):
+  | { type: "buy"; weight: number }   // weight в диапазоне 0..1 — доля от tradeSize()/position
+  | { type: "sell"; weight: number }
+  | { type: "hold" } {
+  const { strategy, change1m, hasPosition } = params;
 
-type Cfg = {
-  mint: string;
-  slippageBps: () => number;
-  price: () => number;
-  change1m: () => number;                  // твоя функция из store (разница цены за 1м)
-  tokenDecimals: () => number;
-  tradeSize: () => number;                 // если включён random-size — даст рандом, иначе budget
-  keypair: () => any;                      // Keypair бота
-  onLog: (lvl: "info" | "ok" | "warn" | "err", msg: string) => void;
-  onUpdate: (b: Partial<Bot> & { id: string }) => void;
-};
+  // базовые триггеры
+  const up = change1m > 0.004;     // +0.4% за минуту
+  const down = change1m < -0.004;  // -0.4% за минуту
 
-/** главный цикл: вернёт stop-функцию */
-export function runBot(connection: Connection, bot: Bot, cfg: Cfg) {
+  if (strategy === "trend") {
+    if (up) return { type: "buy", weight: 1 };
+    if (down && hasPosition) return { type: "sell", weight: 0.5 };
+    return { type: "hold" };
+  }
+
+  if (strategy === "revert") {
+    if (down) return { type: "buy", weight: 1 };
+    if (up && hasPosition) return { type: "sell", weight: 0.4 };
+    return { type: "hold" };
+  }
+
+  // scalper — мелкие сделки чаще
+  if (strategy === "scalper") {
+    if (Math.abs(change1m) < 0.002) {
+      return Math.random() < 0.6 ? { type: "buy", weight: 0.6 } : { type: "hold" };
+    }
+    if (up) return { type: "sell", weight: 0.5 };
+    if (down) return { type: "buy", weight: 0.7 };
+    return { type: "hold" };
+  }
+
+  return { type: "hold" };
+}
+
+// простая TP/SL логика: возвращает sell вес (0..1) или null
+function tpSlDecision(params: {
+  avgSol: number;
+  price: number;
+  hasPosition: boolean;
+}): number | null {
+  const { avgSol, price, hasPosition } = params;
+  if (!hasPosition || !avgSol || !price) return null;
+
+  const pnl = (price - avgSol) / Math.max(1e-9, avgSol);
+
+  // TP 4% — продать половину, 8% — продать 80%
+  if (pnl > 0.08) return 0.8;
+  if (pnl > 0.04) return 0.5;
+
+  // SL 4% — продать 40%
+  if (pnl < -0.04) return 0.4;
+
+  return null;
+}
+
+/** ======= основной раннер ======= */
+export function runBot(
+  connection: Connection,
+  bot: any, // тип упрощён, чтобы не тащить циклические импорты
+  ctx: {
+    mint: string;
+    slippageBps: () => number;
+    twap?: { slices: number; gapMs: number } | null;
+    price: () => number;
+    change1m: () => number;
+    keypair: () => Keypair;
+    tokenDecimals: () => number;
+    tradeSize: () => number; // желаемый размер сделки в SOL (для buy) или базовый объём для sell
+    onLog: LogFn;
+    onUpdate: (b: any) => void;
+  }
+) {
   let stopped = false;
+  const kp = ctx.keypair();
 
-  // состояние позиции (в раннере, чтобы продавать даже если store ещё не успел обновить)
-  let posTok = bot.posToken || 0;
-  let avgSol = bot.avgSol || 0;
-  let peak = 0;                 // локальный максимум цены после входа
-  let lastTrade = 0;
+  const log = (lvl: "info" | "ok" | "warn" | "err", msg: string) =>
+    ctx.onLog(lvl, `${bot.name}: ${msg}`);
 
-  const dec = cfg.tokenDecimals() ?? 9;
-  const mint = new PublicKey(cfg.mint);
-  const minTok = 1 / Math.pow(10, dec); // «пылинка» токена
+  async function tradeOnce() {
+    if (stopped) return;
 
-  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-  const now = () => Date.now();
-
-  async function buy(spendSol: number) {
-    if (spendSol < CFG.minBuySol) return false;
     try {
-      const kp = cfg.keypair();
-      const vtx = await buildTradeTxPumpLocal({
-        publicKey: kp.publicKey.toBase58(),
-        action: "buy",
-        mint: mint.toBase58(),
-        denominatedInSol: "true",
-        amount: +spendSol.toFixed(6),
-        slippage: (cfg.slippageBps() || 50) / 100,
-        priorityFee: CFG.priorityFee,
-        pool: "auto",
+      const price = ctx.price();
+      const ch1 = ctx.change1m();
+
+      // TP/SL имеет приоритет
+      const tpsl = tpSlDecision({
+        avgSol: Number(bot.avgSol || 0),
+        price,
+        hasPosition: (bot.tokenBalance || 0) > 0,
       });
-      vtx.sign([kp]);
-      const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
-      await confirmSigHttp(connection, sig);
 
-      const p = cfg.price();
-      // приблизим полученное кол-во (точный баланс подтянет refreshBalances)
-      const gotTok = Math.max(minTok, spendSol / Math.max(1e-12, p));
-      const newTok = posTok + gotTok;
-      avgSol = (avgSol * posTok + spendSol) / newTok;
-      posTok = newTok;
-      peak = Math.max(peak, p);
-      lastTrade = now();
+      let decision:
+        | { type: "buy"; weight: number }
+        | { type: "sell"; weight: number }
+        | { type: "hold" } = { type: "hold" };
 
-      cfg.onUpdate({ id: bot.id, posToken: posTok, avgSol, last: `buy ${spendSol.toFixed(4)} SOL` });
-      cfg.onLog("ok", `${bot.name}: BUY ${spendSol.toFixed(6)} SOL (${sig.slice(0,8)}…)`);
-      return true;
+      if (tpsl != null) {
+        decision = { type: "sell", weight: tpsl };
+      } else {
+        decision = decideAction({
+          strategy: bot.strategy as "trend" | "revert" | "scalper",
+          change1m: ch1,
+          hasPosition: (bot.tokenBalance || 0) > 0,
+        });
+      }
+
+      if (decision.type === "hold") {
+        bot.last = "hold";
+        ctx.onUpdate({ ...bot });
+        return;
+      }
+
+      // параметры сделки
+      const slipPct = Math.max(0, (ctx.slippageBps() || 50) / 100); // bps -> %
+      const priorityFee = 0.00001;
+
+      if (decision.type === "buy") {
+        // потратить часть от tradeSize, но не больше доступного SOL - небольшой резерв
+        const base = Math.max(0, ctx.tradeSize());
+        const spend = Math.max(
+          0,
+          Math.min(base * decision.weight, Math.max(0, (bot.solBalance || 0) - 0.001))
+        );
+
+        if (spend <= 0) {
+          bot.last = "hold";
+          ctx.onUpdate({ ...bot });
+          return;
+        }
+
+        const vtx = await buildTradeVtx({
+          publicKey: kp.publicKey.toBase58(),
+          action: "buy",
+          mint: ctx.mint,
+          denominatedInSol: "true",
+          amount: +spend.toFixed(6),
+          slippage: slipPct,
+          priorityFee,
+          pool: "auto",
+        });
+
+        vtx.sign([kp]);
+        const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
+        await connection.confirmTransaction(sig, "confirmed");
+
+        bot.fills = (bot.fills || 0) + 1;
+        bot.last = `buy ${spend.toFixed(4)} SOL`;
+        ctx.onUpdate({ ...bot });
+        log("ok", `buy ${spend.toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
+        return;
+      }
+
+      if (decision.type === "sell") {
+        // продаём долю от текущего количества токенов
+        const posTok = Number(bot.tokenBalance || 0);
+        if (posTok <= 0) {
+          bot.last = "hold";
+          ctx.onUpdate({ ...bot });
+          return;
+        }
+
+        const sellTok = Math.max(0, +(posTok * decision.weight).toFixed(6));
+        if (sellTok <= 0) {
+          bot.last = "hold";
+          ctx.onUpdate({ ...bot });
+          return;
+        }
+
+        const vtx = await buildTradeVtx({
+          publicKey: kp.publicKey.toBase58(),
+          action: "sell",
+          mint: ctx.mint,
+          denominatedInSol: "false",
+          amount: sellTok, // в токенах
+          slippage: slipPct,
+          priorityFee,
+          pool: "auto",
+        });
+
+        vtx.sign([kp]);
+        const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
+        await connection.confirmTransaction(sig, "confirmed");
+
+        bot.fills = (bot.fills || 0) + 1;
+        bot.last = `sell ~${sellTok} TOK`;
+        ctx.onUpdate({ ...bot });
+        log("ok", `sell ~${sellTok} TOK (${sig.slice(0, 8)}…)`);
+        return;
+      }
     } catch (e: any) {
-      cfg.onLog("warn", `${bot.name}: buy fail: ${e?.message || e}`);
-      return false;
+      const msg = e?.message || String(e);
+      bot.lastError = msg;
+      ctx.onUpdate({ ...bot });
+      log("warn", `trade error: ${msg}`);
     }
   }
 
-  async function sell(qTok: number, label: string) {
-    if (qTok <= minTok) return false;
-    try {
-      const kp = cfg.keypair();
-      // amount — в токенах, denominatedInSol: "false"
-      const vtx = await buildTradeTxPumpLocal({
-        publicKey: kp.publicKey.toBase58(),
-        action: "sell",
-        mint: mint.toBase58(),
-        denominatedInSol: "false",
-        amount: +qTok.toFixed(Math.min(6, dec)),
-        slippage: (cfg.slippageBps() || 50) / 100,
-        priorityFee: CFG.priorityFee,
-        pool: "auto",
-      });
-      vtx.sign([kp]);
-      const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
-      await confirmSigHttp(connection, sig);
+  // основной цикл
+  let timer: any;
+  const loop = async () => {
+    if (stopped) return;
+    await tradeOnce();
+    if (stopped) return;
+    timer = setTimeout(loop, Math.max(500, Number(bot.speedMs) || 5000));
+  };
 
-      posTok = Math.max(0, posTok - qTok);
-      if (posTok <= minTok) { posTok = 0; avgSol = 0; peak = 0; }
-      lastTrade = now();
+  // стратуем
+  loop();
 
-      cfg.onUpdate({ id: bot.id, posToken: posTok, avgSol, last: label });
-      cfg.onLog("ok", `${bot.name}: SELL ${qTok.toFixed(6)} TOK (${label}) ${sig.slice(0,8)}…`);
-      return true;
-    } catch (e: any) {
-      cfg.onLog("warn", `${bot.name}: sell fail: ${e?.message || e}`);
-      return false;
-    }
-  }
-
-  function wantBuy(): boolean {
-    if (!bot.aiEnabled) return true; // режим без AI — всегда пытаемся по стратегии
-
-    const ch1m = cfg.change1m(); // ~моментум минуты
-    const price = cfg.price();
-
-    if (bot.strategy === "trend")   return ch1m > 0;       // растём — подхватываем
-    if (bot.strategy === "revert")  return ch1m < 0;       // ловим откаты
-    if (bot.strategy === "scalper") return Math.abs(ch1m) > 0.002; // волатильность
-    return true;
-  }
-
-  function sellSignals() {
-    if (posTok <= minTok || avgSol <= 0) return { should: false };
-
-    const p = cfg.price();
-    const pnl = (p - avgSol) / avgSol;          // относительная PnL
-    peak = Math.max(peak || p, p);
-    const drawdown = (peak - p) / Math.max(1e-12, peak);
-
-    const age = now() - lastTrade;
-
-    // трейлинг от пика
-    if (drawdown * 10_000 >= CFG.trailBps && age >= CFG.minHoldMs) {
-      return { should: true, kind: "TRAIL", qty: posTok }; // всё
-    }
-    // стоп-лосс
-    if (pnl * 10_000 <= -CFG.stopLossBps && age >= CFG.minHoldMs) {
-      return { should: true, kind: "SL", qty: posTok };    // всё
-    }
-    // частичные TP
-    if (pnl * 10_000 >= CFG.takeProfit2Bps) {
-      return { should: true, kind: "TP2", qty: posTok * CFG.scale2 };
-    }
-    if (pnl * 10_000 >= CFG.takeProfitBps) {
-      return { should: true, kind: "TP1", qty: posTok * CFG.scale1 };
-    }
-    return { should: false as const };
-  }
-
-  async function tick() {
-    const price = cfg.price();
-    if (!price || isNaN(price)) return;
-
-    // ЕСЛИ позиция есть — проверяем выходы
-    const s = sellSignals();
-    if (s.should) {
-      const q = Math.max(minTok, Math.min(posTok, s.qty || posTok));
-      await sell(q, s.kind!);
-      return;
-    }
-
-    // Иначе — подумать о входе
-    const spent = Math.max(CFG.minBuySol, Math.min(bot.budgetSol, cfg.tradeSize()));
-    const canTrade = now() - lastTrade >= CFG.coolDownMs;
-
-    if (canTrade && wantBuy()) {
-      await buy(spent);
-    } else {
-      // просто обновим «last» чтобы видеть статус
-      const label =
-        posTok > 0
-          ? `hold PnL ${( (price-avgSol)/Math.max(1e-12,avgSol) * 100 ).toFixed(2)}%`
-          : `idle`;
-      cfg.onUpdate({ id: bot.id, last: label });
-    }
-  }
-
-  (async () => {
-    while (!stopped) {
-      try { await tick(); } catch {}
-      await sleep(Math.max(600, bot.speedMs || 2000));
-    }
-  })();
-
-  return () => { stopped = true; };
+  // возвращаем остановщик
+  return () => {
+    stopped = true;
+    try { clearTimeout(timer); } catch {}
+  };
 }
