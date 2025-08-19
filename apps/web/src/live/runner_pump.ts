@@ -2,7 +2,6 @@
 import {
   Connection,
   VersionedTransaction,
-  PublicKey,
   Keypair,
 } from "@solana/web3.js";
 
@@ -49,11 +48,15 @@ type RunCtx = {
 };
 
 const PUMP_BASE = "https://pumpportal.fun";
-const FEE_EST_SOL = 0.00002;     // грубая оценка комиссии
-const MIN_KEEP_SOL = 0.0006;     // резерв, чтобы не сесть «в ноль»
-const TARGET_ALLOC = 0.5;        // целевая доля токена в портфеле (по цене)
-const MAX_ALLOC = 0.75;          // не держим >75% в токене
-const MIN_ALLOC = 0.25;          // и не уходим <25% при наличии позиции
+
+/** грубые оценки комиссий/резервов */
+const FEE_EST_SOL   = 0.00002; // ~ 20k lamports
+const MIN_KEEP_SOL  = 0.0006;  // не высаживаемся в ноль по SOL
+
+/** целевые и предельные доли токена в портфеле (mark-to-market) */
+const TARGET_ALLOC  = 0.55; // к этой цели подвозим частичными продажами/покупками
+const MAX_ALLOC     = 0.80; // если токена >80% — обязательно разгружаем
+const MIN_ALLOC     = 0.20; // если токена <20% и есть SOL — докупаем
 
 async function buildTradeTxPumpPortal(
   payload: Record<string, any>
@@ -110,7 +113,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let pending = false;
   let cooldownUntil = 0;
 
-  // backoff при сетевых фейлах
+  // сетевой бэкофф при фейлах
   let failStreak = 0;
   let nextRetryAt = 0;
 
@@ -124,13 +127,23 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     return { tokVal, total, a: tokVal / total };
   };
 
-  async function trade(side: "buy" | "sell", sizeSol: number, opts?: { sellTokens?: number }) {
+  async function trade(
+    side: "buy" | "sell",
+    sizeSol: number,
+    opts?: { sellTokens?: number } // для частичной продажи
+  ) {
     const kp = ctx.keypair();
     const decimals = ctx.tokenDecimals();
     const priceNow = Math.max(1e-12, ctx.price());
 
-    // подсказка для частичных продаж
-    const amountTok = side === "sell" && opts?.sellTokens ? roundTok(opts.sellTokens, decimals) : undefined;
+    // токеновый объём для частичной продажи
+    const amountTok =
+      side === "sell" && opts?.sellTokens
+        ? roundTok(opts.sellTokens, decimals)
+        : undefined;
+
+    if (side === "buy" && sizeSol <= 0) return;
+    if (side === "sell" && (amountTok ?? bot.posToken) <= 0) return;
 
     const payload =
       side === "buy"
@@ -169,7 +182,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       failStreak = 0;
       nextRetryAt = 0;
 
-      // оптимистичное обновление портфеля
+      // оптимистичное обновление портфеля (без ончейн-чтений)
       if (side === "buy") {
         const qty = sizeSol / priceNow;
         const newPos = bot.posToken + qty;
@@ -185,9 +198,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - FEE_EST_SOL));
         bot.tokenBalance = bot.posToken;
       }
+
       bot.unrealized = bot.posToken * (priceNow - (bot.avgSol || priceNow));
       bot.fills += 1;
-      bot.last = `${side} ${side === "buy" ? sizeSol.toFixed(4) + " SOL" : (amountTok ? `${amountTok} TOK` : "ALL")} @ slp=${ctx.slippageBps().toFixed(0)}bps`;
+      bot.last =
+        side === "buy"
+          ? `buy ${sizeSol.toFixed(4)} SOL @ slp=${ctx.slippageBps().toFixed(0)}bps`
+          : `sell ${opts?.sellTokens ? roundTok(opts.sellTokens, decimals) + " TOK" : "ALL"} @ slp=${ctx.slippageBps().toFixed(0)}bps`;
 
       ctx.onUpdate(bot);
       log("ok", `${side.toUpperCase()} ${sig.slice(0, 8)}…`);
@@ -204,16 +221,37 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     }
   }
 
+  /** TWAP-покупка: разбиваем крупный объём на несколько кусков */
+  async function twapBuy(totalSol: number) {
+    const plan = ctx.twap;
+    if (!plan || plan.slices < 2 || totalSol <= 0) {
+      await trade("buy", totalSol);
+      return;
+    }
+    const per = Math.max(0, totalSol / plan.slices);
+    for (let i = 0; i < plan.slices; i++) {
+      await trade("buy", per);
+      if (i < plan.slices - 1) await sleep(Math.max(300, plan.gapMs));
+    }
+  }
+
+  setTimeout(loop, 10);
+  return () => {
+    stopped = true;
+  };
+
   async function loop() {
     if (stopped || !bot.running) return;
     if (pending) return;
 
     const now = Date.now();
-    // если отложенный ретрай — ждём
+
+    // отложенный ретрай после сетевого фейла
     if (now < nextRetryAt) {
       setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
     }
+    // локальный cooldown после сделки
     if (now < cooldownUntil) {
       setTimeout(loop, Math.max(50, cooldownUntil - now));
       return;
@@ -230,46 +268,73 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       const p = Math.max(1e-12, ctx.price());
-      const fast = (ctx.changeFast?.(12) ?? 0);
+      const fast = (ctx.changeFast?.(12) ?? 0); // быстрый импульс ~12с
       const ch1m = ctx.change1m();
 
-      // портфельная аллокация
+      // портфельные метрики
       const { a: allocTok, total } = alloc(p);
 
-      // лимиты покупки и базовый размер
-      const baseSize = Math.max(0.0002, Math.min(bot.budgetSol || ctx.tradeSize(), bot.solBalance - 0.0003));
-      const haveSol = bot.solBalance > MIN_KEEP_SOL;
+      // базовый размер и наличие SOL c учётом «резерва под комиссии»
+      const baseSize = Math.max(
+        0.00015,
+        Math.min(bot.budgetSol || ctx.tradeSize(), (bot.solBalance - MIN_KEEP_SOL) - 0.00015)
+      );
+      const haveSol = bot.solBalance > MIN_KEEP_SOL + 0.00015;
 
-      // расчет частичных продаж «к цели»
-      const sellToTarget = () => {
-        if (bot.posToken <= 0) return 0;
+      // ====== Авто-ребаланс до входа стратегии ======
+      // 1) слишком много токена → частично разгрузим к цели
+      if (bot.posToken > 0 && allocTok > MAX_ALLOC) {
         const desiredTokVal = TARGET_ALLOC * total;
         const currentTokVal = bot.posToken * p;
         const excessVal = Math.max(0, currentTokVal - desiredTokVal);
-        // разгружаем ~60% избыточной доли, но не менее 20% позиции
-        const tok = Math.max(bot.posToken * 0.2, excessVal * 0.6 / p);
-        return Math.min(bot.posToken, roundTok(tok, ctx.tokenDecimals()));
-      };
+        // продаём ~60% избыточной доли, но не менее 20% позиции
+        const tokToSell = Math.min(
+          bot.posToken,
+          roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+        );
+        if (tokToSell > 0) {
+          await trade("sell", 0, { sellTokens: tokToSell });
+          pending = false;
+          return setTimeout(loop, Math.max(400, bot.speedMs));
+        }
+      }
 
+      // 2) слишком мало токена и есть SOL → докупим к цели
+      if (haveSol && allocTok < MIN_ALLOC) {
+        const targetVal = TARGET_ALLOC * total;
+        const needVal = Math.max(0, targetVal - bot.posToken * p);
+        const buySol = Math.max(0, Math.min(baseSize, needVal));
+        if (buySol > 0.00012) {
+          await twapBuy(buySol);
+          pending = false;
+          return setTimeout(loop, Math.max(400, bot.speedMs));
+        }
+      }
+
+      // ====== Логика стратегий ======
       let did = false;
 
       switch (bot.strategy) {
         case "trend": {
-          // buy: импульс вверх и положительная минутная дельта, но не уходим выше MAX_ALLOC
-          if (haveSol && fast > 0.0018 && ch1m >= 0 && allocTok < MAX_ALLOC) {
-            // ограничим так, чтобы после сделки ток-доля не превысила (TARGET_ALLOC + 0.15)
+          // активнее заходим: небольшой «плюс» по минуте допустим,
+          // быстрый импульс порог снижен
+          if (haveSol && fast > 0.0009 && ch1m > -0.0005 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
-            const limitByAlloc = Math.max(0, headroomVal);
-            const size = Math.min(baseSize, limitByAlloc);
-            if (size > 0.00015) {
-              await trade("buy", size);
+            const size = Math.min(baseSize, headroomVal);
+            if (size > 0.00012) {
+              await twapBuy(size);
               did = true;
               break;
             }
           }
-          // sell: TP 7%, SL 4%, но частично — к цели
+          // TP/SL + подрезание излишков к цели
           if (wantToSell(bot, p, 700, 400) || allocTok > MAX_ALLOC) {
-            const part = sellToTarget();
+            const desiredTokVal = TARGET_ALLOC * total;
+            const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
+            const part = Math.min(
+              bot.posToken,
+              roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+            );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
           }
@@ -277,19 +342,24 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "revert": {
-          // buy: на сильной краткосрочной просадке, но не уходим ниже MIN_KEEP_SOL и не заходим >MAX_ALLOC
-          if (haveSol && fast < -0.0045 && allocTok < MAX_ALLOC) {
+          // агрессивнее ловим дампы
+          if (haveSol && fast < -0.0015 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.10) * total - bot.posToken * p);
             const size = Math.min(baseSize, headroomVal);
-            if (size > 0.00015) {
-              await trade("buy", size);
+            if (size > 0.00012) {
+              await twapBuy(size);
               did = true;
               break;
             }
           }
-          // sell: маленький TP/SL, частично
+          // маленький TP/SL + подрезание к цели
           if (wantToSell(bot, p, 80, 40) || allocTok > MAX_ALLOC) {
-            const part = sellToTarget();
+            const desiredTokVal = TARGET_ALLOC * total;
+            const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
+            const part = Math.min(
+              bot.posToken,
+              roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+            );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
           }
@@ -297,18 +367,23 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "scalper": {
-          // хапаем импульсы в обе стороны, но уважаем аллокацию
+          // импульсы в обе стороны, но уважаем аллокацию
           if (haveSol && Math.abs(fast) > 0.0022 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
             const size = Math.min(baseSize, headroomVal);
-            if (size > 0.00012) {
-              await trade("buy", size);
+            if (size > 0.0001) {
+              await twapBuy(size);
               did = true;
               break;
             }
           }
           if (wantToSell(bot, p, 120, 55) || allocTok > MAX_ALLOC) {
-            const part = sellToTarget();
+            const desiredTokVal = TARGET_ALLOC * total;
+            const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
+            const part = Math.min(
+              bot.posToken,
+              roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+            );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
           }
@@ -330,7 +405,4 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs));
     }
   }
-
-  setTimeout(loop, 10);
-  return () => { stopped = true; };
 }
