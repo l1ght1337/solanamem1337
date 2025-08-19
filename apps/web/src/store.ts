@@ -481,7 +481,7 @@ export const useStore = create<Store>()(
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
       },
 
-      updateBot: (id, patch) => set(s => ({ bots: s.bots.map(b => (b.id === id ? { ...b, ...patch } : b)) }))),
+      updateBot: (id, patch) => set(s => ({ bots: s.bots.map(b => (b.id === id ? { ...b, ...patch } : b)) })),
       removeBot: (id) => { removeKey(id); set(s => ({ bots: s.bots.filter(b => b.id !== id) })); },
       exportBotKey: (id) => exportSecret(id),
 
