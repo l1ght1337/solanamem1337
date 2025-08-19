@@ -88,7 +88,7 @@ async function fetchFirstOk(path: string, init: RequestInit, retries = 2) {
   throw lastErr || new Error("All pump endpoints failed");
 }
 
-/* ---------- Local API (осталось как было) ---------- */
+/* ---------- Local API ---------- */
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
   const res = await fetchFirstOk("/api/trade-local", {
     method: "POST",
@@ -101,11 +101,10 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
 
 async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransaction; mint?: string }> {
   const paths = [
-  "/api/create-token-local",
-  "/api/create-token",
-  "/api/trade-local" // добавили корректный локальный путь
-  // "/api/trade" — это lightning, там не VTX, поэтому сюда не добавляем
-];
+    "/api/create-token-local",
+    "/api/create-token",
+    "/api/trade-local"
+  ];
 
   let lastErr: any;
   for (const p of paths) {
@@ -140,7 +139,7 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
   throw lastErr || new Error("Pump create endpoint failed");
 }
 
-/* ---------- Lightning API: /api/ipfs + /api/trade?action=create ---------- */
+/* ---------- Lightning API ---------- */
 async function uploadIpfsMeta(params: {
   name: string; symbol: string; image: string; description?: string; website?: string; twitter?: string;
 }) {
@@ -181,7 +180,7 @@ async function buildCreateViaLightning(args: {
     tokenMetadata: { name: args.name, symbol: args.symbol, uri },
     denominatedInSol: "true",
     amount: Number(args.initialBuySol || 0),
-    slippage: Number(args.slippagePct ?? 10),      // проценты
+    slippage: Number(args.slippagePct ?? 10),
     priorityFee: Number(args.priorityFeeSol ?? 0.00001),
     pool: "pump",
   };
@@ -199,13 +198,12 @@ async function buildCreateViaLightning(args: {
   return { mint: String(mint), signature: signature ? String(signature) : undefined };
 }
 
-/* ---------- helpers: token program & ATA ---------- */
+/* ---------- helpers ---------- */
 async function detectTokenProgram(connection: Connection, mint: PublicKey) {
   const info = await connection.getAccountInfo(mint);
   return info?.owner?.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
 }
 
-/* ---------- ensure ATA (подписывает Phantom), учитывает Token-2022 ---------- */
 async function ensureWalletAta(connection: Connection, walletPubkey: string, mint: string) {
   const ph = (window as any).solana;
   const mintPk = new PublicKey(mint);
@@ -223,7 +221,6 @@ async function ensureWalletAta(connection: Connection, walletPubkey: string, min
   return ata;
 }
 
-/* ---------- helper: отправка SOL с ретраями + HTTP-confirm ---------- */
 async function sendTransferWithRetry(
   connection: Connection,
   kp: Keypair,
@@ -264,6 +261,11 @@ export type Store = {
   tokenMint: string | null;
   price: number;
   candles: { t: number; open: number; high: number; low: number; close: number; volume: number }[];
+
+  /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
+  ticks: { t: number; p: number }[];
+  /** быстрый импульс: изменение цены за последние `sec` секунд */
+  getChangeFast: (sec?: number) => number;
 
   external: { provider: "dexscreener" | "jupiter" | "solanatracker" | "pumpportal" | "custom"; endpoint: string; apiKey?: string };
 
@@ -340,6 +342,22 @@ export const useStore = create<Store>()(
       price: 0,
       candles: [],
 
+      ticks: [],
+      getChangeFast(sec = 15) {
+        const st = get();
+        if (!st.ticks.length) return 0;
+        const now = Date.now();
+        const since = now - sec * 1000;
+
+        // базовая цена — ближайший тик "чуть старше" горизонта
+        let base = st.ticks[0].p;
+        for (let i = st.ticks.length - 1; i >= 0; i--) {
+          if (st.ticks[i].t <= since) { base = st.ticks[i].p; break; }
+        }
+        const curr = st.price || st.ticks.at(-1)?.p || base;
+        return (curr - base) / Math.max(1e-9, base);
+      },
+
       external: { provider: "dexscreener", endpoint: "https://api.dexscreener.com" },
 
       log: [],
@@ -415,7 +433,12 @@ export const useStore = create<Store>()(
             try { s._ppSub?.detach?.(); } catch {}
             const sub = attachPumpPortalFeed({
               mint,
-              onPrice: (p) => set({ price: p }),
+              onPrice: (p) => set(st => {
+                const now = Date.now();
+                const ticks = (st.ticks || []).concat({ t: now, p });
+                const cut = now - 60_000;
+                return { price: p, ticks: ticks.filter(x => x.t > cut) };
+              }),
               onCandle: (m, p) => set(st => {
                 const last = st.candles.at(-1);
                 let c = st.candles.slice();
@@ -458,11 +481,11 @@ export const useStore = create<Store>()(
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
       },
 
-      updateBot: (id, patch) => set(s => ({ bots: s.bots.map(b => (b.id === id ? { ...b, ...patch } : b)) })),
+      updateBot: (id, patch) => set(s => ({ bots: s.bots.map(b => (b.id === id ? { ...b, ...patch } : b)) }))),
       removeBot: (id) => { removeKey(id); set(s => ({ bots: s.bots.filter(b => b.id !== id) })); },
       exportBotKey: (id) => exportSecret(id),
 
-      // Пополнение из Treasury (без WS, через HTTP-confirm)
+      // Пополнение из Treasury
       async topUpBot(connection, botId) {
         const s = get();
         const bot = s.bots.find(b => b.id === botId);
@@ -516,7 +539,7 @@ export const useStore = create<Store>()(
           await confirmSigHttp(connection, sig);
           s.addLog("ok", `Drain ${bot.name} → ${dest.toBase58().slice(0,4)}…: ${sendSol.toFixed(6)} SOL (${sig})`);
         } catch (e:any) {
-          s.addLog("err", `Drain error ${bot.name}: ${e?.message || String(e)}`);
+          s.addLog("err", `Drain error ${bot.name}: ${e?.message || e}`);
         }
       },
 
@@ -586,7 +609,7 @@ export const useStore = create<Store>()(
         await get().refreshBalances(connection);
       },
 
-      // MAINNET warm-up (на HTTP-confirm)
+      // MAINNET warm-up
       mainnetWarmupCfg: { txPerBot: 30, lamports: 5_000, gapMs: 1200, maxTotalSolPerBot: 0.005 },
 
       async mainnetWarmupTransfers(connection, opts = {}) {
@@ -622,9 +645,9 @@ export const useStore = create<Store>()(
           const kp = getKeypair(sender.keyId);
           if (!kp) { s.addLog("err", `Нет ключа для ${sender.name}`); continue; }
 
-          const idx = bots.findIndex(x => x.id === sender.id);
-          const receiver = bots[(idx + 1) % bots.length];
-          const toPk = new PublicKey(receiver.pubkey);
+        const idx = bots.findIndex(x => x.id === sender.id);
+        const receiver = bots[(idx + 1) % bots.length];
+        const toPk = new PublicKey(receiver.pubkey);
 
           for (let i = 0; i < txPerBot; i++) {
             try {
@@ -673,6 +696,9 @@ export const useStore = create<Store>()(
           slippageBps: () => get().getSmartBps(),
           twap: get().getTwapPlan(),
           price: () => get().price,
+          /** быстрая дельта (10–15 сек) для «человеческих» реакций */
+          changeFast: (secs?: number) => get().getChangeFast(secs ?? 15),
+          /** fallback — минутная дельта */
           change1m: () => {
             const cs = get().candles;
             if (cs.length < 2) return 0;
@@ -743,7 +769,7 @@ export const useStore = create<Store>()(
         }
       },
 
-      // Прайс/свечи
+      // Прайс/свечи + тики
       async tickReal() {
         const s = get();
         if (!s.tokenMint) return;
@@ -759,16 +785,20 @@ export const useStore = create<Store>()(
           else { last.high = Math.max(last.high, p); last.low = Math.min(last.low, p); last.close = p; }
           if (c.length > 1000) c = c.slice(-1000);
 
+          // тики (60 секунд скользящее окно)
+          const now = Date.now();
+          const ticks = (st.ticks || []).concat({ t: now, p });
+          const cut = now - 60_000;
+
           const bots = st.bots.map(b => ({ ...b, unrealized: b.posToken * (p - (b.avgSol || p)) }));
-          return { price: p, candles: c, bots };
+          return { price: p, candles: c, bots, ticks: ticks.filter(x => x.t > cut) };
         });
       },
 
       // === Pump: создать токен и автопокупка ===
       async createPumpToken(connection, creatorPubkey, params) {
-        // 1) Lightning
         try {
-          const slippagePct = (get().getSmartBps() || 50) / 100; // bps → %
+          const slippagePct = (get().getSmartBps() || 50) / 100;
           const { mint, signature } = await buildCreateViaLightning({
             name: params.name,
             symbol: params.symbol,
@@ -791,7 +821,6 @@ export const useStore = create<Store>()(
           get().addLog("warn", `Lightning create failed → fallback to Local: ${e?.message || String(e)}`);
         }
 
-        // 2) Local (фолбэк)
         try {
           const body = {
             publicKey: creatorPubkey,
@@ -858,7 +887,7 @@ export const useStore = create<Store>()(
         }
       },
 
-      // === Sell ALL — боты → кошелёк → одна продажа (HTTP-confirm) ===
+      // === Sell ALL — боты → кошелёк → одна продажа
       async sellAllToWalletOnPump(connection, walletPubkey) {
         const s = get();
         if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
@@ -930,13 +959,13 @@ export const useStore = create<Store>()(
           await confirmSigHttp(connection, signature);
           s.addLog("ok", `Sell ALL: кошелёк продал ~${amountRounded} TOK (${signature.slice(0,8)}…)`);
         } catch (e:any) {
-          s.addLog("err", `Sell ALL sell-phase: ${e?.message || String(e)}`);
+          get().addLog("err", `Sell ALL sell-phase: ${e?.message || String(e)}`);
         }
 
         await get().refreshBalances(connection);
       },
 
-      // Авто-профили
+      // Авто-профили (без изменений)
       autoMode: false,
       autoCfg: { slopeLookback: 20, volLookback: 20, slopeThr: 0.002, volThr: 0.004 },
       autoTick() {
