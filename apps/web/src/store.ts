@@ -116,7 +116,6 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
 /* ---------- Local API ---------- */
 /** Сборка vtx c фолбэком: /api/trade-local → /api/trade (JSON) */
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
-  // 1) основной маршрут — локальный
   try {
     const res = await fetchFirstOk("/api/trade-local", {
       method: "POST",
@@ -134,7 +133,6 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
     const raw = new Uint8Array(await res.arrayBuffer());
     return VersionedTransaction.deserialize(raw);
   } catch (_e) {
-    // 2) фолбэк — роутер /api/trade (JSON)
     const res = await fetchFirstOk("/api/trade", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -370,7 +368,15 @@ export type Store = {
       description?: string; website?: string; twitter?: string; decimals?: number; initialBuySol?: number;
     }
   ) => Promise<void>;
+
+  /** Купит на весь доступный SOL за вычетом keepFeeSol (историческая) */
   buyAllBotsOnPump: (connection: Connection, opts?: { keepFeeSol?: number }) => Promise<void>;
+
+  /** Новая: все боты покупают на percent (0..1) своего баланса SOL */
+  buyAllBotsAtPercentOnPump: (connection: Connection, percent: number, opts?: { keepFeeSol?: number }) => Promise<void>;
+  /** Сахар: 80% */
+  buyAllBots80OnPump: (connection: Connection, opts?: { keepFeeSol?: number }) => Promise<void>;
+
   sellAllToWalletOnPump: (connection: Connection, walletPubkey: string, opts?: { keepFeeSol?: number }) => Promise<void>;
 
   autoMode: boolean;
@@ -409,7 +415,7 @@ export const useStore = create<Store>()(
       external: { provider: "dexscreener", endpoint: "https://api.dexscreener.com" },
 
       log: [],
-      addLog: (level, msg) => set((s) => ({ log: [...s.log, { ts: now(), level, msg }].slice(-600) })),
+      addLog: (level, msg) => set((s) => ({ log: [...s.log, { ts: now(), level, msg }].slice(-800) })),
 
       bots: [],
       slippageBps: 50,
@@ -863,24 +869,43 @@ export const useStore = create<Store>()(
         const s = get();
         if (!s.tokenMint) return;
         if (s.external.provider === "pumpportal") return; // pump.fun обновляет цену через WS
-        const p = await fetchExternalPrice(s.external, s.tokenMint);
+
+        // 1) пробуем основной провайдер
+        const tryOnce = async (prov: any) => {
+          try {
+            return await fetchExternalPrice({ ...prov, endpoint: prov.endpoint, apiKey: prov.apiKey }, s.tokenMint!);
+          } catch { return null; }
+        };
+
+        const candidates = [
+          s.external,
+          { provider: "dexscreener", endpoint: "https://api.dexscreener.com" },
+          { provider: "jupiter", endpoint: "https://price.jup.ag" },
+          { provider: "solanatracker", endpoint: "https://api.solanatracker.io" },
+        ];
+
+        let p: number | null = null;
+        for (const c of candidates) {
+          p = await tryOnce(c);
+          if (p && isFinite(p) && p > 0) break;
+        }
         if (!p) return;
+
         set((st) => {
           const t = Date.now();
           const m = Math.floor(t / 60000) * 60000;
           const last = st.candles.at(-1);
           let c = st.candles.slice();
-          if (!last || last.t !== m) c.push({ t: m, open: p, high: p, low: p, close: p, volume: 0 });
-          else { last.high = Math.max(last.high, p); last.low = Math.min(last.low, p); last.close = p; }
+          if (!last || last.t !== m) c.push({ t: m, open: p!, high: p!, low: p!, close: p!, volume: 0 });
+          else { last.high = Math.max(last.high, p!); last.low = Math.min(last.low, p!); last.close = p!; }
           if (c.length > 1000) c = c.slice(-1000);
 
-          // тики (60 секунд скользящее окно)
           const now = Date.now();
-          const ticks = (st.ticks || []).concat({ t: now, p });
+          const ticks = (st.ticks || []).concat({ t: now, p: p! });
           const cut = now - 60_000;
 
-          const bots = st.bots.map((b) => ({ ...b, unrealized: b.posToken * (p - (b.avgSol || p)) }));
-          return { price: p, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
+          const bots = st.bots.map((b) => ({ ...b, unrealized: b.posToken * (p! - (b.avgSol || p!)) }));
+          return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
         });
       },
 
@@ -969,6 +994,45 @@ export const useStore = create<Store>()(
           }
           if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
         }
+      },
+
+      /** ===== Новая: все боты покупают на percent своего SOL ===== */
+      async buyAllBotsAtPercentOnPump(connection, percent, opts = {}) {
+        const keep = Math.max(0.0005, (opts as any).keepFeeSol ?? get().minFeeSol);
+        const pct = Math.min(1, Math.max(0, Number(percent) || 0));
+        const s = get();
+        if (!s.tokenMint) { s.addLog("warn", "Buy%: mint не задан"); return; }
+
+        for (let i = 0; i < s.bots.length; i++) {
+          const b = s.bots[i];
+          const base = Math.max(0, b.solBalance - keep);
+          const spend = Math.max(0, +(base * pct).toFixed(6));
+          if (spend <= 0) { s.addLog("info", `Buy% ${b.name}: нечего тратить`); continue; }
+          try {
+            const kp = getKeypair(b.keyId);
+            const vtx = await buildTradeTxPumpLocal({
+              publicKey: kp.publicKey.toBase58(),
+              action: "buy",
+              mint: s.tokenMint,
+              denominatedInSol: "true",
+              amount: spend,
+              slippage: (get().getSmartBps() || 50) / 100,
+              priorityFee: 0.00001,
+              pool: "auto",
+            });
+            vtx.sign([kp]);
+            const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
+            await confirmSigHttp(connection, sig);
+            s.addLog("ok", `Buy% ${b.name}: ${(spend).toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
+          } catch (e: any) {
+            s.addLog("warn", `Buy% ${s.bots[i].name}: ${e?.message || String(e)}`);
+          }
+          if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
+        }
+      },
+
+      async buyAllBots80OnPump(connection, opts = {}) {
+        await get().buyAllBotsAtPercentOnPump(connection, 0.8, opts);
       },
 
       // === Sell ALL — боты → кошелёк → одна продажа
