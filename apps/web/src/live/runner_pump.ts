@@ -1,18 +1,12 @@
-// src/live/runner_pump.ts
+// apps/web/src/live/runner_pump.ts
 import {
   Connection,
   VersionedTransaction,
   PublicKey,
   Keypair,
 } from "@solana/web3.js";
-import {
-  getAssociatedTokenAddress,
-  createAssociatedTokenAccountInstruction,
-  TOKEN_PROGRAM_ID,
-  TOKEN_2022_PROGRAM_ID,
-} from "@solana/spl-token";
 
-/** ===== типы из твоего Store (минимально) ===== */
+/** ===== типы из Store (минимально) ===== */
 type LiveBot = {
   id: string;
   name: string;
@@ -39,22 +33,22 @@ type RunCtx = {
   mint: string;
   slippageBps: () => number;
   twap?: { slices: number; gapMs: number } | null;
+
   price: () => number;
-  change1m: () => number;
+  changeFast?: (sec?: number) => number; // быстрый импульс 10–15 сек
+  change1m: () => number;                 // запасной, минутный
+
   keypair: () => Keypair;
-  tokenDecimals: () => number;           // decimals токена
-  tradeSize: () => number;                // размер покупки в SOL
+  tokenDecimals: () => number;
+  tradeSize: () => number;
   onLog: (level: "info" | "ok" | "warn" | "err", msg: string) => void;
   onUpdate: (b: LiveBot) => void;
 };
 
-/** ====== НАПРЯМУЮ в pumpportal.fun ====== */
+/** ====== pumpportal.fun ====== */
 const PUMP_BASE = "https://pumpportal.fun";
 
-/** У PumpPortal бывают разные ответы:
- *  - application/octet-stream: serialized VTX (Uint8Array)
- *  - application/json: { serializedTransaction } | { tx } (base64)
- */
+/** API: возвращает VTX */
 async function buildTradeTxPumpPortal(
   payload: Record<string, any>
 ): Promise<VersionedTransaction> {
@@ -70,7 +64,6 @@ async function buildTradeTxPumpPortal(
     throw new Error(`pumpportal ${r.status}: ${txt || "Bad Request"}`);
   }
 
-  // Бинарный VTX
   if (ct.includes("application/octet-stream")) {
     const raw = new Uint8Array(await r.arrayBuffer());
     return VersionedTransaction.deserialize(raw);
@@ -85,198 +78,235 @@ async function buildTradeTxPumpPortal(
   return VersionedTransaction.deserialize(raw);
 }
 
-/** Определяем программу токена (обычный/2022) */
-async function detectTokenProgram(
-  connection: Connection,
-  mint: PublicKey
-): Promise<PublicKey> {
-  const info = await connection.getAccountInfo(mint);
-  return info?.owner?.equals(TOKEN_2022_PROGRAM_ID)
-    ? TOKEN_2022_PROGRAM_ID
-    : TOKEN_PROGRAM_ID;
-}
-
-/** Готовим ATA для покупателя/продавца */
-async function ensureAtaIfMissing(
-  connection: Connection,
-  owner: PublicKey,
-  mint: PublicKey,
-  feePayer: Keypair
-) {
-  const programId = await detectTokenProgram(connection, mint);
-  const ata = await getAssociatedTokenAddress(mint, owner, false, programId);
-  const info = await connection.getAccountInfo(ata);
-  if (info) return;
-
-  const ix = createAssociatedTokenAccountInstruction(
-    feePayer.publicKey,
-    ata,
-    owner,
-    mint,
-    programId
-  );
-  const { blockhash } = await connection.getLatestBlockhash("finalized");
-  const tx = new VersionedTransaction(
-    // небольшой трюк чтобы не тащить TransactionBuilder:
-    VersionedTransaction.deserialize(
-      new Uint8Array() // просто чтобы TS не ругался; на деле ниже заменим
-    ).message
-  );
-  // Переиспользуем легкий способ: соберём обычный legacy TX через web3.Transaction:
-  // но чтобы не тянуть ещё код — сделаем мини-шорткат:
-  // Отправим IX через sendRawTransaction на базе короткого single-ix legacy.
-  // Чтобы не усложнять — создадим временный legacy:
-  // Это безопасно: ATA создан один раз и сразу подтверждаем.
-  // (Если хочешь — переделай на normal Transaction)
-
-  // → На практике проще:
-  //   const txLegacy = new Transaction({ feePayer: feePayer.publicKey, recentBlockhash: blockhash }).add(ix)
-  //   txLegacy.sign(feePayer)
-  //   await connection.sendRawTransaction(txLegacy.serialize(), { skipPreflight: true })
-  //   await connection.confirmTransaction(sig, 'confirmed')
-
-  // Чтобы не зависеть от импортов Transaction – оставлю комментарий:
-  throw new Error(
-    "ensureAtaIfMissing: чтобы не тащить доп.импорты, сделай ATA один раз из warm-up или замени эту функцию на legacy Transaction (см. комментарий)"
-  );
-}
-
-/** ===== простые правила продажи =====
- *  takeProfitBps – забрать профит при росте >= X bps
- *  stopLossBps   – стоп при снижении >= Y bps
- */
-function shouldSell(
-  bot: LiveBot,
-  currPrice: number,
-  takeProfitBps = 800, // +8%
-  stopLossBps = 400    // -4%
-) {
-  if (bot.posToken <= 0 || !bot.avgSol) return false;
-  const chg = (currPrice - bot.avgSol) / Math.max(1e-9, bot.avgSol);
-  if (chg >= takeProfitBps / 10_000) return true;
-  if (chg <= -stopLossBps / 10_000) return true;
-  return false;
-}
-
-/** Округление количества токенов на продажу */
-function roundTokenAmount(tokens: number, decimals: number) {
-  const p = Math.pow(10, Math.min(6, decimals)); // разумная точность
+/** округление токенов на продажу */
+function roundTok(tokens: number, decimals: number) {
+  const p = Math.pow(10, Math.min(6, decimals));
   return Math.max(0, Math.floor(tokens * p) / p);
 }
 
-/** ===== Основной раннер: без прокси, только pumpportal.fun ===== */
+/** трейлинг/TP/SL в bps (1 bps = 0.01%) */
+const TP_SCALPER_BPS = 120;  // ~1.2%
+const TP_TREND_BPS   = 250;  // ~2.5%
+const TP_REVERT_BPS  = 160;  // ~1.6%
+const SL_ALL_BPS     = 180;  // ~1.8% защитный стоп
+
+/** быстрые пороги импульса (на основе changeFast за ~15 сек) */
+const FBUY_SCALPER = 0.0010;  // +0.10%
+const FSELL_SCALPER = -0.0006; // -0.06%
+const FBUY_TREND = 0.0008;    // +0.08%
+const FSELL_TREND = -0.0012;  // -0.12%
+const FBUY_REVERT = -0.0010;  // для revert — покупаем на провале  -0.10%
+const FEXIT_REVERT = 0.0007;  // фиксируем на откате +0.07%
+
+/** небольшой хелпер */
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+
+/** обновление позиции (приблизительно, чтобы UI жил) */
+function applyPositionOnBuy(bot: LiveBot, price: number, spendSol: number) {
+  const qty = spendSol / Math.max(1e-9, price);
+  const newPos = bot.posToken + qty;
+  bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + spendSol) / newPos : price;
+  bot.posToken = newPos;
+}
+
+function applyPositionOnSell(bot: LiveBot, price: number, sellTok: number) {
+  const sellQty = Math.min(bot.posToken, sellTok);
+  bot.posToken = Math.max(0, bot.posToken - sellQty);
+  bot.realized += (price - (bot.avgSol || price)) * sellQty;
+  if (bot.posToken === 0) bot.avgSol = 0;
+}
+
+/** решаем, что делать, используя “человеческие” правила */
+function decideHuman(
+  bot: LiveBot,
+  price: number,
+  changeFast: number,
+  change1m: number
+): { side: "buy" | "sell" | "hold"; portion?: number } {
+  const pos = bot.posToken;
+
+  // случайный "скип" действия (как будто подумал/передумал)
+  if (Math.random() < 0.05) return { side: "hold" };
+
+  // защитный стоп/профит
+  if (pos > 0 && bot.avgSol > 0) {
+    const chg = (price - bot.avgSol) / bot.avgSol;
+    const tp = (bot.strategy === "scalper" ? TP_SCALPER_BPS :
+               bot.strategy === "trend"   ? TP_TREND_BPS   : TP_REVERT_BPS) / 10_000;
+    if (chg >= tp)       return { side: "sell", portion: 0.4 + Math.random()*0.4 }; // частично
+    if (chg <= -SL_ALL_BPS / 10_000) return { side: "sell", portion: 0.6 + Math.random()*0.4 };
+  }
+
+  if (bot.strategy === "scalper") {
+    if (changeFast > FBUY_SCALPER) return { side: "buy" };
+    if (pos > 0 && (changeFast < FSELL_SCALPER)) return { side: "sell", portion: 0.35 + Math.random()*0.35 };
+    return { side: "hold" };
+  }
+
+  if (bot.strategy === "trend") {
+    // тренд: берём по ускорению (fast) или по минутной свече
+    if (changeFast > FBUY_TREND || change1m > 0.0035) return { side: "buy" };
+    if (pos > 0 && (changeFast < FSELL_TREND)) return { side: "sell", portion: 0.25 + Math.random()*0.35 };
+    return { side: "hold" };
+  }
+
+  // revert: покупаем на падении и фиксируем часть на отскоке
+  if (bot.strategy === "revert") {
+    if (changeFast < FBUY_REVERT) return { side: "buy" };
+    if (pos > 0 && changeFast > FEXIT_REVERT) return { side: "sell", portion: 0.4 + Math.random()*0.4 };
+    return { side: "hold" };
+  }
+
+  return { side: "hold" };
+}
+
 export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let stopped = false;
   let pending = false;
+  let lastTradeTs = 0;
+  let lastSide: "buy" | "sell" | "hold" = "hold";
 
   const log = (lvl: "info" | "ok" | "warn" | "err", s: string) =>
     ctx.onLog(lvl, `[${bot.name}] ${s}`);
 
+  async function sendBuy(spendSol: number) {
+    const kp = ctx.keypair();
+    const payload = {
+      publicKey: kp.publicKey.toBase58(),
+      action: "buy",
+      mint: ctx.mint,
+      denominatedInSol: "true",
+      amount: spendSol,
+      slippage: (ctx.slippageBps() || 50) / 100,
+      priorityFee: 0.00001,
+      pool: "auto",
+    };
+    const vtx = await buildTradeTxPumpPortal(payload);
+    vtx.sign([kp]);
+    const sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
+    await connection.confirmTransaction(sig, "confirmed");
+    return sig as string;
+  }
+
+  async function sendSell(amountTok: number) {
+    const kp = ctx.keypair();
+    const payload = {
+      publicKey: kp.publicKey.toBase58(),
+      action: "sell",
+      mint: ctx.mint,
+      denominatedInSol: "false",
+      amount: amountTok,
+      slippage: (ctx.slippageBps() || 50) / 100,
+      priorityFee: 0.00001,
+      pool: "auto",
+    };
+    const vtx = await buildTradeTxPumpPortal(payload);
+    vtx.sign([kp]);
+    const sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
+    await connection.confirmTransaction(sig, "confirmed");
+    return sig as string;
+  }
+
   const loop = async () => {
     if (stopped || !bot.running) return;
-    if (pending) return; // не спамим, ждём предыдущую операцию
+    if (pending) return;
     pending = true;
 
     try {
-      const kp = ctx.keypair();
-      const mintPk = new PublicKey(ctx.mint);
-      const decimals = ctx.tokenDecimals();
       const priceNow = ctx.price();
-
-      // простая логика решения:
-      const wantSell = shouldSell(bot, priceNow);
-      const wantBuy =
-        !wantSell &&
-        bot.solBalance > 0.0005 &&
-        (bot.posToken <= 0 || bot.strategy !== "revert");
-
-      if (wantSell && bot.posToken > 0) {
-        const amountTok = roundTokenAmount(bot.posToken, decimals);
-        if (amountTok > 0) {
-          // продажа: amount в токенах
-          const payload = {
-            publicKey: kp.publicKey.toBase58(),
-            action: "sell",
-            mint: ctx.mint,
-            denominatedInSol: "false",
-            amount: amountTok,
-            slippage: (ctx.slippageBps() || 50) / 100,
-            priorityFee: 0.00001,
-            pool: "auto",
-          };
-
-          try {
-            const vtx = await buildTradeTxPumpPortal(payload);
-            vtx.sign([kp]);
-            const sig = await connection.sendTransaction(vtx, {
-              skipPreflight: false,
-              maxRetries: 3,
-            });
-            await connection.confirmTransaction(sig, "confirmed");
-            bot.fills += 1;
-            bot.last = `sell ${amountTok}`;
-            log("ok", `sell ${amountTok} TOK (${sig.slice(0, 8)}…)`);
-          } catch (e: any) {
-            bot.lastError = e?.message || String(e);
-            log("warn", `sell failed: ${bot.lastError}`);
-          }
-        }
-      } else if (wantBuy) {
-        // покупка: amount в SOL
-        const spendSol = Math.max(
-          0.000001,
-          Math.min(bot.budgetSol || ctx.tradeSize(), bot.solBalance - 0.0003) // оставим чуть на комиссии
-        );
-        if (spendSol > 0.0002) {
-          // (опционально) убедиться, что у кошелька есть ATA — иначе первый fill может не пройти
-          // await ensureAtaIfMissing(connection, kp.publicKey, mintPk, kp);
-
-          const payload = {
-            publicKey: kp.publicKey.toBase58(),
-            action: "buy",
-            mint: ctx.mint,
-            denominatedInSol: "true",
-            amount: spendSol,
-            slippage: (ctx.slippageBps() || 50) / 100, // bps → %
-            priorityFee: 0.00001,
-            pool: "auto",
-          };
-
-          try {
-            const vtx = await buildTradeTxPumpPortal(payload);
-            vtx.sign([kp]);
-            const sig = await connection.sendTransaction(vtx, {
-              skipPreflight: false,
-              maxRetries: 3,
-            });
-            await connection.confirmTransaction(sig, "confirmed");
-            bot.fills += 1;
-            bot.last = `buy ${spendSol.toFixed(6)} SOL`;
-            log("ok", `buy ${spendSol.toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
-          } catch (e: any) {
-            bot.lastError = e?.message || String(e);
-            log("warn", `buy failed: ${bot.lastError}`);
-          }
-        }
-      } else {
-        bot.last = "hold";
+      if (!priceNow || !bot.aiEnabled) {
+        bot.last = bot.aiEnabled ? "no price" : "ai:off";
+        ctx.onUpdate(bot);
+        return;
       }
 
-      ctx.onUpdate(bot);
+      // кулдаун, чтобы не «строчить»
+      const cooldown = Math.max(800, bot.speedMs * (1.0 + Math.random() * 0.4));
+      if (Date.now() - lastTradeTs < cooldown) {
+        bot.last = "cooldown";
+        ctx.onUpdate(bot);
+        return;
+      }
+
+      const fast = typeof ctx.changeFast === "function" ? ctx.changeFast(15) : 0;
+      const slow = ctx.change1m();
+
+      const decision = decideHuman(bot, priceNow, fast, slow);
+      if (decision.side === "hold") {
+        bot.last = "hold";
+        ctx.onUpdate(bot);
+        return;
+      }
+
+      if (decision.side === "buy" && bot.solBalance > 0.0006) {
+        // размер — с небольшим разбросом и учётом комиссий
+        const base = Math.max(0.0002, Math.min(bot.budgetSol || ctx.tradeSize(), bot.solBalance - 0.00035));
+        const spendSol = +(base * (0.9 + Math.random() * 0.2)).toFixed(6);
+        if (spendSol <= 0.0002) { bot.last = "hold"; ctx.onUpdate(bot); return; }
+
+        // микро-TWAP: делим на 2–5 частей, если нужно
+        const needTwap = ctx.twap && spendSol > 2 * (spendSol / 4);
+        const slices = needTwap ? Math.max(2, Math.min(5, (ctx.twap?.slices || 3))) : 1;
+        const gap = needTwap ? Math.max(600, (ctx.twap?.gapMs || 1200)) : 0;
+
+        const chunk = spendSol / slices;
+        for (let i = 0; i < slices; i++) {
+          try {
+            const sig = await sendBuy(+chunk.toFixed(6));
+            applyPositionOnBuy(bot, priceNow, +chunk.toFixed(6));
+            bot.fills += 1;
+            bot.last = `buy ${chunk.toFixed(4)} SOL`;
+            lastTradeTs = Date.now();
+            lastSide = "buy";
+            log("ok", `BUY ${chunk.toFixed(6)} (${sig.slice(0, 8)}…)`);
+            ctx.onUpdate(bot);
+          } catch (e: any) {
+            bot.lastError = e?.message || String(e);
+            bot.last = "buy failed";
+            log("warn", `buy failed: ${bot.lastError}`);
+            ctx.onUpdate(bot);
+            break; // прерываем twap
+          }
+          if (needTwap && i < slices - 1) {
+            const jitter = Math.floor((Math.random() * 2 - 1) * 300);
+            await sleep(Math.max(400, gap + jitter));
+          }
+        }
+      }
+
+      if (decision.side === "sell" && bot.posToken > 0) {
+        const portion = Math.min(1, Math.max(0.1, decision.portion ?? 0.5));
+        const dec = ctx.tokenDecimals();
+        const amountTok = roundTok(bot.posToken * portion, dec);
+        if (amountTok > 0) {
+          try {
+            const sig = await sendSell(amountTok);
+            applyPositionOnSell(bot, priceNow, amountTok);
+            bot.fills += 1;
+            bot.last = `sell ${amountTok}`;
+            lastTradeTs = Date.now();
+            lastSide = "sell";
+            log("ok", `SELL ${amountTok} (${sig.slice(0, 8)}…)`);
+            ctx.onUpdate(bot);
+          } catch (e: any) {
+            bot.lastError = e?.message || String(e);
+            bot.last = "sell failed";
+            log("warn", `sell failed: ${bot.lastError}`);
+            ctx.onUpdate(bot);
+          }
+        }
+      }
     } catch (e: any) {
       bot.lastError = e?.message || String(e);
       log("warn", `tick error: ${bot.lastError}`);
     } finally {
       pending = false;
-      if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs || 8000));
+      // лёгкая вариативность таймера — чтобы «не тикали в такт»
+      const jitter = Math.floor((Math.random() * 2 - 1) * 250);
+      if (!stopped) setTimeout(loop, Math.max(400, (bot.speedMs || 8000) + jitter));
     }
   };
 
-  // старт сразу
   setTimeout(loop, 10);
-
-  // функция остановки
-  return () => {
-    stopped = true;
-  };
+  return () => { stopped = true; };
 }
