@@ -6,7 +6,6 @@ import {
   Keypair,
 } from "@solana/web3.js";
 
-// ===== Типы (минимум того, что использует стор) =====
 type BotStrategy = "trend" | "revert" | "scalper";
 
 type LiveBot = {
@@ -32,35 +31,25 @@ type LiveBot = {
 
 type RunCtx = {
   mint: string;
-
-  // слippage динамически
   slippageBps: () => number;
-
-  // TWAP-план, если задан
   twap?: { slices: number; gapMs: number } | null;
 
-  // рыночные данные
   price: () => number;
   change1m: () => number;
-  changeFast?: (secs?: number) => number; // быстрый импульс 10–15с
+  changeFast?: (secs?: number) => number;
 
-  // актуальный keypair и decimals
   keypair: () => Keypair;
   tokenDecimals: () => number;
   tradeSize: () => number;
 
-  // важно: функция, которая скажет, «поставлен ли на паузу AI»
-  // мы её передадим из store как чтение текущего состояния бота.
   isAiPaused?: () => boolean;
 
   onLog: (level: "info" | "ok" | "warn" | "err", msg: string) => void;
   onUpdate: (b: LiveBot) => void;
 };
 
-// ===== PumpPortal =====
 const PUMP_BASE = "https://pumpportal.fun";
 
-/** Возвращает VTX из pumpportal */
 async function buildTradeTxPumpPortal(
   payload: Record<string, any>
 ): Promise<VersionedTransaction> {
@@ -68,6 +57,8 @@ async function buildTradeTxPumpPortal(
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(payload),
+    keepalive: true,
+    cache: "no-store",
   });
 
   const ct = r.headers.get("content-type") || "";
@@ -82,15 +73,13 @@ async function buildTradeTxPumpPortal(
   }
 
   const j = await r.json().catch(() => ({}));
-  const b64 =
-    j?.serializedTransaction || j?.tx || j?.transaction || j?.vtx || null;
+  const b64 = j?.serializedTransaction || j?.tx || j?.transaction || j?.vtx || null;
   if (!b64) throw new Error("pumpportal: no transaction in response");
 
   const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
   return VersionedTransaction.deserialize(raw);
 }
 
-// ===== Вспомогалки =====
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function roundTok(tokens: number, decimals: number) {
@@ -98,12 +87,6 @@ function roundTok(tokens: number, decimals: number) {
   return Math.max(0, Math.floor(tokens * p) / p);
 }
 
-// ===== Правила стратегий (человечные) =====
-//
-// trend  : покупаем на устойчивом росте (быстрый импульс + положительная 1m), ТП 6–10%, SL 3–4%.
-// revert : покупаем от «дампа» (быстрый минус > ~0.4–0.6%), ТП 0.5–0.8%, SL 0.25–0.35%.
-// scalper: торгуем импульсы в обе стороны, ТП 0.6–1.2%, SL 0.3–0.5%, короткий cool-down.
-//
 function wantToSell(
   bot: LiveBot,
   currPrice: number,
@@ -121,6 +104,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let stopped = false;
   let pending = false;
   let cooldownUntil = 0;
+
+  // backoff при сетевых фейлах
+  let failStreak = 0;
+  let nextRetryAt = 0;
 
   const log = (lvl: "info" | "ok" | "warn" | "err", s: string) =>
     ctx.onLog(lvl, `[${bot.name}] ${s}`);
@@ -147,44 +134,55 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             action: "sell",
             mint: ctx.mint,
             denominatedInSol: "false",
-            amount: roundTok(bot.posToken, decimals), // продаём позицию полностью
+            amount: roundTok(bot.posToken, decimals),
             slippage: (ctx.slippageBps() || 50) / 100,
             priorityFee: 0.00001,
             pool: "auto",
           };
 
-    const vtx = await buildTradeTxPumpPortal(payload);
-    vtx.sign([kp]);
+    // сетевой флоу с ловлей «Failed to fetch» и бэкоффом
+    try {
+      const vtx = await buildTradeTxPumpPortal(payload);
+      vtx.sign([kp]);
 
-    const sig = await connection.sendTransaction(vtx, {
-      skipPreflight: false,
-      maxRetries: 3,
-    });
-    await connection.confirmTransaction(sig, "confirmed");
+      const sig = await connection.sendTransaction(vtx, {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
+      await connection.confirmTransaction(sig, "confirmed");
 
-    // «честно» обновим метрики локально (без ончейн-чтений)
-    if (side === "buy") {
-      const qty = sizeSol / priceNow;
-      const newPos = bot.posToken + qty;
-      bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + sizeSol) / newPos : priceNow;
-      bot.posToken = newPos;
-    } else {
-      const sellQty = bot.posToken;
-      bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
-      bot.posToken = 0;
-      bot.avgSol = 0;
+      // успех — сбрасываем backoff
+      failStreak = 0;
+      nextRetryAt = 0;
+
+      if (side === "buy") {
+        const qty = sizeSol / priceNow;
+        const newPos = bot.posToken + qty;
+        bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + sizeSol) / newPos : priceNow;
+        bot.posToken = newPos;
+      } else {
+        const sellQty = bot.posToken;
+        bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
+        bot.posToken = 0;
+        bot.avgSol = 0;
+      }
+      bot.unrealized = bot.posToken * (priceNow - (bot.avgSol || priceNow));
+      bot.fills += 1;
+      bot.last = `${side} ${side === "buy" ? sizeSol.toFixed(4) + " SOL" : "ALL"} @ slp=${ctx.slippageBps().toFixed(0)}bps`;
+
+      ctx.onUpdate(bot);
+      log("ok", `${side.toUpperCase()} ${sig.slice(0, 8)}…`);
+
+      cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
+    } catch (e: any) {
+      failStreak++;
+      const cool = Math.min(20_000, 1_000 * failStreak); // 1s → 20s
+      nextRetryAt = Date.now() + cool;
+
+      bot.lastError = e?.message || String(e);
+      ctx.onUpdate(bot);
+      log("warn", `net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
     }
-    bot.unrealized = bot.posToken * (priceNow - (bot.avgSol || priceNow));
-    bot.fills += 1;
-    bot.last = `${side} ${side === "buy" ? sizeSol.toFixed(4) + " SOL" : "ALL"} @ slp=${ctx
-      .slippageBps()
-      .toFixed(0)}bps`;
-
-    ctx.onUpdate(bot);
-    log("ok", `${side.toUpperCase()} ${sig.slice(0, 8)}…`);
-
-    // небольшой anti-spam
-    cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
   }
 
   async function loop() {
@@ -192,6 +190,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     if (pending) return;
 
     const now = Date.now();
+    // если отложенный ретрай — ждём
+    if (now < nextRetryAt) {
+      setTimeout(loop, Math.max(200, nextRetryAt - now));
+      return;
+    }
     if (now < cooldownUntil) {
       setTimeout(loop, Math.max(50, cooldownUntil - now));
       return;
@@ -208,10 +211,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       const p = Math.max(1e-12, ctx.price());
-      const fast = (ctx.changeFast?.(12) ?? 0); // ~12s импульс
+      const fast = (ctx.changeFast?.(12) ?? 0);
       const ch1m = ctx.change1m();
 
-      // лимиты покупки и базовый размер
       const baseSize = Math.max(0.0002, Math.min(bot.budgetSol || ctx.tradeSize(), bot.solBalance - 0.0003));
       const haveSol = bot.solBalance > 0.0006;
 
@@ -219,13 +221,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       switch (bot.strategy) {
         case "trend": {
-          // buy: только если импульс вверх и минутная дельта >= 0
           if (haveSol && fast > 0.002 && ch1m >= 0) {
             await trade("buy", baseSize);
             did = true;
             break;
           }
-          // sell: TP 8%, SL 4%
           if (wantToSell(bot, p, 800, 400)) {
             await trade("sell", 0);
             did = true;
@@ -233,13 +233,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           break;
         }
         case "revert": {
-          // buy на сильной просадке
           if (haveSol && fast < -0.004) {
             await trade("buy", baseSize);
             did = true;
             break;
           }
-          // sell: маленький TP/SL
           if (wantToSell(bot, p, 70, 35)) {
             await trade("sell", 0);
             did = true;
@@ -247,7 +245,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           break;
         }
         case "scalper": {
-          // лёгкая асимметрия: хапаем импульсы в обе стороны
           if (haveSol && Math.abs(fast) > 0.0022) {
             await trade("buy", baseSize);
             did = true;
@@ -263,7 +260,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       if (!did) {
         bot.last = "hold";
-        // тянем mark-to-market
         bot.unrealized = bot.posToken * (p - (bot.avgSol || p));
         ctx.onUpdate(bot);
       }
@@ -278,7 +274,5 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   }
 
   setTimeout(loop, 10);
-  return () => {
-    stopped = true;
-  };
+  return () => { stopped = true; };
 }
