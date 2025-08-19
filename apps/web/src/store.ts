@@ -481,12 +481,13 @@ export const useStore = create<Store>()(
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
       },
 
-      updateBot: (id, patch) => {
+     
+
+updateBot: (id, patch) =>
   set((s) => {
     const bots = s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b));
     return { bots };
-  });
-},
+  }),
 
 removeBot: (id) => {
   removeKey(id);
@@ -497,6 +498,7 @@ removeBot: (id) => {
 },
 
 exportBotKey: (id) => exportSecret(id),
+
 
 
       // Пополнение из Treasury
