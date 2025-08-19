@@ -324,7 +324,7 @@ export type Store = {
 
   smartMM: SmartMM;
   getSmartBps: () => number;
-  getTwapPlan: () => { slices: number; gapMs: number } | null;
+  getTwapPlan: () => ({ slices: number; gapMs: number } | null);
 
   treasuryKeyId?: string;
   autoTopUp: boolean;
@@ -369,12 +369,8 @@ export type Store = {
     }
   ) => Promise<void>;
 
-  /** Купит на весь доступный SOL за вычетом keepFeeSol (историческая) */
   buyAllBotsOnPump: (connection: Connection, opts?: { keepFeeSol?: number }) => Promise<void>;
-
-  /** Новая: все боты покупают на percent (0..1) своего баланса SOL */
   buyAllBotsAtPercentOnPump: (connection: Connection, percent: number, opts?: { keepFeeSol?: number }) => Promise<void>;
-  /** Сахар: 80% */
   buyAllBots80OnPump: (connection: Connection, opts?: { keepFeeSol?: number }) => Promise<void>;
 
   sellAllToWalletOnPump: (connection: Connection, walletPubkey: string, opts?: { keepFeeSol?: number }) => Promise<void>;
@@ -466,7 +462,7 @@ export const useStore = create<Store>()(
       autoTopUp: true,
       minFeeSol: 0.01,
       topUpToSol: 0.03,
-      setTreasuryFromSecret: (name, secret) => {
+      setTreasuryFromSecret: (name: string, secret: string) => {
         const rec = importKey(name || "Treasury", secret);
         set({ treasuryKeyId: rec.id });
         get().addLog("ok", `Treasury задан: ${rec.pubkey}`);
@@ -808,7 +804,12 @@ export const useStore = create<Store>()(
                 };
               }),
             })),
-        });
+
+          // <<< НОВОЕ: после сделки мягко обновляем балансы с RPC
+          afterTrade: () => {
+            get().refreshBalances(connection).catch(() => {});
+          },
+        } as any); // as any — чтобы не ругался TS, если RunCtx пока без afterTrade
 
         (bot as any).__stop = stop;
       },
@@ -824,43 +825,68 @@ export const useStore = create<Store>()(
       startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
       stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
 
-      // Балансы + авто-донат
+      // ===== Балансы + авто-донат (ПОЧИНЕНО) =====
       async refreshBalances(connection) {
-        const mint = get().tokenMint;
-        if (!mint) return;
+        try {
+          const s = get();
+          const mint = s.tokenMint || null;
 
-        let dec = get()._mintDecimals;
-        if (dec == null) {
-          try { dec = await getMintDecimals(connection, mint); set({ _mintDecimals: dec }); } catch {}
-        }
-        const decimals = dec ?? 9;
-
-        const bots = await Promise.all(
-          get().bots.map(async (b) => {
+          // выясняем decimals токена (если mint известен)
+          let decimals: number | null = null;
+          if (mint) {
             try {
-              const lam = await connection.getBalance(new PublicKey(b.pubkey));
-              const sol = lam / LAMPORTS_PER_SOL;
-              const raw = await getSPLBalance(connection, b.pubkey, mint);
-              const tok = Number(raw) / Math.pow(10, decimals);
-              return { ...b, solBalance: sol, tokenBalance: tok };
-            } catch { return b; }
-          })
-        );
-        set({ bots });
-
-        const { autoTopUp, minFeeSol, topUpBot } = get();
-        if (autoTopUp) {
-          const nowTs = Date.now();
-          const last = get()._lastTopUp || {};
-          for (const b of bots) {
-            if (b.solBalance < minFeeSol) {
-              if (!last[b.id] || nowTs - last[b.id] > 30_000) {
-                last[b.id] = nowTs;
-                try { await topUpBot(connection, b.id); } catch {}
-              }
+              let d = s._mintDecimals;
+              if (d == null) { d = await getMintDecimals(connection, mint); set({ _mintDecimals: d }); }
+              decimals = d ?? 9;
+            } catch {
+              decimals = 9;
             }
           }
-          set({ _lastTopUp: last });
+
+          const priceNow = get().price || 0;
+
+          const bots = await Promise.all(
+            get().bots.map(async (b) => {
+              // SOL — всегда обновляем
+              let sol = b.solBalance;
+              try {
+                const lam = await connection.getBalance(new PublicKey(b.pubkey));
+                sol = lam / LAMPORTS_PER_SOL;
+              } catch {}
+
+              // токен — только если mint известен
+              let tok = b.tokenBalance;
+              if (mint && decimals != null) {
+                try {
+                  const raw = await getSPLBalance(connection, b.pubkey, mint);
+                  tok = Number(raw) / Math.pow(10, decimals);
+                } catch {}
+              }
+
+              const unreal = b.posToken * (priceNow - (b.avgSol || priceNow));
+              return { ...b, solBalance: sol, tokenBalance: tok, unrealized: unreal };
+            })
+          );
+
+          set({ bots });
+
+          // авто-донат
+          const { autoTopUp, minFeeSol, topUpBot } = get();
+          if (autoTopUp) {
+            const nowTs = Date.now();
+            const last = get()._lastTopUp || {};
+            for (const b of bots) {
+              if (b.solBalance < minFeeSol) {
+                if (!last[b.id] || nowTs - last[b.id] > 30_000) {
+                  last[b.id] = nowTs;
+                  try { await topUpBot(connection, b.id); } catch {}
+                }
+              }
+            }
+            set({ _lastTopUp: last });
+          }
+        } catch (e: any) {
+          get().addLog("warn", `refreshBalances: ${e?.message || String(e)}`);
         }
       },
 
