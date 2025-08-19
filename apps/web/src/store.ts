@@ -65,32 +65,48 @@ function withTimeout<T>(p: Promise<T>, ms = 10_000): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("fetch timeout")), ms);
     p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      }
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
     );
   });
 }
 
-async function fetchFirstOk(path: string, init: RequestInit, retries = 2) {
+/** Укреплённая обёртка: keepalive, эксп. бэкофф, повтор по 429/5xx, несколько баз */
+async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
+  const baseInit: RequestInit = {
+    keepalive: true,
+    credentials: "omit",
+    cache: "no-store",
+    mode: "cors",
+    ...init,
+    headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
+  };
+
   let lastErr: any;
-  for (const base of PUMP_BASES) {
+  const bases = PUMP_BASES.length ? PUMP_BASES : [""];
+  for (const base of bases) {
     const url = `${base.replace(/\/$/, "")}${path}`;
     for (let attempt = 0; attempt <= retries; attempt++) {
+      const backoff = 350 * attempt + Math.floor(Math.random() * 250);
       try {
-        const r = await withTimeout(fetch(url, init), 12_000);
+        const ctl = new AbortController();
+        const t = setTimeout(() => ctl.abort(), 15_000);
+        const r = await fetch(url, { ...baseInit, signal: ctl.signal });
+        clearTimeout(t);
+
         if (r.ok) return r;
+        // на 429/5xx — пробуем ещё
+        if (r.status >= 500 || r.status === 429) {
+          lastErr = new Error(`${r.status} ${r.statusText}`);
+          await new Promise((res) => setTimeout(res, backoff));
+          continue;
+        }
+        // прочий статус — прекращаем
         const txt = await r.text().catch(() => "");
-        lastErr = new Error(`${r.status} ${r.statusText}: ${txt || url}`);
-        break;
+        throw new Error(`${r.status} ${r.statusText}${txt ? `: ${txt}` : ""}`);
       } catch (e) {
         lastErr = e;
-        await new Promise((res) => setTimeout(res, 300 + attempt * 300));
+        await new Promise((res) => setTimeout(res, backoff));
       }
     }
   }
@@ -98,14 +114,38 @@ async function fetchFirstOk(path: string, init: RequestInit, retries = 2) {
 }
 
 /* ---------- Local API ---------- */
+/** Сборка vtx c фолбэком: /api/trade-local → /api/trade (JSON) */
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
-  const res = await fetchFirstOk("/api/trade-local", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const raw = new Uint8Array(await res.arrayBuffer());
-  return VersionedTransaction.deserialize(raw);
+  // 1) основной маршрут — локальный
+  try {
+    const res = await fetchFirstOk("/api/trade-local", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      const j = await res.json();
+      const b64 = j?.serializedTransaction ?? j?.tx;
+      if (!b64) throw new Error("trade-local: no serializedTransaction");
+      const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
+      return VersionedTransaction.deserialize(raw);
+    }
+    const raw = new Uint8Array(await res.arrayBuffer());
+    return VersionedTransaction.deserialize(raw);
+  } catch (_e) {
+    // 2) фолбэк — роутер /api/trade (JSON)
+    const res = await fetchFirstOk("/api/trade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({} as any));
+    const b64 = j?.serializedTransaction ?? j?.tx;
+    if (!b64) throw new Error("trade fallback: no serializedTransaction");
+    const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
+    return VersionedTransaction.deserialize(raw);
+  }
 }
 
 async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransaction; mint?: string }> {
@@ -146,12 +186,7 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
 
 /* ---------- Lightning API ---------- */
 async function uploadIpfsMeta(params: {
-  name: string;
-  symbol: string;
-  image: string;
-  description?: string;
-  website?: string;
-  twitter?: string;
+  name: string; symbol: string; image: string; description?: string; website?: string; twitter?: string;
 }) {
   const r = await fetchFirstOk("/api/ipfs", {
     method: "POST",
@@ -172,23 +207,13 @@ async function uploadIpfsMeta(params: {
 }
 
 async function buildCreateViaLightning(args: {
-  name: string;
-  symbol: string;
-  image: string;
-  description?: string;
-  website?: string;
-  twitter?: string;
-  initialBuySol?: number;
-  slippagePct?: number;
-  priorityFeeSol?: number;
+  name: string; symbol: string; image: string;
+  description?: string; website?: string; twitter?: string;
+  initialBuySol?: number; slippagePct?: number; priorityFeeSol?: number;
 }) {
   const uri = await uploadIpfsMeta({
-    name: args.name,
-    symbol: args.symbol,
-    image: args.image,
-    description: args.description,
-    website: args.website,
-    twitter: args.twitter,
+    name: args.name, symbol: args.symbol, image: args.image,
+    description: args.description, website: args.website, twitter: args.twitter,
   });
 
   const payload = {
@@ -341,14 +366,8 @@ export type Store = {
     connection: Connection,
     creatorPubkey: string,
     params: {
-      name: string;
-      symbol: string;
-      image: string;
-      description?: string;
-      website?: string;
-      twitter?: string;
-      decimals?: number;
-      initialBuySol?: number;
+      name: string; symbol: string; image: string;
+      description?: string; website?: string; twitter?: string; decimals?: number; initialBuySol?: number;
     }
   ) => Promise<void>;
   buyAllBotsOnPump: (connection: Connection, opts?: { keepFeeSol?: number }) => Promise<void>;
@@ -381,10 +400,7 @@ export const useStore = create<Store>()(
         // базовая цена — ближайший тик "чуть старше" горизонта
         let base = st.ticks[0].p;
         for (let i = st.ticks.length - 1; i >= 0; i--) {
-          if (st.ticks[i].t <= since) {
-            base = st.ticks[i].p;
-            break;
-          }
+          if (st.ticks[i].t <= since) { base = st.ticks[i].p; break; }
         }
         const curr = st.price || st.ticks.at(-1)?.p || base;
         return (curr - base) / Math.max(1e-9, base);
@@ -422,8 +438,7 @@ export const useStore = create<Store>()(
         const p1 = last[last.length - 1].close;
         const slope = (p1 - p0) / Math.max(1e-9, p0);
         const mean = last.reduce((a, c) => a + c.close, 0) / last.length;
-        const sd =
-          Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
+        const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
         const sNorm = Math.min(1, Math.abs(slope) / 0.02);
         const vNorm = Math.min(1, sd / 0.01);
 
@@ -463,9 +478,7 @@ export const useStore = create<Store>()(
         if (mint && isPump) {
           import("./external/pumpportal").then(({ attachPumpPortalFeed }) => {
             const s = get();
-            try {
-              s._ppSub?.detach?.();
-            } catch {}
+            try { s._ppSub?.detach?.(); } catch {}
             const sub = attachPumpPortalFeed({
               mint,
               onPrice: (p) =>
@@ -480,11 +493,7 @@ export const useStore = create<Store>()(
                   const last = st.candles.at(-1);
                   let c = st.candles.slice();
                   if (!last || last.t !== m) c.push({ t: m, open: p, high: p, low: p, close: p, volume: 0 });
-                  else {
-                    last.high = Math.max(last.high, p);
-                    last.low = Math.min(last.low, p);
-                    last.close = p;
-                  }
+                  else { last.high = Math.max(last.high, p); last.low = Math.min(last.low, p); last.close = p; }
                   if (c.length > 1000) c = c.slice(-1000);
                   return { candles: c };
                 }),
@@ -493,9 +502,7 @@ export const useStore = create<Store>()(
             set((s2) => ({ ...s2, external: { ...s2.external, provider: "pumpportal" }, _ppSub: sub }));
           });
         } else {
-          try {
-            get()._ppSub?.detach?.();
-          } catch {}
+          try { get()._ppSub?.detach?.(); } catch {}
           set({ _ppSub: undefined });
         }
       },
@@ -503,23 +510,10 @@ export const useStore = create<Store>()(
       addBot: (name) => {
         const rec = createKey(name || `Bot#${get().bots.length + 1}`);
         const bot: LiveBot = {
-          id: rec.id,
-          name: rec.name,
-          pubkey: rec.pubkey,
-          keyId: rec.id,
-          strategy: "trend",
-          budgetSol: 0.02,
-          speedMs: 8000,
-          running: false,
-          aiEnabled: true,
-          manualLock: false,
-          solBalance: 0,
-          tokenBalance: 0,
-          posToken: 0,
-          avgSol: 0,
-          realized: 0,
-          unrealized: 0,
-          fills: 0,
+          id: rec.id, name: rec.name, pubkey: rec.pubkey, keyId: rec.id,
+          strategy: "trend", budgetSol: 0.02, speedMs: 8000, running: false, aiEnabled: true,
+          manualLock: false, solBalance: 0, tokenBalance: 0, posToken: 0, avgSol: 0,
+          realized: 0, unrealized: 0, fills: 0,
         };
         set((s) => ({ bots: [...s.bots, bot] }));
         get().addLog("ok", `Создан суб-кошелёк ${bot.name}: ${bot.pubkey}`);
@@ -528,23 +522,10 @@ export const useStore = create<Store>()(
       importBotFromSecret: (name, secretB64) => {
         const rec = importKey(name || `BotImported#${get().bots.length + 1}`, secretB64);
         const bot: LiveBot = {
-          id: rec.id,
-          name: rec.name,
-          pubkey: rec.pubkey,
-          keyId: rec.id,
-          strategy: "trend",
-          budgetSol: 0.02,
-          speedMs: 8000,
-          running: false,
-          aiEnabled: true,
-          manualLock: false,
-          solBalance: 0,
-          tokenBalance: 0,
-          posToken: 0,
-          avgSol: 0,
-          realized: 0,
-          unrealized: 0,
-          fills: 0,
+          id: rec.id, name: rec.name, pubkey: rec.pubkey, keyId: rec.id,
+          strategy: "trend", budgetSol: 0.02, speedMs: 8000, running: false, aiEnabled: true,
+          manualLock: false, solBalance: 0, tokenBalance: 0, posToken: 0, avgSol: 0,
+          realized: 0, unrealized: 0, fills: 0,
         };
         set((s) => ({ bots: [...s.bots, bot] }));
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
@@ -559,18 +540,12 @@ export const useStore = create<Store>()(
       },
 
       removeBot: (id: string) => {
-        try {
-          removeKey(id);
-        } catch {}
+        try { removeKey(id); } catch {}
         set((s) => ({ bots: s.bots.filter((b) => b.id !== id) }));
       },
 
       exportBotKey: (id: string) => {
-        try {
-          return exportSecret(id);
-        } catch {
-          return null;
-        }
+        try { return exportSecret(id); } catch { return null; }
       },
 
       // Пополнение из Treasury
@@ -579,10 +554,7 @@ export const useStore = create<Store>()(
         const bot = s.bots.find((b) => b.id === botId);
         if (!bot) return;
         const kpId = s.treasuryKeyId;
-        if (!kpId) {
-          s.addLog("warn", "Не задан Treasury — пополнение невозможно");
-          return;
-        }
+        if (!kpId) { s.addLog("warn", "Не задан Treasury — пополнение невозможно"); return; }
         const kp = getKeypair(kpId);
         const need = Math.max(0, s.topUpToSol - bot.solBalance);
         if (need <= 0) return;
@@ -612,16 +584,10 @@ export const useStore = create<Store>()(
 
         const keep = Math.max(s.drainMinKeepSol, s.minFeeSol);
         let sendSol = bot.solBalance - keep - 0.00001;
-        if (sendSol <= 0) {
-          s.addLog("info", `Drain ${bot.name}: нечего отправлять (баланс ${bot.solBalance.toFixed(6)} SOL)`);
-          return;
-        }
+        if (sendSol <= 0) { s.addLog("info", `Drain ${bot.name}: нечего отправлять (баланс ${bot.solBalance.toFixed(6)} SOL)`); return; }
         sendSol = Math.max(0, +sendSol.toFixed(6));
         const lamports = Math.floor(sendSol * LAMPORTS_PER_SOL);
-        if (lamports <= 0) {
-          s.addLog("info", `Drain ${bot.name}: слишком мало для перевода`);
-          return;
-        }
+        if (lamports <= 0) { s.addLog("info", `Drain ${bot.name}: слишком мало для перевода`); return; }
 
         try {
           const kp = getKeypair(bot.keyId);
@@ -631,10 +597,7 @@ export const useStore = create<Store>()(
           tx.sign(kp);
           const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
           await confirmSigHttp(connection, sig);
-          s.addLog(
-            "ok",
-            `Drain ${bot.name} → ${dest.toBase58().slice(0, 4)}…: ${sendSol.toFixed(6)} SOL (${sig})`
-          );
+          s.addLog("ok", `Drain ${bot.name} → ${dest.toBase58().slice(0, 4)}…: ${sendSol.toFixed(6)} SOL (${sig})`);
         } catch (e: any) {
           s.addLog("err", `Drain error ${bot.name}: ${e?.message || e}`);
         }
@@ -655,18 +618,13 @@ export const useStore = create<Store>()(
 
       async safeWarmupBots(connection) {
         const s = get();
-        if (!s.tokenMint) {
-          s.addLog("warn", "Warm-up: mint не задан");
-          return;
-        }
+        if (!s.tokenMint) { s.addLog("warn", "Warm-up: mint не задан"); return; }
         const mintPk = new PublicKey(s.tokenMint);
 
         for (const bot of s.bots) {
           if (bot.solBalance < s.minFeeSol) {
             if (s.autoTopUp && s.treasuryKeyId) {
-              try {
-                await get().topUpBot(connection, bot.id);
-              } catch {}
+              try { await get().topUpBot(connection, bot.id); } catch {}
               await get().refreshBalances(connection);
             } else {
               s.addLog("warn", `Warm-up: пропуск ${bot.name} — мало SOL и нет авто-доната`);
@@ -690,19 +648,13 @@ export const useStore = create<Store>()(
                 await confirmSigHttp(connection, sig);
                 s.addLog("ok", `Warm-up: создан ATA для ${bot.name}: ${ata.toBase58()} (${sig})`);
               }
-            } catch (e: any) {
-              s.addLog("err", `Warm-up ATA ${bot.name}: ${e?.message || e}`);
-            }
+            } catch (e: any) { s.addLog("err", `Warm-up ATA ${bot.name}: ${e?.message || e}`); }
           }
 
           try {
             const kp = getKeypair(bot.keyId);
             for (let i = 0; i < get().warmupCfg.simulatePerBot; i++) {
-              const memoIx = new TransactionInstruction({
-                keys: [],
-                programId: MEMO_PROGRAM_ID,
-                data: Buffer.from(`warmup:${Date.now()}:${i}`),
-              });
+              const memoIx = new TransactionInstruction({ keys: [], programId: MEMO_PROGRAM_ID, data: Buffer.from(`warmup:${Date.now()}:${i}`) });
               const tx = new Transaction().add(memoIx);
               tx.feePayer = kp.publicKey;
               tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
@@ -711,9 +663,7 @@ export const useStore = create<Store>()(
               await new Promise((r) => setTimeout(r, get().warmupCfg.gapMs));
             }
             s.addLog("ok", `Warm-up: симуляции выполнены для ${bot.name}`);
-          } catch (e: any) {
-            s.addLog("warn", `Warm-up simulate ${bot.name}: ${e?.message || e}`);
-          }
+          } catch (e: any) { s.addLog("warn", `Warm-up simulate ${bot.name}: ${e?.message || e}`); }
         }
 
         await get().refreshBalances(connection);
@@ -725,16 +675,10 @@ export const useStore = create<Store>()(
       async mainnetWarmupTransfers(connection, opts = {}) {
         const s = get();
         const ep = (connection as any)?.rpcEndpoint || "";
-        if (/devnet|testnet/i.test(ep)) {
-          s.addLog("warn", "Mainnet warm-up доступен только на mainnet RPC");
-          return;
-        }
+        if (/devnet|testnet/i.test(ep)) { s.addLog("warn", "Mainnet warm-up доступен только на mainnet RPC"); return; }
 
         const bots = s.bots;
-        if (bots.length < 2) {
-          s.addLog("warn", "Нужно ≥2 бота для кольцевых переводов");
-          return;
-        }
+        if (bots.length < 2) { s.addLog("warn", "Нужно ≥2 бота для кольцевых переводов"); return; }
 
         const cfg = { ...s.mainnetWarmupCfg, ...opts };
         const { txPerBot, lamports, gapMs, maxTotalSolPerBot } = cfg;
@@ -745,33 +689,21 @@ export const useStore = create<Store>()(
         const estPerBotSol = estPerBotLam / LAMPORTS_PER_SOL;
 
         if (estPerBotSol > maxTotalSolPerBot) {
-          s.addLog(
-            "warn",
-            `Warm-up остановлен: расчётная трата ${estPerBotSol.toFixed(6)} SOL/бот > лимита ${maxTotalSolPerBot}`
-          );
+          s.addLog("warn", `Warm-up остановлен: расчётная трата ${estPerBotSol.toFixed(6)} SOL/бот > лимита ${maxTotalSolPerBot}`);
           return;
         }
 
         for (const b of bots) {
           if (b.solBalance < estPerBotSol + s.minFeeSol) {
-            s.addLog(
-              "warn",
-              `Warm-up: у ${b.name} мало SOL (${b.solBalance.toFixed(6)}), требуется ≥ ${(estPerBotSol + s.minFeeSol).toFixed(6)} SOL`
-            );
+            s.addLog("warn", `Warm-up: у ${b.name} мало SOL (${b.solBalance.toFixed(6)}), требуется ≥ ${(estPerBotSol + s.minFeeSol).toFixed(6)} SOL`);
           }
         }
 
-        s.addLog(
-          "info",
-          `Mainnet warm-up: ${txPerBot} tx/бот, ${(lamports / LAMPORTS_PER_SOL).toFixed(6)} SOL/tx, лимит ~${estPerBotSol.toFixed(6)} SOL/бот`
-        );
+        s.addLog("info", `Mainnet warm-up: ${txPerBot} tx/бот, ${(lamports / LAMPORTS_PER_SOL).toFixed(6)} SOL/tx, лимит ~${estPerBotSol.toFixed(6)} SOL/бот`);
 
         for (const sender of bots) {
           const kp = getKeypair(sender.keyId);
-          if (!kp) {
-            s.addLog("err", `Нет ключа для ${sender.name}`);
-            continue;
-          }
+          if (!kp) { s.addLog("err", `Нет ключа для ${sender.name}`); continue; }
 
           const idx = bots.findIndex((x) => x.id === sender.id);
           const receiver = bots[(idx + 1) % bots.length];
@@ -780,12 +712,7 @@ export const useStore = create<Store>()(
           for (let i = 0; i < txPerBot; i++) {
             try {
               const sig = await sendTransferWithRetry(connection as Connection, kp, toPk, lamports, 3);
-              s.addLog(
-                "ok",
-                `Warm-up ${sender.name} → ${receiver.name}: ${(lamports / LAMPORTS_PER_SOL).toFixed(6)} SOL (${i + 1}/${
-                  txPerBot
-                }) ${sig.slice(0, 8)}…`
-              );
+              s.addLog("ok", `Warm-up ${sender.name} → ${receiver.name}: ${(lamports / LAMPORTS_PER_SOL).toFixed(6)} SOL (${i + 1}/${txPerBot}) ${sig.slice(0, 8)}…`);
             } catch (e: any) {
               s.addLog("warn", `Warm-up tx fail ${sender.name}: ${e?.message || e}`);
             }
@@ -808,10 +735,7 @@ export const useStore = create<Store>()(
             await get().topUpBot(connection, bot.id);
             await get().refreshBalances(connection);
           } else {
-            s.addLog(
-              "warn",
-              `Бот ${bot.name} НЕ запущен: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${s.minFeeSol})`
-            );
+            s.addLog("warn", `Бот ${bot.name} НЕ запущен: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${s.minFeeSol})`);
             return;
           }
         }
@@ -851,7 +775,7 @@ export const useStore = create<Store>()(
             return r > 0 ? r : bot.budgetSol;
           },
 
-          // Читаем актуальный AI с UI, раннер уважает паузу
+          // читаем флажок AI «на лету»
           isAiPaused: () => {
             const curr = get().bots.find((x) => x.id === bot.id);
             return !(curr?.aiEnabled);
@@ -886,22 +810,13 @@ export const useStore = create<Store>()(
       stopBot: (id) =>
         set((s) => {
           const b = s.bots.find((x) => x.id === id);
-          if (b && (b as any).__stop) {
-            try {
-              (b as any).__stop();
-            } catch {}
-            delete (b as any).__stop;
-          }
+          if (b && (b as any).__stop) { try { (b as any).__stop(); } catch {} delete (b as any).__stop; }
           if (b) b.running = false;
           return { bots: [...s.bots] };
         }),
 
-      startAll: (connection) => {
-        get().bots.forEach((b) => get().startBot(b.id, connection));
-      },
-      stopAll: () => {
-        get().bots.forEach((b) => get().stopBot(b.id));
-      },
+      startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
+      stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
 
       // Балансы + авто-донат
       async refreshBalances(connection) {
@@ -910,10 +825,7 @@ export const useStore = create<Store>()(
 
         let dec = get()._mintDecimals;
         if (dec == null) {
-          try {
-            dec = await getMintDecimals(connection, mint);
-            set({ _mintDecimals: dec });
-          } catch {}
+          try { dec = await getMintDecimals(connection, mint); set({ _mintDecimals: dec }); } catch {}
         }
         const decimals = dec ?? 9;
 
@@ -925,9 +837,7 @@ export const useStore = create<Store>()(
               const raw = await getSPLBalance(connection, b.pubkey, mint);
               const tok = Number(raw) / Math.pow(10, decimals);
               return { ...b, solBalance: sol, tokenBalance: tok };
-            } catch {
-              return b;
-            }
+            } catch { return b; }
           })
         );
         set({ bots });
@@ -940,9 +850,7 @@ export const useStore = create<Store>()(
             if (b.solBalance < minFeeSol) {
               if (!last[b.id] || nowTs - last[b.id] > 30_000) {
                 last[b.id] = nowTs;
-                try {
-                  await topUpBot(connection, b.id);
-                } catch {}
+                try { await topUpBot(connection, b.id); } catch {}
               }
             }
           }
@@ -963,11 +871,7 @@ export const useStore = create<Store>()(
           const last = st.candles.at(-1);
           let c = st.candles.slice();
           if (!last || last.t !== m) c.push({ t: m, open: p, high: p, low: p, close: p, volume: 0 });
-          else {
-            last.high = Math.max(last.high, p);
-            last.low = Math.min(last.low, p);
-            last.close = p;
-          }
+          else { last.high = Math.max(last.high, p); last.low = Math.min(last.low, p); last.close = p; }
           if (c.length > 1000) c = c.slice(-1000);
 
           // тики (60 секунд скользящее окно)
@@ -985,24 +889,14 @@ export const useStore = create<Store>()(
         try {
           const slippagePct = (get().getSmartBps() || 50) / 100;
           const { mint, signature } = await buildCreateViaLightning({
-            name: params.name,
-            symbol: params.symbol,
-            image: params.image,
-            description: params.description,
-            website: params.website,
-            twitter: params.twitter,
+            name: params.name, symbol: params.symbol, image: params.image,
+            description: params.description, website: params.website, twitter: params.twitter,
             initialBuySol: params.initialBuySol || 0,
-            slippagePct,
-            priorityFeeSol: 0.00001,
+            slippagePct, priorityFeeSol: 0.00001,
           });
 
           get().addLog("ok", `Token created (Lightning): ${mint}${signature ? ` (${signature.slice(0, 8)}…)` : ""}`);
-          set((s) => ({
-            ...s,
-            tokenUrl: mint,
-            tokenMint: mint,
-            external: { ...s.external, provider: "pumpportal" },
-          }));
+          set((s) => ({ ...s, tokenUrl: mint, tokenMint: mint, external: { ...s.external, provider: "pumpportal" } }));
 
           await get().buyAllBotsOnPump(connection, { keepFeeSol: Math.max(0.002, get().minFeeSol) });
           await get().refreshBalances(connection);
@@ -1027,20 +921,14 @@ export const useStore = create<Store>()(
           const { tx, mint } = await buildCreateTxPumpLocal(body);
 
           const ph = (window as any).solana;
-          if (!ph?.signAndSendTransaction)
-            throw new Error("Phantom должен поддерживать signAndSendTransaction (vtx)");
+          if (!ph?.signAndSendTransaction) throw new Error("Phantom должен поддерживать signAndSendTransaction (vtx)");
           const { signature } = await ph.signAndSendTransaction(tx);
           await confirmSigHttp(connection, signature);
 
           const tokenMint = mint || get().tokenMint;
           if (tokenMint) {
             get().addLog("ok", `Token created (Local): ${tokenMint} (${signature.slice(0, 8)}…)`);
-            set((s) => ({
-              ...s,
-              tokenUrl: tokenMint,
-              tokenMint: tokenMint,
-              external: { ...s.external, provider: "pumpportal" },
-            }));
+            set((s) => ({ ...s, tokenUrl: tokenMint, tokenMint: tokenMint, external: { ...s.external, provider: "pumpportal" } }));
           } else {
             get().addLog("warn", "Token created, но API не вернул mint — укажи адрес вручную");
           }
@@ -1055,17 +943,11 @@ export const useStore = create<Store>()(
       async buyAllBotsOnPump(connection, opts = {}) {
         const keep = Math.max(0.0005, (opts as any).keepFeeSol ?? get().minFeeSol);
         const s = get();
-        if (!s.tokenMint) {
-          s.addLog("warn", "Auto-buy: mint не задан");
-          return;
-        }
+        if (!s.tokenMint) { s.addLog("warn", "Auto-buy: mint не задан"); return; }
         for (let i = 0; i < s.bots.length; i++) {
           const b = s.bots[i];
           const spend = Math.max(0, +(b.solBalance - keep).toFixed(6));
-          if (spend <= 0) {
-            s.addLog("info", `Auto-buy ${b.name}: нечего тратить`);
-            continue;
-          }
+          if (spend <= 0) { s.addLog("info", `Auto-buy ${b.name}: нечего тратить`); continue; }
           try {
             const kp = getKeypair(b.keyId);
             const vtx = await buildTradeTxPumpLocal({
@@ -1092,28 +974,19 @@ export const useStore = create<Store>()(
       // === Sell ALL — боты → кошелёк → одна продажа
       async sellAllToWalletOnPump(connection, walletPubkey) {
         const s = get();
-        if (!s.tokenMint) {
-          s.addLog("warn", "Sell ALL: mint не задан");
-          return;
-        }
+        if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
 
         const mintPk = new PublicKey(s.tokenMint);
         const walletPk = new PublicKey(walletPubkey);
 
         let decimals = s._mintDecimals;
         if (decimals == null) {
-          try {
-            decimals = await getMintDecimals(connection, s.tokenMint);
-            set({ _mintDecimals: decimals });
-          } catch {}
+          try { decimals = await getMintDecimals(connection, s.tokenMint); set({ _mintDecimals: decimals }); } catch {}
         }
         decimals = decimals ?? 9;
 
-        try {
-          await ensureWalletAta(connection as Connection, walletPubkey, s.tokenMint);
-        } catch (e) {
-          s.addLog("warn", `Ensure wallet ATA: ${String((e as any)?.message || e)}`);
-        }
+        try { await ensureWalletAta(connection as Connection, walletPubkey, s.tokenMint); }
+        catch (e) { s.addLog("warn", `Ensure wallet ATA: ${String((e as any)?.message || e)}`); }
 
         const programId = await detectTokenProgram(connection as Connection, mintPk);
 
@@ -1126,15 +999,11 @@ export const useStore = create<Store>()(
 
             const raw = await getSPLBalance(connection, b.pubkey, s.tokenMint);
             const amountRaw = BigInt(raw as any);
-            if (amountRaw <= 0n) {
-              s.addLog("info", `Sell ALL: у ${b.name} токенов нет`);
-              continue;
-            }
+            if (amountRaw <= 0n) { s.addLog("info", `Sell ALL: у ${b.name} токенов нет`); continue; }
 
             const tx = new Transaction();
             const dstInfo = await connection.getAccountInfo(dstAta);
-            if (!dstInfo)
-              tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, programId));
+            if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, programId));
             tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId));
 
             const { blockhash } = await connection.getLatestBlockhash("finalized");
@@ -1144,10 +1013,7 @@ export const useStore = create<Store>()(
             const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
             await confirmSigHttp(connection, sig);
 
-            s.addLog(
-              "ok",
-              `Sell ALL: ${b.name} → wallet ${Number(amountRaw) / Math.pow(10, decimals)} TOK (${sig.slice(0, 8)}…)`
-            );
+            s.addLog("ok", `Sell ALL: ${b.name} → wallet ${Number(amountRaw) / Math.pow(10, decimals)} TOK (${sig.slice(0, 8)}…)`);
           } catch (e: any) {
             s.addLog("warn", `Sell ALL transfer ${s.bots[i].name}: ${e?.message || String(e)}`);
           }
@@ -1157,10 +1023,7 @@ export const useStore = create<Store>()(
         try {
           const rawWallet = await getSPLBalance(connection, walletPubkey, s.tokenMint);
           const amountTok = Number(rawWallet as any) / Math.pow(10, decimals);
-          if (amountTok <= 0) {
-            s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи");
-            return;
-          }
+          if (amountTok <= 0) { s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи"); return; }
 
           const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
           const vtx = await buildTradeTxPumpLocal({
@@ -1212,28 +1075,12 @@ export const useStore = create<Store>()(
         let desired: Array<{ type: "trend" | "revert" | "scalper"; share: number }>;
         if (trending) {
           desired = noisy
-            ? [
-                { type: "trend", share: 0.6 },
-                { type: "scalper", share: 0.25 },
-                { type: "revert", share: 0.15 },
-              ]
-            : [
-                { type: "trend", share: 0.7 },
-                { type: "revert", share: 0.2 },
-                { type: "scalper", share: 0.1 },
-              ];
+            ? [{ type: "trend", share: 0.6 }, { type: "scalper", share: 0.25 }, { type: "revert", share: 0.15 }]
+            : [{ type: "trend", share: 0.7 }, { type: "revert", share: 0.2 }, { type: "scalper", share: 0.1 }];
         } else {
           desired = noisy
-            ? [
-                { type: "revert", share: 0.55 },
-                { type: "trend", share: 0.3 },
-                { type: "scalper", share: 0.15 },
-              ]
-            : [
-                { type: "revert", share: 0.6 },
-                { type: "trend", share: 0.3 },
-                { type: "scalper", share: 0.1 },
-              ];
+            ? [{ type: "revert", share: 0.55 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.15 }]
+            : [{ type: "revert", share: 0.6 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.1 }];
         }
 
         const bots = [...s.bots];
@@ -1243,33 +1090,20 @@ export const useStore = create<Store>()(
         const total = free.length;
         const counts = desired.map((x) => ({ type: x.type, n: Math.round(x.share * total) }));
         let sum = counts.reduce((a, c) => a + c.n, 0);
-        while (sum < total) {
-          counts[0].n++;
-          sum++;
-        }
-        while (sum > total) {
-          counts[0].n--;
-          sum--;
-        }
+        while (sum < total) { counts[0].n++; sum++; }
+        while (sum > total) { counts[0].n--; sum--; }
 
         const profiles = {
-          trend: (i: number) =>
-            ({ strategy: "trend" as const, speedMs: 5000 + ((i % 3) * 2000), budgetSol: 0.02 + ((i % 2) * 0.01) }),
+          trend:  (i: number) => ({ strategy: "trend"  as const, speedMs: 5000 + ((i % 3) * 2000), budgetSol: 0.02 + ((i % 2) * 0.01) }),
           revert: (i: number) => ({ strategy: "revert" as const, speedMs: 9000 + ((i % 3) * 3000), budgetSol: 0.015 }),
-          scalper: (i: number) => ({ strategy: "scalper" as const, speedMs: 1500 + ((i % 3) * 500), budgetSol: 0.008 }),
+          scalper:(i: number) => ({ strategy: "scalper"as const, speedMs: 1500 + ((i % 3) * 500),  budgetSol: 0.008 }),
         };
 
         let idx = 0;
         const newBots = bots.map((b) => {
           if (b.manualLock) return b;
           let bucket: "trend" | "revert" | "scalper" = "trend";
-          for (const c of counts) {
-            if (c.n > 0) {
-              bucket = c.type as any;
-              c.n--;
-              break;
-            }
-          }
+          for (const c of counts) { if (c.n > 0) { bucket = c.type as any; c.n--; break; } }
           const prof = profiles[bucket](idx++);
           return { ...b, ...prof };
         });
