@@ -1,5 +1,10 @@
-// apps/web/src/live/runner_pump.ts
-import { Connection, VersionedTransaction, Keypair } from "@solana/web3.js";
+import {
+  Connection,
+  VersionedTransaction,
+  Keypair,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
+import { getSPLBalance } from "../utils/solana";
 
 /* ───────────────────────────── Types ───────────────────────────── */
 type BotStrategy = "trend" | "revert" | "scalper";
@@ -45,18 +50,17 @@ type RunCtx = {
 };
 
 /* ─────────────────────── Net bases & utilities ─────────────────────── */
-// Prefer your backend → custom pump API → public pump portal
+// prefer your backend → custom pump API → public pump portal
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pumpportal.fun"].filter(Boolean);
 
-// Global queue to avoid spamming the pump API from many bots at once
+// global queue to avoid bursts across many bots
 const globalNetQueue: { p: Promise<any> } =
   (window as any).__pumpQueue || ((window as any).__pumpQueue = { p: Promise.resolve() });
 
 function queueNet<T>(fn: () => Promise<T>) {
-  // ~120–220ms spacing between *all* trade-build requests
-  const gap = 120 + Math.floor(Math.random() * 100);
+  const gap = 120 + Math.floor(Math.random() * 120); // 120–240ms
   const run = () =>
     fn().then(async (v) => {
       await new Promise((r) => setTimeout(r, gap));
@@ -67,52 +71,48 @@ function queueNet<T>(fn: () => Promise<T>) {
 }
 
 function withTimeout<T>(p: Promise<T>, ms = 15000): Promise<T> {
-  let t: number;
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("fetch timeout")), ms) as unknown as number;
-    t = timer;
+    const t = setTimeout(() => reject(new Error("fetch timeout")), ms);
     p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      }
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
     );
   });
 }
 
+// “липкий” рабочий базовый endpoint
+let stickyBaseIdx = -1;
+
 async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
+  const order = [...PUMP_BASES.keys()];
+  if (stickyBaseIdx >= 0) {
+    // сначала пробуем “липкий”
+    const i = order.indexOf(stickyBaseIdx);
+    if (i > 0) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
+  }
+
   let lastErr: any;
-  for (const base of PUMP_BASES) {
+  for (const idx of order) {
+    const base = PUMP_BASES[idx];
     const url = `${base.replace(/\/$/, "")}${path}`;
     for (let attempt = 0; attempt <= retries; attempt++) {
-      // light exponential backoff + jitter
       const backoff = 300 * attempt + Math.floor(Math.random() * 250);
       try {
-        const r = await withTimeout(
-          fetch(url, {
-            keepalive: true,
-            credentials: "omit",
-            cache: "no-store",
-            mode: "cors",
-            ...init,
-            headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
-          }),
-          15000
-        );
+        const r = await withTimeout(fetch(url, {
+          keepalive: true,
+          credentials: "omit",
+          cache: "no-store",
+          mode: "cors",
+          ...init,
+          headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
+        }), 15000);
 
-        if (r.ok) return r;
-
-        // retry on 429/5xx
+        if (r.ok) { stickyBaseIdx = idx; return r; }
         if (r.status === 429 || r.status >= 500) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
           await new Promise((res) => setTimeout(res, backoff));
           continue;
         }
-
         const txt = await r.text().catch(() => "");
         throw new Error(`${r.status} ${r.statusText}${txt ? `: ${txt}` : ""}`);
       } catch (e) {
@@ -121,17 +121,17 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
       }
     }
   }
+  stickyBaseIdx = -1;
   throw lastErr || new Error("All pump endpoints failed");
 }
 
-/** Build Versioned TX via pump portal with fallback & global throttling */
+/** Build Versioned TX with throttling, timeout, retries & fallback */
 async function buildTradeTxPumpPortal(payload: Record<string, any>): Promise<VersionedTransaction> {
   return queueNet(async () => {
     const attempts: Array<{ path: string; binary: boolean }> = [
-      { path: "/api/trade-local", binary: true }, // prefer binary stream
-      { path: "/api/trade", binary: false }, // JSON fallback
+      { path: "/api/trade-local", binary: true }, // binary stream (faster)
+      { path: "/api/trade", binary: false },      // JSON fallback
     ];
-
     let lastErr: any;
     for (const a of attempts) {
       try {
@@ -140,13 +140,11 @@ async function buildTradeTxPumpPortal(payload: Record<string, any>): Promise<Ver
           headers: { "Content-Type": "application/json", Accept: "application/json" },
           body: JSON.stringify(payload),
         });
-
         const ct = r.headers.get("content-type") || "";
         if (a.binary && ct.includes("application/octet-stream")) {
           const raw = new Uint8Array(await r.arrayBuffer());
           return VersionedTransaction.deserialize(raw);
         }
-
         const j = await r.json().catch(() => ({} as any));
         const b64 = j?.serializedTransaction || j?.tx || j?.transaction || j?.vtx || null;
         if (!b64) throw new Error("no transaction in response");
@@ -161,10 +159,9 @@ async function buildTradeTxPumpPortal(payload: Record<string, any>): Promise<Ver
 }
 
 /* ─────────────────── Portfolio / strategy helpers ─────────────────── */
-const FEE_EST_SOL = 0.00002; // ≈ 20k lamports
-const MIN_KEEP_SOL = 0.0006; // keep small SOL reserve
+const FEE_EST_SOL = 0.00002; // ~20k lamports
+const MIN_KEEP_SOL = 0.0006;
 
-// allocation targets (by mark-to-market value)
 const TARGET_ALLOC = 0.55;
 const MAX_ALLOC = 0.8;
 const MIN_ALLOC = 0.2;
@@ -190,23 +187,40 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let pending = false;
   let cooldownUntil = 0;
 
-  // network backoff if trade-building fails repeatedly
+  // per-bot backoff if trade building fails
   let failStreak = 0;
   let nextRetryAt = 0;
+  let lastWarnTs = 0;
 
   const log = (lvl: "info" | "ok" | "warn" | "err", s: string) => ctx.onLog(lvl, `[${bot.name}] ${s}`);
+  const warnDebounced = (s: string) => {
+    const now = Date.now();
+    if (now - lastWarnTs > 2000) { lastWarnTs = now; log("warn", s); }
+  };
 
-  /** token allocation against whole portfolio value */
   const alloc = (priceNow: number) => {
     const tokVal = bot.posToken * priceNow;
     const total = Math.max(1e-9, tokVal + bot.solBalance);
     return { tokVal, total, a: tokVal / total };
   };
 
+  async function refreshOnChainBalances() {
+    try {
+      const kp = ctx.keypair();
+      const lam = await connection.getBalance(kp.publicKey, "processed");
+      const sol = lam / LAMPORTS_PER_SOL;
+      const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
+      const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
+      bot.solBalance = sol;
+      bot.tokenBalance = tok;
+      ctx.onUpdate(bot);
+    } catch (_) { /* soft */ }
+  }
+
   async function trade(
     side: "buy" | "sell",
     sizeSol: number,
-    opts?: { sellTokens?: number } // partial sell amount (tokens)
+    opts?: { sellTokens?: number }
   ) {
     const kp = ctx.keypair();
     const decimals = ctx.tokenDecimals();
@@ -235,7 +249,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             action: "sell",
             mint: ctx.mint,
             denominatedInSol: "false",
-            amount: amountTok ?? roundTok(bot.posToken, decimals), // default: sell ALL
+            amount: amountTok ?? roundTok(bot.posToken, decimals),
             slippage: (ctx.slippageBps() || 50) / 100,
             priorityFee: 0.00001,
             pool: "auto",
@@ -245,14 +259,18 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const vtx = await buildTradeTxPumpPortal(payload);
       vtx.sign([kp]);
 
-      const sig = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
+      // send as raw tx (a bit leaner)
+      const sig = await connection.sendRawTransaction(vtx.serialize(), {
+        skipPreflight: false,
+        maxRetries: 4,
+      });
       await connection.confirmTransaction(sig, "confirmed");
 
-      // reset per-bot backoff after success
+      // success → reset backoff
       failStreak = 0;
       nextRetryAt = 0;
 
-      // optimistic portfolio update (no on-chain reads)
+      // optimistic local portfolio update
       if (side === "buy") {
         const qty = sizeSol / priceNow;
         const newPos = bot.posToken + qty;
@@ -281,6 +299,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       ctx.onUpdate(bot);
       log("ok", `${side.toUpperCase()} ${sig.slice(0, 8)}…`);
 
+      // force on-chain refresh for this bot (SOL + token)
+      await refreshOnChainBalances();
+
       cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
     } catch (e: any) {
       failStreak++;
@@ -289,11 +310,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       bot.lastError = e?.message || String(e);
       ctx.onUpdate(bot);
-      log("warn", `net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
+      warnDebounced(`net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
     }
   }
 
-  /** Split big buy into TWAP slices if configured */
   async function twapBuy(totalSol: number) {
     const plan = ctx.twap;
     if (!plan || plan.slices < 2 || totalSol <= 0) {
@@ -307,10 +327,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     }
   }
 
-  setTimeout(loop, 10);
-  return () => {
-    stopped = true;
-  };
+  // desync start a bit across bots
+  setTimeout(loop, 100 + Math.floor(Math.random() * 500));
+  return () => { stopped = true; };
+
+  let lastLightRefresh = 0;
 
   async function loop() {
     if (stopped || !bot.running) return;
@@ -318,7 +339,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     const now = Date.now();
 
-    // scheduled retry after prior net fail
+    // scheduled retry after net fail
     if (now < nextRetryAt) {
       setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
@@ -331,7 +352,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     pending = true;
     try {
-      // AI pause
+      // periodic light on-chain refresh (keeps UI in sync even without trades)
+      if (now - lastLightRefresh > 15000) {
+        await refreshOnChainBalances();
+        lastLightRefresh = now;
+      }
+
       if (ctx.isAiPaused && ctx.isAiPaused()) {
         bot.last = "ai:off";
         ctx.onUpdate(bot);
@@ -340,22 +366,18 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       const p = Math.max(1e-12, ctx.price());
-      const fast = ctx.changeFast?.(12) ?? 0; // ~12s impulse
+      const fast = ctx.changeFast?.(12) ?? 0;
       const ch1m = ctx.change1m();
 
-      // portfolio metrics
       const { a: allocTok, total } = alloc(p);
 
-      // base size (respect SOL reserve)
       const baseSize = Math.max(
         0.00015,
         Math.min(bot.budgetSol || ctx.tradeSize(), bot.solBalance - (MIN_KEEP_SOL + 0.00015))
       );
       const haveSol = bot.solBalance > MIN_KEEP_SOL + 0.00015;
 
-      /* ======= Pre-strategy auto-rebalance ======= */
-
-      // too much token → trim toward target
+      /* ======= pre-strategy auto-rebalance ======= */
       if (bot.posToken > 0 && allocTok > MAX_ALLOC) {
         const desiredTokVal = TARGET_ALLOC * total;
         const currentTokVal = bot.posToken * p;
@@ -371,7 +393,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      // too little token and we have SOL → buy toward target
       if (haveSol && allocTok < MIN_ALLOC) {
         const targetVal = TARGET_ALLOC * total;
         const needVal = Math.max(0, targetVal - bot.posToken * p);
@@ -383,22 +404,16 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      /* ================== Strategies ================== */
+      /* ================== strategies ================== */
       let did = false;
 
       switch (bot.strategy) {
         case "trend": {
-          // be more active: small negative 1m acceptable, lower fast threshold
           if (haveSol && fast > 0.0009 && ch1m > -0.0005 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
             const size = Math.min(baseSize, headroomVal);
-            if (size > 0.00012) {
-              await twapBuy(size);
-              did = true;
-              break;
-            }
+            if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
-          // TP/SL or over-allocated → partial trim to target
           if (wantToSell(bot, p, 700, 400) || allocTok > MAX_ALLOC) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
@@ -413,17 +428,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "revert": {
-          // buy aggressive dips
           if (haveSol && fast < -0.0015 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.1) * total - bot.posToken * p);
             const size = Math.min(baseSize, headroomVal);
-            if (size > 0.00012) {
-              await twapBuy(size);
-              did = true;
-              break;
-            }
+            if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
-          // small TP/SL or over-allocated → trim
           if (wantToSell(bot, p, 80, 40) || allocTok > MAX_ALLOC) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
@@ -438,15 +447,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "scalper": {
-          // impulse both ways, respect allocation
           if (haveSol && Math.abs(fast) > 0.0022 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
             const size = Math.min(baseSize, headroomVal);
-            if (size > 0.0001) {
-              await twapBuy(size);
-              did = true;
-              break;
-            }
+            if (size > 0.0001) { await twapBuy(size); did = true; break; }
           }
           if (wantToSell(bot, p, 120, 55) || allocTok > MAX_ALLOC) {
             const desiredTokVal = TARGET_ALLOC * total;
@@ -470,7 +474,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     } catch (e: any) {
       bot.lastError = e?.message || String(e);
       ctx.onUpdate(bot);
-      log("warn", bot.lastError);
+      warnDebounced(String(e?.message || e));
     } finally {
       pending = false;
       if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs));
