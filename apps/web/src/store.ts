@@ -486,26 +486,22 @@ export const useStore = create<Store>()(
 
 
 
-updateBot(id: string, patch: Partial<LiveBot>) {
+updateBot: (id: string, patch: Partial<LiveBot>) => {
   set((s) => {
     const bots = s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b));
     return { bots };
   });
 },
 
-// удаление бота + очистка ключа
-removeBot(id: string) {
-  removeKey(id);
-  set((s) => {
-    const bots = s.bots.filter((b) => b.id !== id);
-    return { bots };
-  });
+removeBot: (id: string) => {
+  try { removeKey(id); } catch {}
+  set((s) => ({ bots: s.bots.filter((b) => b.id !== id) }));
 },
 
-// экспорт секрета
-exportBotKey(id: string) {
-  return exportSecret(id);
-},
+exportBotKey: (id: string) => {
+  try { return exportSecret(id); } catch { return null; }
+}, 
+
 
 
 
@@ -1022,7 +1018,7 @@ exportBotKey(id: string) {
         } else {
           desired = noisy
             ? [{ type: "revert", share: 0.55 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.15 }]
-            : [{ type: "revert", share: 0.6 }, { type: "trend", share: 0.3 }, { type: "scalпер", share: 0.1 }];
+            : [{ type: "revert", share: 0.6 }, { type: "trend", share: 0.3 }, { type: "scalpер", share: 0.1 }];
         }
 
         const bots = [...s.bots];
