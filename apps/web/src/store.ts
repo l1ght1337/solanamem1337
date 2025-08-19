@@ -483,13 +483,18 @@ export const useStore = create<Store>()(
 
      
 
-updateBot: (id, patch) =>
+
+
+
+updateBot(id: string, patch: Partial<LiveBot>) {
   set((s) => {
     const bots = s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b));
     return { bots };
-  }),
+  });
+},
 
-removeBot: (id) => {
+// удаление бота + очистка ключа
+removeBot(id: string) {
   removeKey(id);
   set((s) => {
     const bots = s.bots.filter((b) => b.id !== id);
@@ -497,7 +502,12 @@ removeBot: (id) => {
   });
 },
 
-exportBotKey: (id) => exportSecret(id),
+// экспорт секрета
+exportBotKey(id: string) {
+  return exportSecret(id);
+},
+
+
 
 
 
