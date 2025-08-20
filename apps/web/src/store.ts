@@ -65,6 +65,9 @@ const PROXIES: string[] = RAW_PROXIES
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 
+// ⬇️ Jupiter base (через твой воркер). По умолчанию — "/jup"
+const JUP_BASE = ((import.meta.env as any).VITE_JUP_BASE || "/jup").replace(/\/+$/, "");
+
 // финальный список апстримов (прокси → свой бекенд → alt → публичный)
 const PUMP_BASES: string[] = [
   ...PROXIES.map((p) => `${p}/x/pump`),
@@ -97,7 +100,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
 
   // базовые init
   const baseInit: RequestInit = {
-    keepalive: true,
+    keepalive: false, // ⬅️ уменьшает висящие соединения/“failed to fetch”
     credentials: "omit",
     cache: "no-store",
     mode: "cors",
@@ -137,6 +140,13 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   }
   stickyBaseIdx = -1;
   throw lastErr || new Error("All pump endpoints failed");
+}
+
+/* ⬇️ helper для Jupiter: уходит на {proxy}/jup/... или {proxy}/x/pump/jup/... */
+export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  // Если в проекте используешь роутинг через /x/pump/jup — можно сменить префикс ниже
+  return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
 }
 
 /* ---------- Local API ---------- */
@@ -1179,7 +1189,7 @@ export const useStore = create<Store>()(
         const lastN = cs.slice(-Math.max(slopeLookback, volLookback));
         const prices = lastN.map((c) => c.close);
         const p0 = prices[0];
-        const p1 = prices[prices.length - 1];
+        const p1 = prices[prices.length - 1].close;
         if (!p0) return;
 
         const slope = (p1 - p0) / p0;
