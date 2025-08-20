@@ -54,8 +54,6 @@ const b58 = (s: string) => s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/)?.[0] || null;
 const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
 /* ---------------- PumpPortal через твои прокси/бекенд ---------------- */
-// из .env можно передать сразу несколько воркеров через запятую
-// VITE_PUMP_PROXIES=https://w1...,https://w2...,https://w3...
 const RAW_PROXIES = (import.meta.env as any).VITE_PUMP_PROXIES || "";
 const PROXIES: string[] = RAW_PROXIES
   .split(",")
@@ -91,16 +89,14 @@ let stickyBaseIdx = -1;
 
 /** Усиленная обёртка: пробует все базы с приоритетом sticky, повторы на 429/5xx, таймауты */
 async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase = 1) {
-  // порядок перебора: sticky → остальные
   const order = [...PUMP_BASES.keys()];
   if (stickyBaseIdx >= 0) {
     const i = order.indexOf(stickyBaseIdx);
     if (i > 0) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
   }
 
-  // базовые init
   const baseInit: RequestInit = {
-    keepalive: false, // уменьшаем висящие соединения/“failed to fetch”
+    keepalive: false,
     credentials: "omit",
     cache: "no-store",
     mode: "cors",
@@ -112,7 +108,6 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   for (const idx of order) {
     const base = PUMP_BASES[idx];
     const url = `${base.replace(/\/$/, "")}${path}`;
-
     for (let attempt = 0; attempt <= Math.max(0, retriesPerBase); attempt++) {
       const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
       if (backoff) await new Promise((res) => setTimeout(res, backoff));
@@ -121,10 +116,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
         const t = setTimeout(() => ctl.abort(), 15_000);
         const r = await fetch(url, { ...baseInit, signal: ctl.signal });
         clearTimeout(t);
-
         if (r.ok) { stickyBaseIdx = idx; return r; }
-
-        // на 429/5xx — повторяем; на прочие — считаем «окончательный» ответ этой базы
         if (r.status === 429 || r.status >= 500) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
           continue;
@@ -134,7 +126,6 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
         }
       } catch (e) {
         lastErr = e;
-        // пробуем дальше эту же базу (повтор) или следующую
       }
     }
   }
@@ -142,15 +133,13 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   throw lastErr || new Error("All pump endpoints failed");
 }
 
-/* ⬇️ helper для Jupiter: уходит на {proxy}/jup/... или {proxy}/x/pump/jup/... */
+/* ⬇️ helper для Jupiter */
 export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
   const p = path.startsWith("/") ? path : `/${path}`;
-  // Если в проекте используешь роутинг через /x/pump/jup — можно сменить префикс ниже
   return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
 }
 
 /* ---------- Local API ---------- */
-/** Сборка vtx c фолбэком: /api/trade-local → /api/trade (JSON) */
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
   try {
     const res = await fetchFirstOk("/api/trade-local", {
@@ -184,7 +173,6 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
 
 async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransaction; mint?: string }> {
   const paths = ["/api/create-token-local", "/api/create-token", "/api/trade-local"];
-
   let lastErr: any;
   for (const p of paths) {
     try {
@@ -194,12 +182,10 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
         body: JSON.stringify(body),
       }, 2);
       const ct = r.headers.get("content-type") || "";
-
       if (!ct.includes("application/json")) {
         const raw = new Uint8Array(await r.arrayBuffer());
         return { tx: VersionedTransaction.deserialize(raw) };
       }
-
       const j = await r.json();
       if (j?.serializedTransaction) {
         const raw = Uint8Array.from(atob(j.serializedTransaction), (c) => c.charCodeAt(0));
@@ -210,7 +196,6 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
         const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
         return { tx: VersionedTransaction.deserialize(raw), mint: j.mint };
       }
-
       lastErr = new Error("Unknown create-token response format");
     } catch (e) {
       lastErr = e;
@@ -356,7 +341,6 @@ const safeBps = (bps: any, fallback = 50) => {
   const n = Math.round(toNum(bps, fallback));
   return Number.isFinite(n) ? Math.max(1, Math.min(2000, n)) : fallback;
 };
-const safeSlippagePct = () => safeBps((useStore.getState?.() || {}).getSmartBps?.(), 50) / 100;
 
 /* ===== Store ===== */
 export type Store = {
@@ -365,9 +349,7 @@ export type Store = {
   price: number;
   candles: { t: number; open: number; high: number; low: number; close: number; volume: number }[];
 
-  /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
   ticks: { t: number; p: number }[];
-  /** быстрый импульс: изменение цены за последние `sec` секунд */
   getChangeFast: (sec?: number) => number;
 
   external: {
@@ -462,8 +444,6 @@ export const useStore = create<Store>()(
         if (!st.ticks.length) return 0;
         const now = Date.now();
         const since = now - sec * 1000;
-
-        // базовая цена — ближайший тик "чуть старше" горизонта
         let base = st.ticks[0].p;
         for (let i = st.ticks.length - 1; i >= 0; i--) {
           if (st.ticks[i].t <= since) { base = st.ticks[i].p; break; }
@@ -497,10 +477,8 @@ export const useStore = create<Store>()(
         const s = get();
         const mm = sanitizeSmartMM(s.smartMM);
         if (!mm.enabled) return safeBps(s.slippageBps, 50);
-
         const cs = s.candles;
         let out = (mm.minBps + mm.maxBps) / 2;
-
         if (cs.length >= 6) {
           const last = cs.slice(-5);
           const p0 = last[0].close;
@@ -510,12 +488,10 @@ export const useStore = create<Store>()(
           const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
           const sNorm = Math.min(1, Math.abs(slope) / 0.02);
           const vNorm = Math.min(1, sd / 0.01);
-
           const w = mm.alpha;
           const score = w * sNorm + (1 - w) * vNorm;
           out = mm.minBps + score * (mm.maxBps - mm.minBps);
         }
-
         return safeBps(out, 50);
       },
 
@@ -526,6 +502,9 @@ export const useStore = create<Store>()(
         return { slices: mm.twapSlices, gapMs: Math.max(0, gapMs) };
       },
 
+      // локальный безопасный слеппедж — БЕЗ обращения к useStore снаружи
+      // чтобы не ловить TDZ/“Cannot access 'D' before initialization”
+      getSafeSlippagePct: undefined as any, // заполним ниже
       // Treasury / авто-пополнение
       treasuryKeyId: undefined,
       autoTopUp: true,
@@ -602,12 +581,8 @@ export const useStore = create<Store>()(
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
       },
 
-      // ===== CRUD над настройками из UI
       updateBot: (id: string, patch: Partial<LiveBot>) => {
-        set((s) => {
-          const bots = s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b));
-          return { bots };
-        });
+        set((s) => ({ bots: s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b)) }));
       },
 
       removeBot: (id: string) => {
@@ -619,7 +594,6 @@ export const useStore = create<Store>()(
         try { return exportSecret(id); } catch { return null; }
       },
 
-      // Пополнение из Treasury
       async topUpBot(connection, botId) {
         const s = get();
         const bot = s.bots.find((b) => b.id === botId);
@@ -646,13 +620,11 @@ export const useStore = create<Store>()(
         }
       },
 
-      // Drain (HTTP-confirm)
       async drainBotTo(connection, botId, destAddress) {
         const s = get();
         const bot = s.bots.find((b) => b.id === botId);
         if (!bot) return;
         const dest = new PublicKey(destAddress);
-
         const keep = Math.max(s.drainMinKeepSol, s.minFeeSol);
         let sendSol = bot.solBalance - keep - 0.00001;
         if (sendSol <= 0) { s.addLog("info", `Drain ${bot.name}: нечего отправлять (баланс ${bot.solBalance.toFixed(6)} SOL)`); return; }
@@ -684,7 +656,6 @@ export const useStore = create<Store>()(
         await get().refreshBalances(connection);
       },
 
-      // SAFE warm-up симуляции
       warmupCfg: { simulatePerBot: 5, gapMs: 2000, ensureATA: true },
 
       async safeWarmupBots(connection) {
@@ -740,7 +711,6 @@ export const useStore = create<Store>()(
         await get().refreshBalances(connection);
       },
 
-      // MAINNET warm-up
       mainnetWarmupCfg: { txPerBot: 30, lamports: 5_000, gapMs: 1200, maxTotalSolPerBot: 0.005 },
 
       async mainnetWarmupTransfers(connection, opts = {}) {
@@ -846,7 +816,6 @@ export const useStore = create<Store>()(
             return r > 0 ? r : bot.budgetSol;
           },
 
-          // читаем флажок AI «на лету»
           isAiPaused: () => {
             const curr = get().bots.find((x) => x.id === bot.id);
             return !(curr?.aiEnabled);
@@ -854,7 +823,6 @@ export const useStore = create<Store>()(
 
           onLog: (lvl, msg) => get().addLog(lvl, msg),
 
-          // Обновляем только рантайм-поля
           onUpdate: (patch: any) =>
             set((st) => ({
               bots: st.bots.map((x) => {
@@ -874,7 +842,6 @@ export const useStore = create<Store>()(
               }),
             })),
 
-          // после сделки мягкий refresh (SOL + токен) для всех ботов
           afterTrade: () => {
             get().refreshBalances(connection).catch(() => {});
           },
@@ -894,13 +861,11 @@ export const useStore = create<Store>()(
       startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
       stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
 
-      // ===== Балансы + авто-донат (починено) =====
       async refreshBalances(connection) {
         try {
           const s = get();
           const mint = s.tokenMint || null;
 
-          // выясняем decimals токена (если mint известен)
           let decimals: number | null = null;
           if (mint) {
             try {
@@ -916,14 +881,12 @@ export const useStore = create<Store>()(
 
           const bots = await Promise.all(
             get().bots.map(async (b) => {
-              // SOL — всегда обновляем
               let sol = b.solBalance;
               try {
                 const lam = await connection.getBalance(new PublicKey(b.pubkey));
                 sol = lam / LAMPORTS_PER_SOL;
               } catch {}
 
-              // токен — только если mint известен
               let tok = b.tokenBalance;
               if (mint && decimals != null) {
                 try {
@@ -939,7 +902,6 @@ export const useStore = create<Store>()(
 
           set({ bots });
 
-          // авто-донат
           const { autoTopUp, minFeeSol, topUpBot } = get();
           if (autoTopUp) {
             const nowTs = Date.now();
@@ -959,13 +921,11 @@ export const useStore = create<Store>()(
         }
       },
 
-      // Прайс/свечи + тики
       async tickReal() {
         const s = get();
         if (!s.tokenMint) return;
-        if (s.external.provider === "pumpportal") return; // pump.fun обновляет цену через WS
+        if (s.external.provider === "pumpportal") return;
 
-        // 1) пробуем основной провайдер
         const tryOnce = async (prov: any) => {
           try {
             return await fetchExternalPrice({ ...prov, endpoint: prov.endpoint, apiKey: prov.apiKey }, s.tokenMint!);
@@ -1007,7 +967,7 @@ export const useStore = create<Store>()(
       // === Pump: создать токен и автопокупка ===
       async createPumpToken(connection, creatorPubkey, params) {
         try {
-          const slippagePct = safeSlippagePct();
+          const slippagePct = safeBps(get().getSmartBps(), 50) / 100;
           const { mint, signature } = await buildCreateViaLightning({
             name: params.name, symbol: params.symbol, image: params.image,
             description: params.description, website: params.website, twitter: params.twitter,
@@ -1076,7 +1036,7 @@ export const useStore = create<Store>()(
               mint: s.tokenMint,
               denominatedInSol: "true",
               amount: spend,
-              slippage: safeSlippagePct(),
+              slippage: safeBps(get().getSmartBps(), 50) / 100,
               priorityFee: 0.00001,
               pool: "auto",
             });
@@ -1091,7 +1051,6 @@ export const useStore = create<Store>()(
         }
       },
 
-      /** ===== Новая: все боты покупают на percent своего SOL ===== */
       async buyAllBotsAtPercentOnPump(connection, percent, opts = {}) {
         const keep = Math.max(0.0005, (opts as any).keepFeeSol ?? get().minFeeSol);
         const pct = Math.min(1, Math.max(0, Number(percent) || 0));
@@ -1111,7 +1070,7 @@ export const useStore = create<Store>()(
               mint: s.tokenMint,
               denominatedInSol: "true",
               amount: spend,
-              slippage: safeSlippagePct(),
+              slippage: safeBps(get().getSmartBps(), 50) / 100,
               priorityFee: 0.00001,
               pool: "auto",
             });
@@ -1130,7 +1089,6 @@ export const useStore = create<Store>()(
         await get().buyAllBotsAtPercentOnPump(connection, 0.8, opts);
       },
 
-      // === Sell ALL — боты → кошелёк → одна продажа
       async sellAllToWalletOnPump(connection, walletPubkey) {
         const s = get();
         if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
@@ -1191,7 +1149,7 @@ export const useStore = create<Store>()(
             mint: s.tokenMint,
             denominatedInSol: "false",
             amount: amountRounded,
-            slippage: safeSlippagePct(),
+            slippage: safeBps(get().getSmartBps(), 50) / 100,
             priorityFee: 0.00001,
             pool: "auto",
           });
@@ -1302,7 +1260,6 @@ export const useStore = create<Store>()(
         try {
           const u = state?.tokenUrl;
           if (u) setTimeout(() => useStore.getState().setTokenUrl(u), 0);
-          // доп. санитизация на старте
           set((s) => ({
             smartMM: sanitizeSmartMM(state?.smartMM || s.smartMM),
             slippageBps: safeBps(state?.slippageBps ?? s.slippageBps, 50),
