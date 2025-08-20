@@ -100,7 +100,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
 
   // базовые init
   const baseInit: RequestInit = {
-    keepalive: false, // ⬅️ уменьшает висящие соединения/“failed to fetch”
+    keepalive: false, // уменьшаем висящие соединения/“failed to fetch”
     credentials: "omit",
     cache: "no-store",
     mode: "cors",
@@ -323,6 +323,7 @@ async function sendTransferWithRetry(
   throw new Error(lastErr || "block height exceeded after retries");
 }
 
+/* ===== безотказные числа / санитайзеры ===== */
 export type SmartMM = {
   enabled: boolean;
   minBps: number;
@@ -332,6 +333,32 @@ export type SmartMM = {
   twapSlices: number;
 };
 
+const toNum = (x: any, d: number) => {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+};
+
+const sanitizeSmartMM = (mm?: Partial<SmartMM>): SmartMM => {
+  const m: any = mm || {};
+  const min = Math.max(1, toNum(m.minBps, 20));
+  const max = Math.max(min, toNum(m.maxBps, 200));
+  return {
+    enabled: !!m.enabled,
+    minBps: min,
+    maxBps: max,
+    alpha: Math.min(0.99, Math.max(0.01, toNum(m.alpha, 0.6))),
+    twapSec: Math.max(0, Math.floor(toNum(m.twapSec, 120))),
+    twapSlices: Math.max(1, Math.floor(toNum(m.twapSlices, 4))),
+  };
+};
+
+const safeBps = (bps: any, fallback = 50) => {
+  const n = Math.round(toNum(bps, fallback));
+  return Number.isFinite(n) ? Math.max(1, Math.min(2000, n)) : fallback;
+};
+const safeSlippagePct = () => safeBps((useStore.getState?.() || {}).getSmartBps?.(), 50) / 100;
+
+/* ===== Store ===== */
 export type Store = {
   tokenUrl: string;
   tokenMint: string | null;
@@ -468,30 +495,35 @@ export const useStore = create<Store>()(
 
       getSmartBps() {
         const s = get();
-        if (!s.smartMM.enabled) return s.slippageBps;
+        const mm = sanitizeSmartMM(s.smartMM);
+        if (!mm.enabled) return safeBps(s.slippageBps, 50);
+
         const cs = s.candles;
-        if (cs.length < 6) return Math.round((s.smartMM.minBps + s.smartMM.maxBps) / 2);
+        let out = (mm.minBps + mm.maxBps) / 2;
 
-        const last = cs.slice(-5);
-        const p0 = last[0].close;
-        const p1 = last[last.length - 1].close;
-        const slope = (p1 - p0) / Math.max(1e-9, p0);
-        const mean = last.reduce((a, c) => a + c.close, 0) / last.length;
-        const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
-        const sNorm = Math.min(1, Math.abs(slope) / 0.02);
-        const vNorm = Math.min(1, sd / 0.01);
+        if (cs.length >= 6) {
+          const last = cs.slice(-5);
+          const p0 = last[0].close;
+          const p1 = last[last.length - 1].close;
+          const slope = (p1 - p0) / Math.max(1e-9, p0);
+          const mean = last.reduce((a, c) => a + c.close, 0) / last.length;
+          const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
+          const sNorm = Math.min(1, Math.abs(slope) / 0.02);
+          const vNorm = Math.min(1, sd / 0.01);
 
-        const w = s.smartMM.alpha;
-        const score = w * sNorm + (1 - w) * vNorm;
-        const bps = s.smartMM.minBps + score * (s.smartMM.maxBps - s.smartMM.minBps);
-        return Math.round(bps);
+          const w = mm.alpha;
+          const score = w * sNorm + (1 - w) * vNorm;
+          out = mm.minBps + score * (mm.maxBps - mm.minBps);
+        }
+
+        return safeBps(out, 50);
       },
 
       getTwapPlan() {
-        const mm = get().smartMM;
+        const mm = sanitizeSmartMM(get().smartMM);
         if (!mm.enabled || mm.twapSlices < 2 || mm.twapSec <= 0) return null;
         const gapMs = Math.floor((mm.twapSec * 1000) / mm.twapSlices);
-        return { slices: mm.twapSlices, gapMs };
+        return { slices: mm.twapSlices, gapMs: Math.max(0, gapMs) };
       },
 
       // Treasury / авто-пополнение
@@ -744,9 +776,9 @@ export const useStore = create<Store>()(
           const kp = getKeypair(sender.keyId);
           if (!kp) { s.addLog("err", `Нет ключа для ${sender.name}`); continue; }
 
-        const idx = bots.findIndex((x) => x.id === sender.id);
-        const receiver = bots[(idx + 1) % bots.length];
-        const toPk = new PublicKey(receiver.pubkey);
+          const idx = bots.findIndex((x) => x.id === sender.id);
+          const receiver = bots[(idx + 1) % bots.length];
+          const toPk = new PublicKey(receiver.pubkey);
 
           for (let i = 0; i < txPerBot; i++) {
             try {
@@ -794,7 +826,7 @@ export const useStore = create<Store>()(
 
         const stop = run(connection, bot, {
           mint: s.tokenMint!,
-          slippageBps: () => get().getSmartBps(),
+          slippageBps: () => safeBps(get().getSmartBps(), 50),
           twap: get().getTwapPlan(),
 
           price: () => get().price,
@@ -975,7 +1007,7 @@ export const useStore = create<Store>()(
       // === Pump: создать токен и автопокупка ===
       async createPumpToken(connection, creatorPubkey, params) {
         try {
-          const slippagePct = (get().getSmartBps() || 50) / 100;
+          const slippagePct = safeSlippagePct();
           const { mint, signature } = await buildCreateViaLightning({
             name: params.name, symbol: params.symbol, image: params.image,
             description: params.description, website: params.website, twitter: params.twitter,
@@ -1044,7 +1076,7 @@ export const useStore = create<Store>()(
               mint: s.tokenMint,
               denominatedInSol: "true",
               amount: spend,
-              slippage: (get().getSmartBps() || 50) / 100,
+              slippage: safeSlippagePct(),
               priorityFee: 0.00001,
               pool: "auto",
             });
@@ -1079,7 +1111,7 @@ export const useStore = create<Store>()(
               mint: s.tokenMint,
               denominatedInSol: "true",
               amount: spend,
-              slippage: (get().getSmartBps() || 50) / 100,
+              slippage: safeSlippagePct(),
               priorityFee: 0.00001,
               pool: "auto",
             });
@@ -1159,7 +1191,7 @@ export const useStore = create<Store>()(
             mint: s.tokenMint,
             denominatedInSol: "false",
             amount: amountRounded,
-            slippage: (get().getSmartBps() || 50) / 100,
+            slippage: safeSlippagePct(),
             priorityFee: 0.00001,
             pool: "auto",
           });
@@ -1240,6 +1272,16 @@ export const useStore = create<Store>()(
     }),
     {
       name: "meme-bundler:v1",
+      version: 2,
+      migrate: (persisted: any) => {
+        const p = persisted || {};
+        p.smartMM = sanitizeSmartMM(p.smartMM);
+        p.slippageBps = safeBps(p.slippageBps ?? 50, 50);
+        if (!p.tradeRange) p.tradeRange = { minSol: 0.005, maxSol: 0.03 };
+        p.tradeRange.minSol = toNum(p.tradeRange.minSol, 0.005);
+        p.tradeRange.maxSol = toNum(p.tradeRange.maxSol, 0.03);
+        return p;
+      },
       storage: createJSONStorage(() => localStorage),
       partialize: (s) => ({
         tokenUrl: s.tokenUrl,
@@ -1259,7 +1301,12 @@ export const useStore = create<Store>()(
       onRehydrateStorage: () => (state) => {
         try {
           const u = state?.tokenUrl;
-          if (u) setTimeout(() => get().setTokenUrl(u), 0);
+          if (u) setTimeout(() => useStore.getState().setTokenUrl(u), 0);
+          // доп. санитизация на старте
+          set((s) => ({
+            smartMM: sanitizeSmartMM(state?.smartMM || s.smartMM),
+            slippageBps: safeBps(state?.slippageBps ?? s.slippageBps, 50),
+          }));
         } catch {}
       },
     }
