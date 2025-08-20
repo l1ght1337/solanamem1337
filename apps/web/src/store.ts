@@ -53,7 +53,7 @@ const now = () => new Date().toLocaleTimeString();
 const b58 = (s: string) => s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/)?.[0] || null;
 const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/* ---------------- PumpPortal через твои прокси/бекенд ---------------- */
+/* ---------------- PumpPortal через прокси/бэкенд ---------------- */
 const RAW_PROXIES = (import.meta.env as any).VITE_PUMP_PROXIES || "";
 const PROXIES: string[] = RAW_PROXIES
   .split(",")
@@ -63,10 +63,10 @@ const PROXIES: string[] = RAW_PROXIES
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 
-// ⬇️ Jupiter base (через твой воркер). По умолчанию — "/jup"
+// Jupiter через свой воркер (по умолчанию — /jup)
 const JUP_BASE = ((import.meta.env as any).VITE_JUP_BASE || "/jup").replace(/\/+$/, "");
 
-// финальный список апстримов (прокси → свой бекенд → alt → публичный)
+/** порядок апстримов: прокси → свой бэкенд → alt → публичный */
 const PUMP_BASES: string[] = [
   ...PROXIES.map((p) => `${p}/x/pump`),
   API_BASE ? `${API_BASE}/x/pump` : "",
@@ -74,20 +74,10 @@ const PUMP_BASES: string[] = [
   "https://pumpportal.fun",
 ].filter(Boolean);
 
-function withTimeout<T>(p: Promise<T>, ms = 10_000): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("fetch timeout")), ms);
-    p.then(
-      (v) => { clearTimeout(t); resolve(v); },
-      (e) => { clearTimeout(t); reject(e); }
-    );
-  });
-}
-
-// «липкий» индекс базы — успешная база будет приоритетной
+// «липкий» индекс удачной базы
 let stickyBaseIdx = -1;
 
-/** Усиленная обёртка: пробует все базы с приоритетом sticky, повторы на 429/5xx, таймауты */
+/** Усиленная обёртка: sticky-приоритет, ретраи на 429/5xx, таймауты */
 async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase = 1) {
   const order = [...PUMP_BASES.keys()];
   if (stickyBaseIdx >= 0) {
@@ -96,7 +86,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   }
 
   const baseInit: RequestInit = {
-    keepalive: false,
+    keepalive: false, // меньше «висячих» соединений
     credentials: "omit",
     cache: "no-store",
     mode: "cors",
@@ -108,6 +98,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   for (const idx of order) {
     const base = PUMP_BASES[idx];
     const url = `${base.replace(/\/$/, "")}${path}`;
+
     for (let attempt = 0; attempt <= Math.max(0, retriesPerBase); attempt++) {
       const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
       if (backoff) await new Promise((res) => setTimeout(res, backoff));
@@ -116,7 +107,9 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
         const t = setTimeout(() => ctl.abort(), 15_000);
         const r = await fetch(url, { ...baseInit, signal: ctl.signal });
         clearTimeout(t);
+
         if (r.ok) { stickyBaseIdx = idx; return r; }
+
         if (r.status === 429 || r.status >= 500) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
           continue;
@@ -133,7 +126,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   throw lastErr || new Error("All pump endpoints failed");
 }
 
-/* ⬇️ helper для Jupiter */
+/** helper для Jupiter: уйдёт на {proxy}/jup/... */
 export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
   const p = path.startsWith("/") ? path : `/${path}`;
   return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
@@ -182,10 +175,12 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
         body: JSON.stringify(body),
       }, 2);
       const ct = r.headers.get("content-type") || "";
+
       if (!ct.includes("application/json")) {
         const raw = new Uint8Array(await r.arrayBuffer());
         return { tx: VersionedTransaction.deserialize(raw) };
       }
+
       const j = await r.json();
       if (j?.serializedTransaction) {
         const raw = Uint8Array.from(atob(j.serializedTransaction), (c) => c.charCodeAt(0));
@@ -196,6 +191,7 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
         const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
         return { tx: VersionedTransaction.deserialize(raw), mint: j.mint };
       }
+
       lastErr = new Error("Unknown create-token response format");
     } catch (e) {
       lastErr = e;
@@ -300,15 +296,14 @@ async function sendTransferWithRetry(
       await confirmSigHttp(connection, sig);
       return sig;
     } catch (e: any) {
-      const m = e?.message || String(e);
-      lastErr = m;
+      lastErr = e?.message || String(e);
       await new Promise((r) => setTimeout(r, 300));
     }
   }
   throw new Error(lastErr || "block height exceeded after retries");
 }
 
-/* ===== безотказные числа / санитайзеры ===== */
+/* ===== санитайзеры/дефолты ===== */
 export type SmartMM = {
   enabled: boolean;
   minBps: number;
@@ -318,10 +313,9 @@ export type SmartMM = {
   twapSlices: number;
 };
 
-const toNum = (x: any, d: number) => {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-};
+const toNum = (x: any, d: number) => (Number.isFinite(Number(x)) ? Number(x) : d);
+const safeBps = (bps: any, fallback = 50) =>
+  Math.min(2000, Math.max(1, Math.round(toNum(bps, fallback))));
 
 const sanitizeSmartMM = (mm?: Partial<SmartMM>): SmartMM => {
   const m: any = mm || {};
@@ -335,11 +329,6 @@ const sanitizeSmartMM = (mm?: Partial<SmartMM>): SmartMM => {
     twapSec: Math.max(0, Math.floor(toNum(m.twapSec, 120))),
     twapSlices: Math.max(1, Math.floor(toNum(m.twapSlices, 4))),
   };
-};
-
-const safeBps = (bps: any, fallback = 50) => {
-  const n = Math.round(toNum(bps, fallback));
-  return Number.isFinite(n) ? Math.max(1, Math.min(2000, n)) : fallback;
 };
 
 /* ===== Store ===== */
@@ -478,21 +467,21 @@ export const useStore = create<Store>()(
         const mm = sanitizeSmartMM(s.smartMM);
         if (!mm.enabled) return safeBps(s.slippageBps, 50);
         const cs = s.candles;
-        let out = (mm.minBps + mm.maxBps) / 2;
-        if (cs.length >= 6) {
-          const last = cs.slice(-5);
-          const p0 = last[0].close;
-          const p1 = last[last.length - 1].close;
-          const slope = (p1 - p0) / Math.max(1e-9, p0);
-          const mean = last.reduce((a, c) => a + c.close, 0) / last.length;
-          const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
-          const sNorm = Math.min(1, Math.abs(slope) / 0.02);
-          const vNorm = Math.min(1, sd / 0.01);
-          const w = mm.alpha;
-          const score = w * sNorm + (1 - w) * vNorm;
-          out = mm.minBps + score * (mm.maxBps - mm.minBps);
-        }
-        return safeBps(out, 50);
+        if (cs.length < 6) return Math.round((mm.minBps + mm.maxBps) / 2);
+
+        const last = cs.slice(-5);
+        const p0 = last[0].close;
+        const p1 = last[last.length - 1].close;
+        const slope = (p1 - p0) / Math.max(1e-9, p0);
+        const mean = last.reduce((a, c) => a + c.close, 0) / last.length;
+        const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
+        const sNorm = Math.min(1, Math.abs(slope) / 0.02);
+        const vNorm = Math.min(1, sd / 0.01);
+
+        const w = mm.alpha;
+        const score = w * sNorm + (1 - w) * vNorm;
+        const bps = mm.minBps + score * (mm.maxBps - mm.minBps);
+        return safeBps(bps, 50);
       },
 
       getTwapPlan() {
@@ -502,9 +491,6 @@ export const useStore = create<Store>()(
         return { slices: mm.twapSlices, gapMs: Math.max(0, gapMs) };
       },
 
-      // локальный безопасный слеппедж — БЕЗ обращения к useStore снаружи
-      // чтобы не ловить TDZ/“Cannot access 'D' before initialization”
-      getSafeSlippagePct: undefined as any, // заполним ниже
       // Treasury / авто-пополнение
       treasuryKeyId: undefined,
       autoTopUp: true,
@@ -533,9 +519,9 @@ export const useStore = create<Store>()(
               mint,
               onPrice: (p) =>
                 set((st) => {
-                  const now = Date.now();
-                  const ticks = (st.ticks || []).concat({ t: now, p });
-                  const cut = now - 60_000;
+                  const ts = Date.now();
+                  const ticks = (st.ticks || []).concat({ t: ts, p });
+                  const cut = ts - 60_000;
                   return { price: p, ticks: ticks.filter((x) => x.t > cut) };
                 }),
               onCandle: (m, p) =>
@@ -581,18 +567,9 @@ export const useStore = create<Store>()(
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
       },
 
-      updateBot: (id: string, patch: Partial<LiveBot>) => {
-        set((s) => ({ bots: s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b)) }));
-      },
-
-      removeBot: (id: string) => {
-        try { removeKey(id); } catch {}
-        set((s) => ({ bots: s.bots.filter((b) => b.id !== id) }));
-      },
-
-      exportBotKey: (id: string) => {
-        try { return exportSecret(id); } catch { return null; }
-      },
+      updateBot: (id, patch) => set((s) => ({ bots: s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b)) })),
+      removeBot: (id) => { try { removeKey(id); } catch {} set((s) => ({ bots: s.bots.filter((b) => b.id !== id) })); },
+      exportBotKey: (id) => { try { return exportSecret(id); } catch { return null; } },
 
       async topUpBot(connection, botId) {
         const s = get();
@@ -625,6 +602,7 @@ export const useStore = create<Store>()(
         const bot = s.bots.find((b) => b.id === botId);
         if (!bot) return;
         const dest = new PublicKey(destAddress);
+
         const keep = Math.max(s.drainMinKeepSol, s.minFeeSol);
         let sendSol = bot.solBalance - keep - 0.00001;
         if (sendSol <= 0) { s.addLog("info", `Drain ${bot.name}: нечего отправлять (баланс ${bot.solBalance.toFixed(6)} SOL)`); return; }
@@ -656,6 +634,7 @@ export const useStore = create<Store>()(
         await get().refreshBalances(connection);
       },
 
+      // SAFE warm-up симуляции
       warmupCfg: { simulatePerBot: 5, gapMs: 2000, ensureATA: true },
 
       async safeWarmupBots(connection) {
@@ -698,7 +677,8 @@ export const useStore = create<Store>()(
             for (let i = 0; i < get().warmupCfg.simulatePerBot; i++) {
               const memoIx = new TransactionInstruction({ keys: [], programId: MEMO_PROGRAM_ID, data: Buffer.from(`warmup:${Date.now()}:${i}`) });
               const tx = new Transaction().add(memoIx);
-              tx.feePayer = kp.publicKey;
+              tx.feeПayer = kp.publicKey as any; // совместимость со старыми типами
+              (tx as any).feePayer = kp.publicKey;
               tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
               tx.sign(kp);
               await connection.simulateTransaction(tx, { sigVerify: false });
@@ -711,6 +691,7 @@ export const useStore = create<Store>()(
         await get().refreshBalances(connection);
       },
 
+      // MAINNET warm-up
       mainnetWarmupCfg: { txPerBot: 30, lamports: 5_000, gapMs: 1200, maxTotalSolPerBot: 0.005 },
 
       async mainnetWarmupTransfers(connection, opts = {}) {
@@ -861,6 +842,7 @@ export const useStore = create<Store>()(
       startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
       stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
 
+      // Балансы + авто-донат
       async refreshBalances(connection) {
         try {
           const s = get();
@@ -872,9 +854,7 @@ export const useStore = create<Store>()(
               let d = s._mintDecimals;
               if (d == null) { d = await getMintDecimals(connection, mint); set({ _mintDecimals: d }); }
               decimals = d ?? 9;
-            } catch {
-              decimals = 9;
-            }
+            } catch { decimals = 9; }
           }
 
           const priceNow = get().price || 0;
@@ -921,6 +901,7 @@ export const useStore = create<Store>()(
         }
       },
 
+      // Прайс/свечи + тики
       async tickReal() {
         const s = get();
         if (!s.tokenMint) return;
@@ -955,9 +936,9 @@ export const useStore = create<Store>()(
           else { last.high = Math.max(last.high, p!); last.low = Math.min(last.low, p!); last.close = p!; }
           if (c.length > 1000) c = c.slice(-1000);
 
-          const now = Date.now();
-          const ticks = (st.ticks || []).concat({ t: now, p: p! });
-          const cut = now - 60_000;
+          const ts = Date.now();
+          const ticks = (st.ticks || []).concat({ t: ts, p: p! });
+          const cut = ts - 60_000;
 
           const bots = st.bots.map((b) => ({ ...b, unrealized: b.posToken * (p! - (b.avgSol || p!)) }));
           return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
@@ -1089,6 +1070,7 @@ export const useStore = create<Store>()(
         await get().buyAllBotsAtPercentOnPump(connection, 0.8, opts);
       },
 
+      // === Sell ALL — боты → кошелёк → одна продажа
       async sellAllToWalletOnPump(connection, walletPubkey) {
         const s = get();
         if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
@@ -1230,7 +1212,7 @@ export const useStore = create<Store>()(
     }),
     {
       name: "meme-bundler:v1",
-      version: 2,
+      version: 3,
       migrate: (persisted: any) => {
         const p = persisted || {};
         p.smartMM = sanitizeSmartMM(p.smartMM);
@@ -1259,11 +1241,7 @@ export const useStore = create<Store>()(
       onRehydrateStorage: () => (state) => {
         try {
           const u = state?.tokenUrl;
-          if (u) setTimeout(() => useStore.getState().setTokenUrl(u), 0);
-          set((s) => ({
-            smartMM: sanitizeSmartMM(state?.smartMM || s.smartMM),
-            slippageBps: safeBps(state?.slippageBps ?? s.slippageBps, 50),
-          }));
+          if (u) setTimeout(() => { try { get().setTokenUrl(u); } catch {} }, 0); // ⬅️ без useStore — нет TDZ
         } catch {}
       },
     }
