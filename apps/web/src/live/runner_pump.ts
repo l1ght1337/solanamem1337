@@ -55,22 +55,42 @@ const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, 
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pumpportal.fun"].filter(Boolean);
 
-// global queue to avoid bursts across many bots
-const globalNetQueue: { p: Promise<any> } =
-  (window as any).__pumpQueue || ((window as any).__pumpQueue = { p: Promise.resolve() });
+// === очередь с ограничением конкурентности (глобально на вкладку)
+type Job<T> = () => Promise<T>;
+function makeQueue(concurrency = 3, baseGapMs = 150) {
+  const q: Array<{ job: Job<any>; resolve: (v: any) => void; reject: (e: any) => void }> = [];
+  let running = 0;
 
-function queueNet<T>(fn: () => Promise<T>) {
-  const gap = 120 + Math.floor(Math.random() * 120); // 120–240ms
-  const run = () =>
-    fn().then(async (v) => {
-      await new Promise((r) => setTimeout(r, gap));
-      return v;
+  async function runNext() {
+    if (running >= concurrency) return;
+    const item = q.shift();
+    if (!item) return;
+    running++;
+    try {
+      const jitter = baseGapMs + Math.floor(Math.random() * baseGapMs);
+      const res = await item.job();
+      await new Promise((r) => setTimeout(r, jitter)); // spacing между сборками
+      item.resolve(res);
+    } catch (e) {
+      item.reject(e);
+    } finally {
+      running--;
+      runNext();
+    }
+  }
+
+  return function enqueue<T>(job: Job<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      q.push({ job, resolve, reject });
+      runNext();
     });
-  globalNetQueue.p = globalNetQueue.p.then(run, run);
-  return globalNetQueue.p as Promise<T>;
+  };
 }
 
-function withTimeout<T>(p: Promise<T>, ms = 15000): Promise<T> {
+const enqueueTradeBuild: <T>(fn: () => Promise<T>) => Promise<T> =
+  (window as any).__tradeQ || ((window as any).__tradeQ = makeQueue(3, 150));
+
+function withTimeout<T>(p: Promise<T>, ms = 20_000): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("fetch timeout")), ms);
     p.then(
@@ -80,13 +100,12 @@ function withTimeout<T>(p: Promise<T>, ms = 15000): Promise<T> {
   });
 }
 
-// “липкий” рабочий базовый endpoint
+// “липкий” base (если один из эндпоинтов надёжен — держимся за него)
 let stickyBaseIdx = -1;
 
-async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
+async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
   const order = [...PUMP_BASES.keys()];
   if (stickyBaseIdx >= 0) {
-    // сначала пробуем “липкий”
     const i = order.indexOf(stickyBaseIdx);
     if (i > 0) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
   }
@@ -96,7 +115,8 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
     const base = PUMP_BASES[idx];
     const url = `${base.replace(/\/$/, "")}${path}`;
     for (let attempt = 0; attempt <= retries; attempt++) {
-      const backoff = 300 * attempt + Math.floor(Math.random() * 250);
+      const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
+      if (backoff) await new Promise((r) => setTimeout(r, backoff));
       try {
         const r = await withTimeout(fetch(url, {
           keepalive: true,
@@ -105,19 +125,17 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
           mode: "cors",
           ...init,
           headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
-        }), 15000);
+        }), 20_000);
 
         if (r.ok) { stickyBaseIdx = idx; return r; }
         if (r.status === 429 || r.status >= 500) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
-          await new Promise((res) => setTimeout(res, backoff));
           continue;
         }
         const txt = await r.text().catch(() => "");
         throw new Error(`${r.status} ${r.statusText}${txt ? `: ${txt}` : ""}`);
       } catch (e) {
         lastErr = e;
-        await new Promise((res) => setTimeout(res, backoff));
       }
     }
   }
@@ -127,7 +145,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
 
 /** Build Versioned TX with throttling, timeout, retries & fallback */
 async function buildTradeTxPumpPortal(payload: Record<string, any>): Promise<VersionedTransaction> {
-  return queueNet(async () => {
+  return enqueueTradeBuild(async () => {
     const attempts: Array<{ path: string; binary: boolean }> = [
       { path: "/api/trade-local", binary: true }, // binary stream (faster)
       { path: "/api/trade", binary: false },      // JSON fallback
@@ -145,7 +163,7 @@ async function buildTradeTxPumpPortal(payload: Record<string, any>): Promise<Ver
           const raw = new Uint8Array(await r.arrayBuffer());
           return VersionedTransaction.deserialize(raw);
         }
-        const j = await r.json().catch(() => ({} as any));
+        const j = (await r.json().catch(() => ({}))) as any;
         const b64 = j?.serializedTransaction || j?.tx || j?.transaction || j?.vtx || null;
         if (!b64) throw new Error("no transaction in response");
         const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
@@ -214,7 +232,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       bot.solBalance = sol;
       bot.tokenBalance = tok;
       ctx.onUpdate(bot);
-    } catch (_) { /* soft */ }
+    } catch { /* soft */ }
   }
 
   async function trade(
@@ -259,7 +277,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const vtx = await buildTradeTxPumpPortal(payload);
       vtx.sign([kp]);
 
-      // send as raw tx (a bit leaner)
       const sig = await connection.sendRawTransaction(vtx.serialize(), {
         skipPreflight: false,
         maxRetries: 4,
@@ -299,7 +316,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       ctx.onUpdate(bot);
       log("ok", `${side.toUpperCase()} ${sig.slice(0, 8)}…`);
 
-      // force on-chain refresh for this bot (SOL + token)
+      // force on-chain refresh for this bot
       await refreshOnChainBalances();
 
       cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
@@ -339,12 +356,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     const now = Date.now();
 
-    // scheduled retry after net fail
     if (now < nextRetryAt) {
       setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
     }
-    // cool-down after trade
     if (now < cooldownUntil) {
       setTimeout(loop, Math.max(50, cooldownUntil - now));
       return;
@@ -362,7 +377,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         bot.last = "ai:off";
         ctx.onUpdate(bot);
         pending = false;
-        return setTimeout(loop, Math.max(400, bot.speedMs));
+        const jitter = 200 + Math.floor(Math.random() * 300);
+        return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
       }
 
       const p = Math.max(1e-12, ctx.price());
@@ -389,7 +405,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         if (tokToSell > 0) {
           await trade("sell", 0, { sellTokens: tokToSell });
           pending = false;
-          return setTimeout(loop, Math.max(400, bot.speedMs));
+          const jitter = 200 + Math.floor(Math.random() * 300);
+          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
         }
       }
 
@@ -400,7 +417,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         if (buySol > 0.00012) {
           await twapBuy(buySol);
           pending = false;
-          return setTimeout(loop, Math.max(400, bot.speedMs));
+          const jitter = 200 + Math.floor(Math.random() * 300);
+          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
         }
       }
 
@@ -477,7 +495,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       warnDebounced(String(e?.message || e));
     } finally {
       pending = false;
-      if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs));
+      const jitter = 200 + Math.floor(Math.random() * 300);
+      if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
     }
   }
 }
