@@ -53,11 +53,23 @@ const now = () => new Date().toLocaleTimeString();
 const b58 = (s: string) => s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/)?.[0] || null;
 const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/* ---------------- PumpPortal через твой бекенд ---------------- */
+/* ---------------- PumpPortal через твои прокси/бекенд ---------------- */
+// из .env можно передать сразу несколько воркеров через запятую
+// VITE_PUMP_PROXIES=https://w1...,https://w2...,https://w3...
+const RAW_PROXIES = (import.meta.env as any).VITE_PUMP_PROXIES || "";
+const PROXIES: string[] = RAW_PROXIES
+  .split(",")
+  .map((s: string) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
-const PUMP_BASES = [
+const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
+
+// финальный список апстримов (прокси → свой бекенд → alt → публичный)
+const PUMP_BASES: string[] = [
+  ...PROXIES.map((p) => `${p}/x/pump`),
   API_BASE ? `${API_BASE}/x/pump` : "",
-  ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, ""),
+  ALT_PUMP,
   "https://pumpportal.fun",
 ].filter(Boolean);
 
@@ -71,8 +83,19 @@ function withTimeout<T>(p: Promise<T>, ms = 10_000): Promise<T> {
   });
 }
 
-/** Укреплённая обёртка: keepalive, эксп. бэкофф, повтор по 429/5xx, несколько баз */
-async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
+// «липкий» индекс базы — успешная база будет приоритетной
+let stickyBaseIdx = -1;
+
+/** Усиленная обёртка: пробует все базы с приоритетом sticky, повторы на 429/5xx, таймауты */
+async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase = 1) {
+  // порядок перебора: sticky → остальные
+  const order = [...PUMP_BASES.keys()];
+  if (stickyBaseIdx >= 0) {
+    const i = order.indexOf(stickyBaseIdx);
+    if (i > 0) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
+  }
+
+  // базовые init
   const baseInit: RequestInit = {
     keepalive: true,
     credentials: "omit",
@@ -83,33 +106,36 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
   };
 
   let lastErr: any;
-  const bases = PUMP_BASES.length ? PUMP_BASES : [""];
-  for (const base of bases) {
+  for (const idx of order) {
+    const base = PUMP_BASES[idx];
     const url = `${base.replace(/\/$/, "")}${path}`;
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      const backoff = 350 * attempt + Math.floor(Math.random() * 250);
+
+    for (let attempt = 0; attempt <= Math.max(0, retriesPerBase); attempt++) {
+      const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
+      if (backoff) await new Promise((res) => setTimeout(res, backoff));
       try {
         const ctl = new AbortController();
         const t = setTimeout(() => ctl.abort(), 15_000);
         const r = await fetch(url, { ...baseInit, signal: ctl.signal });
         clearTimeout(t);
 
-        if (r.ok) return r;
-        // на 429/5xx — пробуем ещё
-        if (r.status >= 500 || r.status === 429) {
+        if (r.ok) { stickyBaseIdx = idx; return r; }
+
+        // на 429/5xx — повторяем; на прочие — считаем «окончательный» ответ этой базы
+        if (r.status === 429 || r.status >= 500) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
-          await new Promise((res) => setTimeout(res, backoff));
           continue;
+        } else {
+          stickyBaseIdx = idx;
+          return r;
         }
-        // прочий статус — прекращаем
-        const txt = await r.text().catch(() => "");
-        throw new Error(`${r.status} ${r.statusText}${txt ? `: ${txt}` : ""}`);
       } catch (e) {
         lastErr = e;
-        await new Promise((res) => setTimeout(res, backoff));
+        // пробуем дальше эту же базу (повтор) или следующую
       }
     }
   }
+  stickyBaseIdx = -1;
   throw lastErr || new Error("All pump endpoints failed");
 }
 
@@ -119,13 +145,13 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
   try {
     const res = await fetchFirstOk("/api/trade-local", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
-    });
+    }, 2);
     const ct = res.headers.get("content-type") || "";
     if (ct.includes("application/json")) {
       const j = await res.json();
-      const b64 = j?.serializedTransaction ?? j?.tx;
+      const b64 = j?.serializedTransaction ?? j?.tx ?? j?.transaction ?? j?.vtx;
       if (!b64) throw new Error("trade-local: no serializedTransaction");
       const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
       return VersionedTransaction.deserialize(raw);
@@ -135,11 +161,11 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
   } catch (_e) {
     const res = await fetchFirstOk("/api/trade", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
-    });
+    }, 2);
     const j = await res.json().catch(() => ({} as any));
-    const b64 = j?.serializedTransaction ?? j?.tx;
+    const b64 = j?.serializedTransaction ?? j?.tx ?? j?.transaction ?? j?.vtx;
     if (!b64) throw new Error("trade fallback: no serializedTransaction");
     const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
     return VersionedTransaction.deserialize(raw);
@@ -154,9 +180,9 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
     try {
       const r = await fetchFirstOk(p, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify(body),
-      });
+      }, 2);
       const ct = r.headers.get("content-type") || "";
 
       if (!ct.includes("application/json")) {
@@ -169,8 +195,9 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
         const raw = Uint8Array.from(atob(j.serializedTransaction), (c) => c.charCodeAt(0));
         return { tx: VersionedTransaction.deserialize(raw), mint: j.mint || j.token || j.tokenAddress };
       }
-      if (j?.mint && j?.tx) {
-        const raw = Uint8Array.from(atob(j.tx), (c) => c.charCodeAt(0));
+      if (j?.mint && (j?.tx || j?.transaction)) {
+        const b64 = j.tx || j.transaction;
+        const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
         return { tx: VersionedTransaction.deserialize(raw), mint: j.mint };
       }
 
@@ -188,7 +215,7 @@ async function uploadIpfsMeta(params: {
 }) {
   const r = await fetchFirstOk("/api/ipfs", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({
       name: params.name,
       symbol: params.symbol,
@@ -197,7 +224,7 @@ async function uploadIpfsMeta(params: {
       website: params.website || "",
       twitter: params.twitter || "",
     }),
-  });
+  }, 2);
   const j = await r.json().catch(() => ({}));
   const uri = j?.uri || j?.ipfsUri || j?.metadataUri;
   if (!uri) throw new Error("IPFS upload failed (no uri)");
@@ -226,9 +253,9 @@ async function buildCreateViaLightning(args: {
 
   const r = await fetchFirstOk("/api/trade", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(payload),
-  });
+  }, 2);
 
   const j = await r.json().catch(() => ({}));
   const mint = j?.mint || j?.token || j?.tokenAddress || j?.address;
@@ -324,7 +351,7 @@ export type Store = {
 
   smartMM: SmartMM;
   getSmartBps: () => number;
-  getTwapPlan: () => ({ slices: number; gapMs: number } | null);
+  getTwapPlan: () => { slices: number; gapMs: number } | null;
 
   treasuryKeyId?: string;
   autoTopUp: boolean;
@@ -462,7 +489,7 @@ export const useStore = create<Store>()(
       autoTopUp: true,
       minFeeSol: 0.01,
       topUpToSol: 0.03,
-      setTreasuryFromSecret: (name: string, secret: string) => {
+      setTreasuryFromSecret: (name, secret) => {
         const rec = importKey(name || "Treasury", secret);
         set({ treasuryKeyId: rec.id });
         get().addLog("ok", `Treasury задан: ${rec.pubkey}`);
@@ -707,9 +734,9 @@ export const useStore = create<Store>()(
           const kp = getKeypair(sender.keyId);
           if (!kp) { s.addLog("err", `Нет ключа для ${sender.name}`); continue; }
 
-          const idx = bots.findIndex((x) => x.id === sender.id);
-          const receiver = bots[(idx + 1) % bots.length];
-          const toPk = new PublicKey(receiver.pubkey);
+        const idx = bots.findIndex((x) => x.id === sender.id);
+        const receiver = bots[(idx + 1) % bots.length];
+        const toPk = new PublicKey(receiver.pubkey);
 
           for (let i = 0; i < txPerBot; i++) {
             try {
@@ -805,11 +832,11 @@ export const useStore = create<Store>()(
               }),
             })),
 
-          // <<< НОВОЕ: после сделки мягко обновляем балансы с RPC
+          // после сделки мягкий refresh (SOL + токен) для всех ботов
           afterTrade: () => {
             get().refreshBalances(connection).catch(() => {});
           },
-        } as any); // as any — чтобы не ругался TS, если RunCtx пока без afterTrade
+        } as any);
 
         (bot as any).__stop = stop;
       },
@@ -825,7 +852,7 @@ export const useStore = create<Store>()(
       startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
       stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
 
-      // ===== Балансы + авто-донат (ПОЧИНЕНО) =====
+      // ===== Балансы + авто-донат (починено) =====
       async refreshBalances(connection) {
         try {
           const s = get();
