@@ -53,7 +53,7 @@ const now = () => new Date().toLocaleTimeString();
 const b58 = (s: string) => s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/)?.[0] || null;
 const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/* ---------------- PumpPortal через прокси/бэкенд ---------------- */
+/* ---------------- PumpPortal через твои прокси/бекенд ---------------- */
 const RAW_PROXIES = (import.meta.env as any).VITE_PUMP_PROXIES || "";
 const PROXIES: string[] = RAW_PROXIES
   .split(",")
@@ -63,10 +63,10 @@ const PROXIES: string[] = RAW_PROXIES
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 
-// Jupiter через свой воркер (по умолчанию — /jup)
+// ⬇️ Jupiter base (через твой воркер). По умолчанию — "/jup"
 const JUP_BASE = ((import.meta.env as any).VITE_JUP_BASE || "/jup").replace(/\/+$/, "");
 
-/** порядок апстримов: прокси → свой бэкенд → alt → публичный */
+// финальный список апстримов (прокси → свой бекенд → alt → публичный)
 const PUMP_BASES: string[] = [
   ...PROXIES.map((p) => `${p}/x/pump`),
   API_BASE ? `${API_BASE}/x/pump` : "",
@@ -74,10 +74,10 @@ const PUMP_BASES: string[] = [
   "https://pumpportal.fun",
 ].filter(Boolean);
 
-// «липкий» индекс удачной базы
+// «липкий» индекс базы — успешная база будет приоритетной
 let stickyBaseIdx = -1;
 
-/** Усиленная обёртка: sticky-приоритет, ретраи на 429/5xx, таймауты */
+/** Усиленная обёртка: пробует все базы с приоритетом sticky, повторы на 429/5xx, таймауты */
 async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase = 1) {
   const order = [...PUMP_BASES.keys()];
   if (stickyBaseIdx >= 0) {
@@ -86,7 +86,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   }
 
   const baseInit: RequestInit = {
-    keepalive: false, // меньше «висячих» соединений
+    keepalive: false, // меньше висящих соединений
     credentials: "omit",
     cache: "no-store",
     mode: "cors",
@@ -126,11 +126,35 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   throw lastErr || new Error("All pump endpoints failed");
 }
 
-/** helper для Jupiter: уйдёт на {proxy}/jup/... */
+/* ⬇️ helper для Jupiter: уходит на {proxy}/jup/... или {proxy}/x/pump/jup/... */
 export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
   const p = path.startsWith("/") ? path : `/${path}`;
   return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
 }
+
+/* ⛑ ГЛОБАЛЬНЫЙ АНТИ-CORS ПАТЧ ДЛЯ JUPITER
+   Любой прямой fetch на https://quote-api.jup.ag/* или https://price.jup.ag/*
+   автоматически уходит через наш прокси (JUP_BASE) и много-прокси обёртку. */
+(() => {
+  const origFetch = globalThis.fetch?.bind(globalThis);
+  if (!origFetch) return;
+  const needsProxy = (u: string) =>
+    /^https:\/\/(quote-api|price)\.jup\.ag\//.test(u);
+  globalThis.fetch = ((input: any, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : (input?.url ?? "");
+    if (typeof url === "string" && needsProxy(url)) {
+      try {
+        const u = new URL(url);
+        // Превращаем https://quote-api.jup.ag/v6/quote?... -> {base}/jup/v6/quote?...
+        return fetchFirstOk(`${JUP_BASE}${u.pathname}${u.search}`, init, 1);
+      } catch {
+        // если вдруг не распарсили — падаем обратно на обычный fetch
+      }
+    }
+    return origFetch(input as any, init);
+  }) as any;
+})();
+/* ---------- /анти-CORS ---------- */
 
 /* ---------- Local API ---------- */
 async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
@@ -296,14 +320,15 @@ async function sendTransferWithRetry(
       await confirmSigHttp(connection, sig);
       return sig;
     } catch (e: any) {
-      lastErr = e?.message || String(e);
+      const m = e?.message || String(e);
+      lastErr = m;
       await new Promise((r) => setTimeout(r, 300));
     }
   }
   throw new Error(lastErr || "block height exceeded after retries");
 }
 
-/* ===== санитайзеры/дефолты ===== */
+/* ===== Misc types & sanitizers ===== */
 export type SmartMM = {
   enabled: boolean;
   minBps: number;
@@ -338,7 +363,9 @@ export type Store = {
   price: number;
   candles: { t: number; open: number; high: number; low: number; close: number; volume: number }[];
 
+  /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
   ticks: { t: number; p: number }[];
+  /** быстрый импульс: изменение цены за последние `sec` секунд */
   getChangeFast: (sec?: number) => number;
 
   external: {
@@ -431,8 +458,8 @@ export const useStore = create<Store>()(
       getChangeFast(sec = 15) {
         const st = get();
         if (!st.ticks.length) return 0;
-        const now = Date.now();
-        const since = now - sec * 1000;
+        const tnow = Date.now();
+        const since = tnow - sec * 1000;
         let base = st.ticks[0].p;
         for (let i = st.ticks.length - 1; i >= 0; i--) {
           if (st.ticks[i].t <= since) { base = st.ticks[i].p; break; }
@@ -519,9 +546,9 @@ export const useStore = create<Store>()(
               mint,
               onPrice: (p) =>
                 set((st) => {
-                  const ts = Date.now();
-                  const ticks = (st.ticks || []).concat({ t: ts, p });
-                  const cut = ts - 60_000;
+                  const tnow = Date.now();
+                  const ticks = (st.ticks || []).concat({ t: tnow, p });
+                  const cut = tnow - 60_000;
                   return { price: p, ticks: ticks.filter((x) => x.t > cut) };
                 }),
               onCandle: (m, p) =>
@@ -567,10 +594,24 @@ export const useStore = create<Store>()(
         get().addLog("ok", `Импортирован ключ для ${bot.name}: ${bot.pubkey}`);
       },
 
-      updateBot: (id, patch) => set((s) => ({ bots: s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b)) })),
-      removeBot: (id) => { try { removeKey(id); } catch {} set((s) => ({ bots: s.bots.filter((b) => b.id !== id) })); },
-      exportBotKey: (id) => { try { return exportSecret(id); } catch { return null; } },
+      // ===== CRUD над настройками из UI
+      updateBot: (id: string, patch: Partial<LiveBot>) => {
+        set((s) => {
+          const bots = s.bots.map((b) => (b.id === id ? { ...b, ...patch } : b));
+          return { bots };
+        });
+      },
 
+      removeBot: (id: string) => {
+        try { removeKey(id); } catch {}
+        set((s) => ({ bots: s.bots.filter((b) => b.id !== id) }));
+      },
+
+      exportBotKey: (id: string) => {
+        try { return exportSecret(id); } catch { return null; }
+      },
+
+      // Пополнение из Treasury
       async topUpBot(connection, botId) {
         const s = get();
         const bot = s.bots.find((b) => b.id === botId);
@@ -597,6 +638,7 @@ export const useStore = create<Store>()(
         }
       },
 
+      // Drain (HTTP-confirm)
       async drainBotTo(connection, botId, destAddress) {
         const s = get();
         const bot = s.bots.find((b) => b.id === botId);
@@ -677,8 +719,7 @@ export const useStore = create<Store>()(
             for (let i = 0; i < get().warmupCfg.simulatePerBot; i++) {
               const memoIx = new TransactionInstruction({ keys: [], programId: MEMO_PROGRAM_ID, data: Buffer.from(`warmup:${Date.now()}:${i}`) });
               const tx = new Transaction().add(memoIx);
-              tx.feeПayer = kp.publicKey as any; // совместимость со старыми типами
-              (tx as any).feePayer = kp.publicKey;
+              tx.feePayer = kp.publicKey;
               tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
               tx.sign(kp);
               await connection.simulateTransaction(tx, { sigVerify: false });
@@ -797,6 +838,7 @@ export const useStore = create<Store>()(
             return r > 0 ? r : bot.budgetSol;
           },
 
+          // читаем флажок AI «на лету»
           isAiPaused: () => {
             const curr = get().bots.find((x) => x.id === bot.id);
             return !(curr?.aiEnabled);
@@ -804,6 +846,7 @@ export const useStore = create<Store>()(
 
           onLog: (lvl, msg) => get().addLog(lvl, msg),
 
+          // Обновляем только рантайм-поля
           onUpdate: (patch: any) =>
             set((st) => ({
               bots: st.bots.map((x) => {
@@ -823,6 +866,7 @@ export const useStore = create<Store>()(
               }),
             })),
 
+          // после сделки мягкий refresh (SOL + токен) для всех ботов
           afterTrade: () => {
             get().refreshBalances(connection).catch(() => {});
           },
@@ -842,31 +886,36 @@ export const useStore = create<Store>()(
       startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
       stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
 
-      // Балансы + авто-донат
+      // ===== Балансы + авто-донат =====
       async refreshBalances(connection) {
         try {
           const s = get();
           const mint = s.tokenMint || null;
 
+          // выясняем decimals токена (если mint известен)
           let decimals: number | null = null;
           if (mint) {
             try {
               let d = s._mintDecimals;
               if (d == null) { d = await getMintDecimals(connection, mint); set({ _mintDecimals: d }); }
               decimals = d ?? 9;
-            } catch { decimals = 9; }
+            } catch {
+              decimals = 9;
+            }
           }
 
           const priceNow = get().price || 0;
 
           const bots = await Promise.all(
             get().bots.map(async (b) => {
+              // SOL — всегда обновляем
               let sol = b.solBalance;
               try {
                 const lam = await connection.getBalance(new PublicKey(b.pubkey));
                 sol = lam / LAMPORTS_PER_SOL;
               } catch {}
 
+              // токен — только если mint известен
               let tok = b.tokenBalance;
               if (mint && decimals != null) {
                 try {
@@ -882,6 +931,7 @@ export const useStore = create<Store>()(
 
           set({ bots });
 
+          // авто-донат
           const { autoTopUp, minFeeSol, topUpBot } = get();
           if (autoTopUp) {
             const nowTs = Date.now();
@@ -905,7 +955,7 @@ export const useStore = create<Store>()(
       async tickReal() {
         const s = get();
         if (!s.tokenMint) return;
-        if (s.external.provider === "pumpportal") return;
+        if (s.external.provider === "pumpportal") return; // pump.fun обновляет цену через WS
 
         const tryOnce = async (prov: any) => {
           try {
@@ -936,9 +986,9 @@ export const useStore = create<Store>()(
           else { last.high = Math.max(last.high, p!); last.low = Math.min(last.low, p!); last.close = p!; }
           if (c.length > 1000) c = c.slice(-1000);
 
-          const ts = Date.now();
-          const ticks = (st.ticks || []).concat({ t: ts, p: p! });
-          const cut = ts - 60_000;
+          const now = Date.now();
+          const ticks = (st.ticks || []).concat({ t: now, p: p! });
+          const cut = now - 60_000;
 
           const bots = st.bots.map((b) => ({ ...b, unrealized: b.posToken * (p! - (b.avgSol || p!)) }));
           return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
@@ -1032,6 +1082,7 @@ export const useStore = create<Store>()(
         }
       },
 
+      /** ===== Новая: все боты покупают на percent своего SOL ===== */
       async buyAllBotsAtPercentOnPump(connection, percent, opts = {}) {
         const keep = Math.max(0.0005, (opts as any).keepFeeSol ?? get().minFeeSol);
         const pct = Math.min(1, Math.max(0, Number(percent) || 0));
@@ -1241,7 +1292,7 @@ export const useStore = create<Store>()(
       onRehydrateStorage: () => (state) => {
         try {
           const u = state?.tokenUrl;
-          if (u) setTimeout(() => { try { get().setTokenUrl(u); } catch {} }, 0); // ⬅️ без useStore — нет TDZ
+          if (u) setTimeout(() => { try { get().setTokenUrl(u); } catch {} }, 0);
         } catch {}
       },
     }
