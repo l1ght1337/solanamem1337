@@ -119,7 +119,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
       if (backoff) await new Promise((r) => setTimeout(r, backoff));
       try {
         const r = await withTimeout(fetch(url, {
-          keepalive: true,
+          keepalive: false, // ⬅️ уменьшает висящие сокеты и failed to fetch
           credentials: "omit",
           cache: "no-store",
           mode: "cors",
