@@ -68,7 +68,10 @@ export async function swapFromQuoteWithKeypair(opts: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapRes.swapTransaction, 'base64'))
+  // Browser-safe base64 decode (без Node Buffer, чтобы исключить полифилл и TDZ-ошибки)
+  const b64 = String(swapRes.swapTransaction)
+  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+  const tx = VersionedTransaction.deserialize(raw)
   tx.sign([keypair])
   const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 })
   return sig

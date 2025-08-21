@@ -5,6 +5,7 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import { getSPLBalance } from "../utils/solana";
+import { scheduleFetch } from "../utils/network";
 
 /* ───────────────────────────── Types ───────────────────────────── */
 type BotStrategy = "trend" | "revert" | "scalper";
@@ -118,14 +119,11 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 3) {
       const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
       if (backoff) await new Promise((r) => setTimeout(r, backoff));
       try {
-        const r = await withTimeout(fetch(url, {
-          keepalive: false, // ⬅️ уменьшает висящие сокеты и failed to fetch
-          credentials: "omit",
-          cache: "no-store",
-          mode: "cors",
-          ...init,
-          headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
-        }), 20_000);
+        const r = await scheduleFetch(url, {
+          ...(init as any),
+          timeoutMs: 20_000,
+          tries: 1,
+        }, "pump");
 
         if (r.ok) { stickyBaseIdx = idx; return r; }
         if (r.status === 429 || r.status >= 500) {
