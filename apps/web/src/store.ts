@@ -289,6 +289,22 @@ async function detectTokenProgram(connection: Connection, mint: PublicKey) {
   }
 }
 
+// Быстрое чтение decimals из raw Mint-аккаунта (offset 44, u8). Без парсинга.
+async function getMintDecimalsFast(connection: Connection, mint: PublicKey): Promise<number | null> {
+  try {
+    const infos = await connection.getMultipleAccountsInfo([mint]);
+    const acc = infos?.[0] || null;
+    const data = (acc?.data as any) as Uint8Array | undefined;
+    if (data && data.byteLength >= 45) return data[44];
+  } catch {}
+  try {
+    const info = await connection.getAccountInfo(mint);
+    const data = (info?.data as any) as Uint8Array | undefined;
+    if (data && data.byteLength >= 45) return data[44];
+  } catch {}
+  return null;
+}
+
 async function ensureWalletAta(connection: Connection, walletPubkey: string, mint: string) {
   const ph = (window as any).solana;
   const mintPk = new PublicKey(mint);
@@ -1186,9 +1202,15 @@ export const useStore = create<Store>()(
         const walletPk = new PublicKey(walletPubkey);
         let decimals = s._mintDecimals;
         if (decimals == null) {
-          try { decimals = await getMintDecimals(connection, s.tokenMint); set({ _mintDecimals: decimals }); } catch {}
+          // Сначала быстрый raw-декод; если не получилось — обычный helper
+          const fast = await getMintDecimalsFast(connection as Connection, mintPk);
+          decimals = fast ?? null;
+          if (decimals == null) {
+            try { decimals = await getMintDecimals(connection, s.tokenMint); } catch {}
+          }
+          if (decimals != null) set({ _mintDecimals: decimals });
         }
-        decimals = decimals ?? 9;
+        decimals = (decimals ?? 9);
 
         for (let i = 0; i < s.bots.length; i++) {
           const b = s.bots[i];
@@ -1214,7 +1236,14 @@ export const useStore = create<Store>()(
 
             const tx = new Transaction();
             if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, useProgram));
-            tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], useProgram));
+            // Если decimals по-прежнему не удалось получить корректно — сделаем transfer без checked
+            if (typeof decimals === "number" && Number.isFinite(decimals)) {
+              tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], useProgram));
+            } else {
+              // fallback на не-checked передачу
+              const { createTransferInstruction } = await import("@solana/spl-token");
+              tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], useProgram));
+            }
 
             const { blockhash } = await connection.getLatestBlockhash("finalized");
             tx.feePayer = kp.publicKey;
