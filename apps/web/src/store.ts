@@ -1128,7 +1128,7 @@ export const useStore = create<Store>()(
               pool: "auto",
             });
             vtx.sign([kp]);
-            const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
+            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
             await confirmSigHttp(connection, sig);
             s.addLog("ok", `Auto-buy ${b.name}: ${spend.toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
           } catch (e: any) {
@@ -1163,7 +1163,7 @@ export const useStore = create<Store>()(
               pool: "auto",
             });
             vtx.sign([kp]);
-            const sig = await connection.sendTransaction(vtx, { skipPreflight: false });
+            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
             await confirmSigHttp(connection, sig);
             s.addLog("ok", `Buy% ${b.name}: ${(spend).toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
           } catch (e: any) {
