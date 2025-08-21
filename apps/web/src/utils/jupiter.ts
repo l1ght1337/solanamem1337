@@ -14,22 +14,46 @@ export type JupQuote = {
 }
 
 const JUP_BASE = ((import.meta as any).env?.VITE_JUP_BASE || '/jup').replace(/\/+$/, '')
+const RAW_PROXIES = ((import.meta as any).env?.VITE_PUMP_PROXIES || '').trim()
+const JUP_PUBLIC = 'https://quote-api.jup.ag'
 
 async function jupFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T> {
-  // если пришёл абсолютный URL quote-api — перепрыгнем на наш прокси
-  let url = pathOrUrl
+  // Нормализуем путь для Jupiter v6
+  let path = pathOrUrl
   try {
     const u = new URL(pathOrUrl)
     if (/^https:\/\/(quote-api|price)\.jup\.ag\//.test(u.href)) {
-      url = `${JUP_BASE}${u.pathname}${u.search}`
+      path = `${u.pathname}${u.search}`
     }
   } catch {
-    // относительный путь — считаем, что это уже /jup/..
-    if (!/^https?:/i.test(pathOrUrl)) url = `${JUP_BASE}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`
+    if (!/^\//.test(pathOrUrl)) path = `/${pathOrUrl}`
   }
-  const r = await scheduleFetch(url, { ...(init as any), timeoutMs: 15000, tries: 2 }, 'jup')
-  if (!r.ok) throw new Error(`Jupiter HTTP ${r.status}`)
-  return r.json() as Promise<T>
+  if (!/^\/v\d+\//.test(path)) path = `/v6${path}`
+
+  const proxies = RAW_PROXIES
+    ? RAW_PROXIES.split(',').map((s: string) => s.trim()).filter(Boolean)
+    : []
+
+  const candidates = proxies.length
+    ? proxies.map((p: string) => `${p.replace(/\/+$/, '')}/x/pump${JUP_BASE}${path}`)
+    : [`${JUP_PUBLIC}${path}`]
+
+  let lastErr: any
+  for (const url of candidates) {
+    try {
+      const r = await scheduleFetch(url, { ...(init as any), timeoutMs: 15000, tries: 2 }, 'jup')
+      if (!r.ok) { lastErr = new Error(`Jupiter HTTP ${r.status}`); continue }
+      const ct = r.headers.get('content-type') || ''
+      if (!/json/i.test(ct)) {
+        const txt = await r.text().catch(() => '')
+        throw new Error(`Jupiter non-JSON (${r.status}) at ${url.split('?')[0]}: ${txt.slice(0,80)}`)
+      }
+      return r.json() as Promise<T>
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw lastErr || new Error('Jupiter fetch failed')
 }
 
 export async function getJupiterQuote(opts: {
