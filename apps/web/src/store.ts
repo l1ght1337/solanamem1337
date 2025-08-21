@@ -1225,13 +1225,24 @@ export const useStore = create<Store>()(
             const infos = await connection.getMultipleAccountsInfo([srcClassic, src22, dstClassic, dst22]);
             const [srcCInfo, src22Info, dstCInfo, dst22Info] = infos;
 
-            let useProgram = TOKEN_PROGRAM_ID;
-            let srcAta = srcClassic; let dstAta = dstClassic; let dstInfo = dstCInfo;
-            if (src22Info) { useProgram = TOKEN_2022_PROGRAM_ID; srcAta = src22; dstAta = dst22; dstInfo = dst22Info; }
+            // локальный декодер amount из ATA
+            const decodeAmount = (acc: any): bigint => {
+              try {
+                if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+                return (BigInt(hi) << 32n) + BigInt(lo);
+              } catch { return 0n; }
+            };
 
-            // баланс источника
-            const raw = await getSPLBalance(connection, b.pubkey, s.tokenMint);
-            const amountRaw = BigInt(raw as any);
+            const amtC = decodeAmount(srcCInfo);
+            const amt22 = decodeAmount(src22Info);
+
+            let useProgram = TOKEN_PROGRAM_ID;
+            let srcAta = srcClassic; let dstAta = dstClassic; let dstInfo = dstCInfo; let amountRaw = amtC;
+            if (amt22 > 0n || (!srcCInfo && src22Info)) { // предпочитаем 2022, если там есть баланс или только он существует
+              useProgram = TOKEN_2022_PROGRAM_ID; srcAta = src22; dstAta = dst22; dstInfo = dst22Info; amountRaw = amt22;
+            }
             if (amountRaw <= 0n) { s.addLog("info", `Sell ALL: у ${b.name} токенов нет`); continue; }
 
             const tx = new Transaction();
