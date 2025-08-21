@@ -280,25 +280,48 @@ async function buildCreateViaLightning(args: {
 
 /* ---------- helpers ---------- */
 async function detectTokenProgram(connection: Connection, mint: PublicKey) {
-  const info = await connection.getAccountInfo(mint);
-  return info?.owner?.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+  try {
+    const info = await connection.getAccountInfo(mint);
+    return info?.owner?.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+  } catch {
+    // Fail-safe: если RPC дал странный ответ — используем классический TOKEN_PROGRAM_ID
+    return TOKEN_PROGRAM_ID;
+  }
 }
 
 async function ensureWalletAta(connection: Connection, walletPubkey: string, mint: string) {
   const ph = (window as any).solana;
   const mintPk = new PublicKey(mint);
   const walletPk = new PublicKey(walletPubkey);
-  const programId = await detectTokenProgram(connection, mintPk);
-  const ata = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
-  const info = await connection.getAccountInfo(ata);
-  if (info) return ata;
-  const ix = createAssociatedTokenAccountInstruction(walletPk, ata, walletPk, mintPk, programId);
-  const { blockhash } = await connection.getLatestBlockhash();
-  const tx = new Transaction({ feePayer: walletPk, recentBlockhash: blockhash }).add(ix);
-  if (!ph?.signAndSendTransaction) throw new Error("Phantom не поддерживает signAndSendTransaction");
-  const { signature } = await ph.signAndSendTransaction(tx);
-  await confirmSigHttp(connection, signature);
-  return ata;
+
+  // Попробуем оба варианта программ, чтобы не падать при сбое detect
+  const programGuess = await detectTokenProgram(connection, mintPk);
+  const candidates = [programGuess, programGuess === TOKEN_2022_PROGRAM_ID ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID];
+
+  for (const programId of candidates) {
+    const ata = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
+    try {
+      const info = await connection.getAccountInfo(ata);
+      if (info) return ata;
+    } catch {}
+  }
+
+  // Создадим с предполагаемой программой, при ошибке попробуем второй
+  for (const programId of candidates) {
+    try {
+      const ata = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
+      const ix = createAssociatedTokenAccountInstruction(walletPk, ata, walletPk, mintPk, programId);
+      const { blockhash } = await connection.getLatestBlockhash();
+      const tx = new Transaction({ feePayer: walletPk, recentBlockhash: blockhash }).add(ix);
+      if (!ph?.signAndSendTransaction) throw new Error("Phantom не поддерживает signAndSendTransaction");
+      const { signature } = await ph.signAndSendTransaction(tx);
+      await confirmSigHttp(connection, signature);
+      return ata;
+    } catch (e) {
+      // попробуем следующий programId
+    }
+  }
+  throw new Error("ensureWalletAta: failed to create ATA for wallet");
 }
 
 async function sendTransferWithRetry(
