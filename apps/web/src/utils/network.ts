@@ -65,7 +65,11 @@ class Scheduler {
   constructor(maxConcurrency: number, maxRps: number) {
     this.maxConcurrency = Math.max(1, maxConcurrency);
     this.bucket = new TokenBucket(maxRps, maxRps);
+    // RPS window ticker
     setInterval(() => this.tickRps(), 1000);
+    // Периодически пробуем запускать задачи из очереди, чтобы не залипать,
+    // когда токены появились позже (в фоне таймеры могут клампиться браузером)
+    setInterval(() => this.maybeRun(), 100);
   }
 
   private tickRps() {
@@ -88,6 +92,7 @@ class Scheduler {
       const [job] = this.queue.splice(idx, 1);
       this.runJob(job);
     }
+    // Если токенов нет или достигнут предел — перезапустимся позже автоматически таймером
   }
 
   private runJob(job: Job) {
@@ -164,6 +169,7 @@ class Scheduler {
         reject,
       };
       this.queue.push(job);
+      // Немедленный пинок очереди
       this.maybeRun();
     });
   }
