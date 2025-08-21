@@ -23,6 +23,7 @@ import {
 import { fetchExternalPrice } from "./store-price-feeds";
 import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./utils/keyring";
 import { getMintDecimals, getSPLBalance } from "./utils/solana";
+import { scheduleFetch, getNetMetrics } from "./utils/network";
 
 export type BotStrategy = "trend" | "revert" | "scalper";
 
@@ -103,10 +104,8 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
       const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
       if (backoff) await new Promise((res) => setTimeout(res, backoff));
       try {
-        const ctl = new AbortController();
-        const t = setTimeout(() => ctl.abort(), 15_000);
-        const r = await fetch(url, { ...baseInit, signal: ctl.signal });
-        clearTimeout(t);
+        // планировщик ограничивает глобальную конкуренцию и rps
+        const r = await scheduleFetch(url, { ...(baseInit as any), timeoutMs: 15_000, tries: 1 }, "pump");
 
         if (r.ok) { stickyBaseIdx = idx; return r; }
 

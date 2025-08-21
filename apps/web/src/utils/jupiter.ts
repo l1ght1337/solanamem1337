@@ -1,4 +1,5 @@
 import { Connection, VersionedTransaction, Keypair } from '@solana/web3.js'
+import { scheduleFetch } from './network'
 
 export const WSOL = 'So11111111111111111111111111111111111111112'
 
@@ -12,8 +13,21 @@ export type JupQuote = {
   routePlan?: any[]
 }
 
-async function jupFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(url, init)
+const JUP_BASE = ((import.meta as any).env?.VITE_JUP_BASE || '/jup').replace(/\/+$/, '')
+
+async function jupFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T> {
+  // если пришёл абсолютный URL quote-api — перепрыгнем на наш прокси
+  let url = pathOrUrl
+  try {
+    const u = new URL(pathOrUrl)
+    if (/^https:\/\/(quote-api|price)\.jup\.ag\//.test(u.href)) {
+      url = `${JUP_BASE}${u.pathname}${u.search}`
+    }
+  } catch {
+    // относительный путь — считаем, что это уже /jup/..
+    if (!/^https?:/i.test(pathOrUrl)) url = `${JUP_BASE}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`
+  }
+  const r = await scheduleFetch(url, { ...(init as any), timeoutMs: 15000, tries: 2 }, 'jup')
   if (!r.ok) throw new Error(`Jupiter HTTP ${r.status}`)
   return r.json() as Promise<T>
 }
@@ -49,7 +63,7 @@ export async function swapFromQuoteWithKeypair(opts: {
     wrapAndUnwrapSol: wrapAndUnwrapSol ?? true,
     dynamicComputeUnitLimit: true,
   }
-  const swapRes = await jupFetch<any>('https://quote-api.jup.ag/v6/swap', {
+  const swapRes = await jupFetch<any>('/v6/swap', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

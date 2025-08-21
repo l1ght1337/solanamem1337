@@ -23,170 +23,167 @@ export interface Env {
 
   /** CORS (через запятую) — по умолчанию * */
   CORS_ORIGINS?: string;
+
+  /** (опц.) лимиты воркера */
+  RATE_MAX_CONCURRENCY?: string; // например 16
+  RATE_MAX_RPS?: string;         // например 120
 }
 
 const JSON_CT = "application/json; charset=utf-8";
 
-/* ----------------------------- helpers ----------------------------- */
+/* ----------------------------- rate limiting & metrics ----------------------------- */
 
-function pickRpcHttp(env: Env): string {
-  const url =
-    env.UPSTREAM_RPC_URL ||
-    env.UPSTREAM_ON_URL ||
-    env.UPSTREAM_QN_URL ||
-    "";
-  if (!url.trim()) throw new Error("UPSTREAM_RPC_URL secret is not set");
-  return url.trim();
-}
+// Простая реализация TokenBucket + семафор в памяти воркера.
+// Работает в одном изоляте; для прод — держите несколько воркеров (как у вас 01/02/03).
 
-function pickRpcWs(env: Env): string {
-  const ws =
-    env.UPSTREAM_RPC_WS ||
-    env.UPSTREAM_QN_WS ||
-    pickRpcHttp(env).replace(/^http/i, "ws");
-  return ws.trim();
-}
+class TokenBucket {
+  private capacity: number;
+  private ratePerSec: number;
+  private tokens: number;
+  private lastRefill: number;
+  private waiters: Array<() => void> = [];
 
-function allowedOrigin(req: Request, env: Env): string {
-  const origin = req.headers.get("Origin") || "";
-  const cfg = (env.CORS_ORIGINS || "*").trim();
-  if (cfg === "*" || !cfg) return "*";
-  const list = cfg.split(",").map((s) => s.trim()).filter(Boolean);
-  if (list.includes(origin)) return origin;
-  return list[0] || "*";
-}
+  constructor(capacity: number, ratePerSec: number) {
+    this.capacity = Math.max(1, capacity);
+    this.ratePerSec = Math.max(1, ratePerSec);
+    this.tokens = this.capacity;
+    this.lastRefill = Date.now();
+  }
 
-function corsHeaders(req: Request, env: Env): Record<string, string> {
-  const allowOrigin = allowedOrigin(req, env);
-  const reqHdr = req.headers.get("Access-Control-Request-Headers") || "*";
-  return {
-    "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": reqHdr,
-    "Access-Control-Allow-Credentials": "true",
-    Vary: "Origin",
-  };
-}
+  private refill() {
+    const now = Date.now();
+    const delta = (now - this.lastRefill) / 1000;
+    if (delta <= 0) return;
+    this.lastRefill = now;
+    this.tokens = Math.min(this.capacity, this.tokens + delta * this.ratePerSec);
+  }
 
-function withCors(req: Request, env: Env, res: Response): Response {
-  const h = new Headers(res.headers);
-  for (const [k, v] of Object.entries(corsHeaders(req, env))) h.set(k, v);
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
-}
+  async acquire(n = 1): Promise<void> {
+    while (true) {
+      this.refill();
+      if (this.tokens >= n) {
+        this.tokens -= n;
+        return;
+      }
+      await new Promise<void>((res) => this.waiters.push(res));
+    }
+  }
 
-function json(req: Request, env: Env, status: number, body: unknown) {
-  return withCors(req, env, new Response(JSON.stringify(body), { status, headers: { "content-type": JSON_CT } }));
-}
-
-function isAuthOk(req: Request, env: Env): boolean {
-  const required = (env.ACCESS_TOKEN || "").trim();
-  if (!required) return true;
-  const url = new URL(req.url);
-  const q = url.searchParams.get("token");
-  const bearer = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-  const x = req.headers.get("x-api-key") || "";
-  return q === required || bearer === required || x === required;
-}
-
-function pumpBase(env: Env): string {
-  return (env.PUMP_BASE || "https://pumpportal.fun").replace(/\/+$/, "");
-}
-
-/* ----------------------------- JSON-RPC (/rpc) ----------------------------- */
-
-async function handleRpcHttp(req: Request, env: Env): Promise<Response> {
-  if (!isAuthOk(req, env)) return json(req, env, 401, { error: "UNAUTHORIZED" });
-
-  const upstream = pickRpcHttp(env);
-
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort("timeout"), 15_000);
-
-  try {
-    const hdr = new Headers({ "content-type": "application/json" });
-    if (env.QN_TOKEN) hdr.set("x-api-key", env.QN_TOKEN);
-
-    const r = await fetch(upstream, { method: "POST", body: req.body, headers: hdr, signal: ac.signal });
-    return withCors(req, env, r);
-  } catch (e: any) {
-    return json(req, env, 500, { error: "UPSTREAM_FAIL", message: e?.message || String(e) });
-  } finally {
-    clearTimeout(to);
+  notify() {
+    // будим одного ожидателя на каждый токен
+    this.refill();
+    while (this.tokens >= 1 && this.waiters.length) {
+      this.tokens -= 1;
+      const w = this.waiters.shift();
+      try { w && w(); } catch {}
+    }
   }
 }
 
-/* ----------------------------- Pump proxy (/x/pump/*) ----------------------------- */
-
-async function handlePumpProxy(req: Request, env: Env, url: URL): Promise<Response> {
-  const targetPath = url.pathname.replace(/^\/x\/pump/, "") || "/";
-  const targetUrl = new URL(pumpBase(env) + targetPath);
-  targetUrl.search = url.search;
-
-  const headers = new Headers(req.headers);
-  headers.delete("host");
-  headers.delete("cf-connecting-ip");
-  headers.delete("x-forwarded-for");
-  headers.delete("x-real-ip");
-  if (env.PUMP_API_KEY) headers.set("x-api-key", env.PUMP_API_KEY);
-
-  const r = await fetch(targetUrl.toString(), { method: req.method, headers, body: req.body });
-  return withCors(req, env, r);
+class Semaphore {
+  private max: number;
+  private inuse = 0;
+  private queue: Array<() => void> = [];
+  constructor(max: number) { this.max = Math.max(1, max); }
+  async acquire(): Promise<void> {
+    if (this.inuse < this.max) { this.inuse++; return; }
+    await new Promise<void>((res) => this.queue.push(res));
+    this.inuse++;
+  }
+  release() {
+    this.inuse = Math.max(0, this.inuse - 1);
+    const next = this.queue.shift();
+    if (next) next();
+  }
+  getInUse() { return this.inuse; }
+  getQueueLen() { return this.queue.length; }
 }
 
-/* ----------------------------- fetch ----------------------------- */
+let bucket = new TokenBucket(120, 120);
+let sem = new Semaphore(16);
+function ensureLimits(env: Env) {
+  const maxConc = Number(env.RATE_MAX_CONCURRENCY || 16);
+  const maxRps = Number(env.RATE_MAX_RPS || 120);
+  const g: any = globalThis as any;
+  const key = `${maxConc}|${maxRps}`;
+  if (g.__limKey !== key) {
+    g.__limKey = key;
+    bucket = new TokenBucket(maxRps, maxRps);
+    sem = new Semaphore(maxConc);
+  }
+}
+
+const metrics = {
+  started: Date.now(),
+  inflight: 0,
+  queued: () => sem.getQueueLen(),
+  ok: 0,
+  err: 0,
+  lastSecCount: 0,
+  lastSecTs: Math.floor(Date.now() / 1000),
+  latencies: [] as number[], // последние ~100
+};
+
+function upstreamFetch(env: Env, url: string, init: RequestInit & { timeoutMs?: number; tries?: number } = {}) {
+  ensureLimits(env);
+  const tries = Math.max(1, Number(init.tries ?? 3));
+  const timeoutMs = Math.max(1000, Number(init.timeoutMs ?? 15000));
+  let lastErr: any;
+  for (let i = 0; i < tries; i++) {
+    const backoff = i === 0 ? 0 : Math.min(5000, 250 * Math.pow(2, i - 1)) + Math.floor(Math.random() * 200);
+    if (backoff) await new Promise((r) => setTimeout(r, backoff));
+
+    await bucket.acquire(1);
+    await sem.acquire();
+    metrics.inflight++;
+    const started = Date.now();
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, { ...init, signal: ac.signal });
+      clearTimeout(to);
+      const ms = Date.now() - started;
+      recordLatency(ms);
+      metrics.lastSecCount++;
+      if (r.ok) { metrics.ok++; return r; }
+      if (r.status === 429 || r.status >= 500) { lastErr = new Error(`${r.status}`); continue; }
+      return r; // пусть 4xx пройдут как есть
+    } catch (e) {
+      lastErr = e;
+    } finally {
+      metrics.inflight = Math.max(0, metrics.inflight - 1);
+      sem.release();
+      bucket.notify();
+    }
+  }
+  throw lastErr || new Error("upstream failed");
+}
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    ensureLimits(env);
     const url = new URL(req.url);
+    const method = req.method;
+    const headers = req.headers;
+    const body = req.body;
 
-    // CORS preflight
-    if (req.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders(req, env) });
+    const upstreamUrl = url.searchParams.get("upstream_url");
+    if (!upstreamUrl) {
+      return new Response("upstream_url parameter is required", { status: 400 });
     }
 
-    // ⬇️ WebSocket upgrade для /rpc  (ВАЖНО для web3.js)
-    if (req.headers.get("upgrade")?.toLowerCase() === "websocket" && url.pathname.startsWith("/rpc")) {
-      // Проверка токена доступа — такая же, как и для HTTP
-      if (!isAuthOk(req, env)) return new Response("Unauthorized", { status: 401 });
+    const init: RequestInit = {
+      method: method,
+      headers: headers,
+      body: body,
+    };
 
-      const upWs = new URL(pickRpcWs(env));
-      // путь оставляем «как есть» (у QN/Helius WS на корне '/')
-      // если ваш апстрим ждёт токен в query, можно добавить тут:
-      // if (env.QN_TOKEN) upWs.searchParams.set("api-key", env.QN_TOKEN);
-
-      const wsHdr = new Headers(req.headers);
-      if (env.QN_TOKEN) wsHdr.set("x-api-key", env.QN_TOKEN);
-
-      // NB: создаём новый Request, чтобы можно было подменить заголовки
-      return fetch(upWs.toString(), new Request(req, { headers: wsHdr }));
+    try {
+      const response = await upstreamFetch(env, upstreamUrl, init);
+      return new Response(JSON.stringify(response), { status: response.status, headers: Object.fromEntries(response.headers.entries()) });
+    } catch (e) {
+      console.error("Upstream fetch failed:", e);
+      return new Response(JSON.stringify({ error: e.message }), { status: 500 });
     }
-
-    // health
-    if (req.method === "GET" && (url.pathname === "/rpc/health" || url.pathname === "/__health")) {
-      return withCors(req, env, new Response("ok", { status: 200 }));
-    }
-
-    // RPC HTTP
-    if (req.method === "POST" && url.pathname === "/rpc") {
-      return handleRpcHttp(req, env);
-    }
-
-    // Pump proxy
-    if (url.pathname.startsWith("/x/pump")) {
-      return handlePumpProxy(req, env, url);
-    }
-
-    // Короткая справка
-    if (url.pathname === "/" && req.method === "GET") {
-      const body = `rpc-proxy worker
-- POST /rpc        -> JSON-RPC proxy
-- WS   /rpc        -> WebSocket proxy (signatureSubscribe, и т.п.)
-- GET  /rpc/health -> health check
-- *    /x/pump/*   -> proxy to PUMP_BASE (default https://pumpportal.fun)
-`;
-      return withCors(req, env, new Response(body, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } }));
-    }
-
-    return json(req, env, 404, { error: "NOT_FOUND" });
   },
 } satisfies ExportedHandler<Env>;
