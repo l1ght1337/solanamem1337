@@ -1184,33 +1184,37 @@ export const useStore = create<Store>()(
 
         const mintPk = new PublicKey(s.tokenMint);
         const walletPk = new PublicKey(walletPubkey);
-
         let decimals = s._mintDecimals;
         if (decimals == null) {
           try { decimals = await getMintDecimals(connection, s.tokenMint); set({ _mintDecimals: decimals }); } catch {}
         }
         decimals = decimals ?? 9;
 
-        try { await ensureWalletAta(connection as Connection, walletPubkey, s.tokenMint); }
-        catch (e) { s.addLog("warn", `Ensure wallet ATA: ${String((e as any)?.message || e)}`); }
-
-        const programId = await detectTokenProgram(connection as Connection, mintPk);
-
         for (let i = 0; i < s.bots.length; i++) {
           const b = s.bots[i];
           try {
             const kp = getKeypair(b.keyId);
-            const srcAta = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, programId);
-            const dstAta = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
+            // Определяем используемую программу по существующему ATA (без getAccountInfo на mint)
+            const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
+            const src22 = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
+            const dstClassic = await getAssociatedTokenAddress(mintPk, walletPk, false, TOKEN_PROGRAM_ID);
+            const dst22 = await getAssociatedTokenAddress(mintPk, walletPk, false, TOKEN_2022_PROGRAM_ID);
 
+            const infos = await connection.getMultipleAccountsInfo([srcClassic, src22, dstClassic, dst22]);
+            const [srcCInfo, src22Info, dstCInfo, dst22Info] = infos;
+
+            let useProgram = TOKEN_PROGRAM_ID;
+            let srcAta = srcClassic; let dstAta = dstClassic; let dstInfo = dstCInfo;
+            if (src22Info) { useProgram = TOKEN_2022_PROGRAM_ID; srcAta = src22; dstAta = dst22; dstInfo = dst22Info; }
+
+            // баланс источника
             const raw = await getSPLBalance(connection, b.pubkey, s.tokenMint);
             const amountRaw = BigInt(raw as any);
             if (amountRaw <= 0n) { s.addLog("info", `Sell ALL: у ${b.name} токенов нет`); continue; }
 
             const tx = new Transaction();
-            const dstInfo = await connection.getAccountInfo(dstAta);
-            if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, programId));
-            tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId));
+            if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, useProgram));
+            tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], useProgram));
 
             const { blockhash } = await connection.getLatestBlockhash("finalized");
             tx.feePayer = kp.publicKey;
