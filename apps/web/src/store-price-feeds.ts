@@ -1,6 +1,7 @@
 // src/store-price-feeds.ts
 // Унифицированная обёртка получения цены из внешних источников.
 // ВАЖНО: единственный экспорт — fetchExternalPrice (никаких дублей)
+import { scheduleFetch } from './utils/network';
 
 export type ExtProvider =
   | 'dexscreener'
@@ -18,7 +19,7 @@ export interface ExtCfg {
 // ---------- helpers ----------
 async function safeJSON<T>(url: string, init?: RequestInit): Promise<T | undefined> {
   try {
-    const r = await fetch(url, init);
+    const r = await scheduleFetch(url, { ...(init as any), timeoutMs: 8000, tries: 1 }, 'price');
     if (!r.ok) return;
     return (await r.json()) as T;
   } catch {

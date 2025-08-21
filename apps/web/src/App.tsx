@@ -5,6 +5,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useStore } from "./store";
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import CandleTV from "./components/CandleTV";
+import { getNetMetrics } from "./utils/network";
 
 declare global {
   interface Window {
@@ -21,6 +22,26 @@ export default function App() {
 
   const rpcUrl = (rpcPrimary || rpcFallback || "") as string;
   const connection = useMemo(() => (rpcUrl ? new Connection(rpcUrl, { commitment: "processed" }) : undefined), [rpcUrl]);
+
+  // RPC status for header
+  const [rpcOk, setRpcOk] = useState<boolean | null>(null);
+  const rpcHost = useMemo(() => {
+    try { return rpcUrl ? new URL(rpcUrl).host : ""; } catch { return rpcUrl || ""; }
+  }, [rpcUrl]);
+  useEffect(() => {
+    let stop = false;
+    (async () => {
+      if (!connection) { setRpcOk(null); return; }
+      try { await connection.getSlot("processed"); if (!stop) setRpcOk(true); }
+      catch { if (!stop) setRpcOk(false); }
+    })();
+    const id = setInterval(async () => {
+      if (!connection) return;
+      try { await connection.getSlot("processed"); if (!stop) setRpcOk(true); }
+      catch { if (!stop) setRpcOk(false); }
+    }, 20000);
+    return () => { stop = true; clearInterval(id); };
+  }, [connection]);
 
   // авто-тикеры — чаще для цены
   useEffect(() => {
@@ -184,6 +205,11 @@ export default function App() {
             <b>{s.bots.reduce((a, b) => a + b.solBalance, 0).toFixed(3)} SOL</b>
           </div>
           {!rpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
+          {rpcUrl && (
+            <span style={{ color: rpcOk ? "#8aff8a" : rpcOk === false ? "#ff6b6b" : "#97a6ba", fontSize: 12 }}>
+              RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"}
+            </span>
+          )}
         </div>
         <div>
           {!walletPubkey ? (
@@ -206,6 +232,10 @@ export default function App() {
       {/* Панель */}
       <div style={{ marginTop: 12, padding: 12, border: "1px solid #283042", borderRadius: 10, background: "#0f1325" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {/* лёгкий статус сети (без изменения стилей кнопок) */}
+          <span style={{ color: "#97a6ba", fontSize: 12 }}>
+            net: rps {getNetMetrics().rps} | q {getNetMetrics().queued} | in {getNetMetrics().inflight}
+          </span>
           <input
             placeholder="Вставь ссылку BonkFun / LetsBonk (или mint)"
             value={s.tokenUrl}
