@@ -6,6 +6,7 @@ import {
 } from "@solana/web3.js";
 import { getSPLBalance } from "../utils/solana";
 import { scheduleFetch } from "../utils/network";
+import { getJupiterQuote, WSOL } from "../utils/jupiter";
 
 /* ───────────────────────────── Types ───────────────────────────── */
 type BotStrategy = "trend" | "revert" | "scalper";
@@ -183,6 +184,10 @@ let TARGET_ALLOC = 0.70;
 let MAX_ALLOC = 0.85; // при превышении — частичная продажа
 let MIN_ALLOC = 0.60; // при падении ниже — ребаланс в покупку
 
+// Риск‑ограничители
+const MAX_SINGLE_TRADE_IMPACT = 0.20; // не принимаем сделки хуже -20% к fair
+const MAX_TOTAL_DRAWDOWN = 0.30;      // при просадке портфеля >30% — защита
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function roundTok(tokens: number, decimals: number) {
@@ -208,6 +213,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let failStreak = 0;
   let nextRetryAt = 0;
   let lastWarnTs = 0;
+
+  // Базовая стоимость портфеля для защиты от просадки
+  let baselineValue = 0;
 
   const log = (lvl: "info" | "ok" | "warn" | "err", s: string) => ctx.onLog(lvl, `[${bot.name}] ${s}`);
   const warnDebounced = (s: string) => {
@@ -290,6 +298,32 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           };
 
     try {
+      // Защита от сверхплохих котировок: Jupiter sanity check
+      if (side === 'buy') {
+        const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
+        try {
+          const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
+          const fairOut = (pay / 1e9) / priceNow; // в токенах
+          const out = Number(q.outAmount || 0) / Math.pow(10, decimals);
+          if (fairOut > 0 && out < fairOut * (1 - MAX_SINGLE_TRADE_IMPACT)) {
+            warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
+            return;
+          }
+        } catch {}
+      } else {
+        const qty = amountTok ?? bot.posToken;
+        const raw = Math.round(qty * Math.pow(10, decimals));
+        try {
+          const q = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
+          const fairOutSol = qty * priceNow;
+          const outSol = Number(q.outAmount || 0) / 1e9;
+          if (fairOutSol > 0 && outSol < fairOutSol * (1 - MAX_SINGLE_TRADE_IMPACT)) {
+            warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
+            return;
+          }
+        } catch {}
+      }
+
       // Разбиваем крупный шаг на 1..slicesMax маленьких под-ордеров, чтобы график выглядел естественно
       const totalSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
       const slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
@@ -336,7 +370,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               .toFixed(0)}bps`;
 
       ctx.onUpdate(bot);
-      log("ok", `${side.toUpperCase()} ${sig.slice(0, 8)}…`);
+      log("ok", `${side.toUpperCase()} executed`);
 
       // force on-chain refresh for this bot
       await refreshOnChainBalances();
@@ -409,6 +443,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       const { a: allocTok, total } = alloc(p);
 
+      // Риск: защитный режим при большой просадке
+      const portfolioNow = bot.solBalance + bot.posToken * p;
+      if (baselineValue === 0) baselineValue = portfolioNow;
+      const protect = portfolioNow < baselineValue * (1 - MAX_TOTAL_DRAWDOWN);
+
       // Считываем шаг исполнения
       let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
       try { const s = (ctx as any).getTradeStep?.(); if (s) step = s; } catch {}
@@ -441,7 +480,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      if (haveSol && allocTok < MIN_ALLOC) {
+      if (!protect && haveSol && allocTok < MIN_ALLOC) {
         const targetVal = TARGET_ALLOC * total;
         const needVal = Math.max(0, targetVal - bot.posToken * p);
         const buySol = Math.max(0, Math.min(Math.max(baseSize, pickStep()), needVal));
@@ -458,12 +497,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       switch (bot.strategy) {
         case "trend": {
-          if (haveSol && (fast > 0.0006 || ch1m > 0.001) && allocTok < MAX_ALLOC) {
+          if (!protect && haveSol && (fast > 0.0006 || ch1m > 0.001) && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.12) * total - bot.posToken * p);
             const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
-          if (wantToSell(bot, p, 700, 400) || allocTok > MAX_ALLOC) {
+          if (wantToSell(bot, p, 700, 400) || allocTok > MAX_ALLOC || protect) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
@@ -477,12 +516,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "revert": {
-          if (haveSol && (fast < -0.0012 || ch1m < -0.0018) && allocTok < MAX_ALLOC) {
+          if (!protect && haveSol && (fast < -0.0012 || ch1m < -0.0018) && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.1) * total - bot.posToken * p);
             const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
-          if (wantToSell(bot, p, 80, 40) || allocTok > MAX_ALLOC) {
+          if (wantToSell(bot, p, 80, 40) || allocTok > MAX_ALLOC || protect) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
@@ -496,12 +535,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "scalper": {
-          if (haveSol && Math.abs(fast) > 0.0018 && allocTok < MAX_ALLOC) {
+          if (!protect && haveSol && Math.abs(fast) > 0.0018 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.12) * total - bot.posToken * p);
             const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.0001) { await twapBuy(size); did = true; break; }
           }
-          if (wantToSell(bot, p, 120, 55) || allocTok > MAX_ALLOC) {
+          if (wantToSell(bot, p, 120, 55) || allocTok > MAX_ALLOC || protect) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
