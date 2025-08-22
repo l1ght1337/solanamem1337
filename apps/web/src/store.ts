@@ -233,12 +233,8 @@ async function uploadIpfsMeta(params: {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({
-      name: params.name,
-      symbol: params.symbol,
-      description: params.description || "",
-      image: params.image,
-      website: params.website || "",
-      twitter: params.twitter || "",
+      name: params.name, symbol: params.symbol, description: params.description || "",
+      image: params.image, website: params.website || "", twitter: params.twitter || "",
     }),
   }, 2);
   const j = await r.json().catch(() => ({}));
@@ -511,6 +507,10 @@ export type Store = {
     lossThrPct: number;         // падение после покупки, считаем как «неудачную» (например 0.8%)
     lossWindowMs: number;       // окно наблюдения для неудачной покупки
     lossCooldownMs: number;     // пауза покупок после серии неудачных
+    maxBuySliceSol: number;     // максимум SOL на один buy-срез
+    maxSellSliceTokPct: number; // максимум процента позиции на один sell-срез
+    minSliceGapMs: number;      // минимальная пауза между срезами
+    maxSliceGapMs: number;      // максимальная пауза между срезами
   };
 };
 
@@ -1466,6 +1466,10 @@ export const useStore = create<Store>()(
         lossThrPct: 0.008,
         lossWindowMs: 20000,
         lossCooldownMs: 20000,
+        maxBuySliceSol: 0.0018,
+        maxSellSliceTokPct: 0.12,
+        minSliceGapMs: 200,
+        maxSliceGapMs: 850,
       }),
     }),
     {

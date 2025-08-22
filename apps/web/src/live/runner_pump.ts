@@ -360,11 +360,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const isLast = si === slices - 1;
         let pl = payload as any;
         if (side === 'buy') {
-          const per = Math.max(0.00005, totalSol / slices);
+          const per = Math.min(Math.max(0.00005, totalSol / slices), (risk.maxBuySliceSol || 0.0018));
           const pay = isLast ? Math.max(0.00005, +(totalSol - per * (slices - 1)).toFixed(6)) : per;
           pl = { ...payload, amount: pay };
         } else {
-          const perTok = Math.max(0, sellQtyTok / slices);
+          const maxPct = Math.min(0.5, Math.max(0.02, risk.maxSellSliceTokPct || 0.12));
+          const perTok = Math.min(Math.max(0, sellQtyTok / slices), bot.posToken * maxPct);
           const qty = isLast ? Math.max(0, roundTok(sellQtyTok - perTok * (slices - 1), decimals)) : roundTok(perTok, decimals);
           pl = { ...payload, amount: qty };
         }
@@ -373,7 +374,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
         await connection.confirmTransaction(sig, "confirmed");
         // лёгкий джиттер между под-ордеров
-        if (si < slices-1) await sleep(220 + Math.floor(Math.random()*280));
+        if (si < slices-1) {
+          const gmin = Math.max(120, (risk.minSliceGapMs || 200));
+          const gmax = Math.max(gmin+50, (risk.maxSliceGapMs || 850));
+          const gap = gmin + Math.floor(Math.random() * (gmax - gmin));
+          await sleep(gap);
+        }
       }
 
       // success → reset backoff
