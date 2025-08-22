@@ -236,6 +236,7 @@ export default function App() {
           <span style={{ color: "#97a6ba", fontSize: 12 }}>
             net: rps {getNetMetrics().rps} | q {getNetMetrics().queued} | in {getNetMetrics().inflight}
           </span>
+          <button onClick={() => { if (connection) s.refreshBalances(connection); }} style={btnSm}>Refresh balances</button>
           {/* Аллокация 70/30 контролы */}
           <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Alloc:</span>
           <input
