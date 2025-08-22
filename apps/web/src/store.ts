@@ -491,6 +491,14 @@ export type Store = {
   allocMax: number;       // верхняя граница, ребаланс в продажу
   setAlloc: (t: number, min: number, max: number) => void;
   getAlloc: () => { target: number; min: number; max: number };
+
+  // Размер шага сделки и форма исполнения
+  tradeStepMinSol: number;
+  tradeStepMaxSol: number;
+  tradeSlicesMax: number;    // максимум кусочков для TWAP шага
+  tradeJitterPct: number;    // 0..0.5 — случайная вариация размера шага
+  setTradeStep: (minSol: number, maxSol: number, slicesMax: number, jitterPct: number) => void;
+  getTradeStep: () => { minSol: number; maxSol: number; slicesMax: number; jitterPct: number };
 };
 
 export const useStore = create<Store>()(
@@ -1396,6 +1404,24 @@ export const useStore = create<Store>()(
         allocMax: Math.min(0.98, Math.max(0.06, Number(max) || 0.85)),
       }),
       getAlloc: () => ({ target: get().allocTarget, min: get().allocMin, max: get().allocMax }),
+
+      // Размер шага сделки и форма исполнения
+      tradeStepMinSol: 0.0003,
+      tradeStepMaxSol: 0.0030,
+      tradeSlicesMax: 3,
+      tradeJitterPct: 0.18,
+      setTradeStep: (minSol, maxSol, slicesMax, jitterPct) => set({
+        tradeStepMinSol: Math.max(0.00005, Number(minSol) || 0.0003),
+        tradeStepMaxSol: Math.max(0.0001, Number(maxSol) || 0.003),
+        tradeSlicesMax: Math.max(1, Math.floor(Number(slicesMax) || 3)),
+        tradeJitterPct: Math.min(0.5, Math.max(0, Number(jitterPct) || 0.18)),
+      }),
+      getTradeStep: () => ({
+        minSol: get().tradeStepMinSol,
+        maxSol: get().tradeStepMaxSol,
+        slicesMax: get().tradeSlicesMax,
+        jitterPct: get().tradeJitterPct,
+      }),
     }),
     {
       name: "meme-bundler:v1",
@@ -1407,6 +1433,10 @@ export const useStore = create<Store>()(
         if (!p.tradeRange) p.tradeRange = { minSol: 0.005, maxSol: 0.03 };
         p.tradeRange.minSol = toNum(p.tradeRange.minSol, 0.005);
         p.tradeRange.maxSol = toNum(p.tradeRange.maxSol, 0.03);
+        if (typeof p.tradeStepMinSol !== 'number') p.tradeStepMinSol = 0.0003;
+        if (typeof p.tradeStepMaxSol !== 'number') p.tradeStepMaxSol = 0.0030;
+        if (typeof p.tradeSlicesMax !== 'number') p.tradeSlicesMax = 3;
+        if (typeof p.tradeJitterPct !== 'number') p.tradeJitterPct = 0.18;
         // Поддержка аллокации
         if (typeof p.allocTarget !== 'number') p.allocTarget = 0.70;
         if (typeof p.allocMin !== 'number') p.allocMin = 0.60;
@@ -1421,16 +1451,20 @@ export const useStore = create<Store>()(
         slippageBps: s.slippageBps,
         useRandomSize: s.useRandomSize,
         tradeRange: s.tradeRange,
+        tradeStepMinSol: s.tradeStepMinSol,
+        tradeStepMaxSol: s.tradeStepMaxSol,
+        tradeSlicesMax: s.tradeSlicesMax,
+        tradeJitterPct: s.tradeJitterPct,
         smartMM: s.smartMM,
+        allocTarget: s.allocTarget,
+        allocMin: s.allocMin,
+        allocMax: s.allocMax,
         autoTopUp: s.autoTopUp,
         minFeeSol: s.minFeeSol,
         topUpToSol: s.topUpToSol,
         drainMinKeepSol: s.drainMinKeepSol,
         drainDelayMs: s.drainDelayMs,
         treasuryKeyId: s.treasuryKeyId,
-        allocTarget: s.allocTarget,
-        allocMin: s.allocMin,
-        allocMax: s.allocMax,
       }),
       onRehydrateStorage: () => (state) => {
         try {

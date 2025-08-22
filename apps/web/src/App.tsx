@@ -268,6 +268,46 @@ export default function App() {
             style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Max token allocation (rebalance sell)"
           />
+          {/* Шаг сделок */}
+          <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Step:</span>
+          <input
+            type="number"
+            min={0.00005}
+            step={0.00005}
+            value={s.tradeStepMinSol}
+            onChange={(e) => s.setTradeStep(Number(e.target.value), s.tradeStepMaxSol, s.tradeSlicesMax, s.tradeJitterPct)}
+            style={{ width: 80, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Min SOL per sub-order"
+          />
+          <input
+            type="number"
+            min={0.0001}
+            step={0.0001}
+            value={s.tradeStepMaxSol}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, Number(e.target.value), s.tradeSlicesMax, s.tradeJitterPct)}
+            style={{ width: 80, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Max SOL per sub-order"
+          />
+          <input
+            type="number"
+            min={1}
+            max={5}
+            step={1}
+            value={s.tradeSlicesMax}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, Number(e.target.value), s.tradeJitterPct)}
+            style={{ width: 60, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Max slices per order"
+          />
+          <input
+            type="number"
+            min={0}
+            max={0.5}
+            step={0.01}
+            value={s.tradeJitterPct}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, s.tradeSlicesMax, Number(e.target.value))}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Random jitter of step size (0..0.5)"
+          />
           <input
             placeholder="Вставь ссылку BonkFun / LetsBonk (или mint)"
             value={s.tokenUrl}

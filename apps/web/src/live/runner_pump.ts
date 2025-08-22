@@ -248,6 +248,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         MAX_ALLOC = Math.max(TARGET_ALLOC, Math.min(0.98, alloc.max ?? 0.85));
       }
     } catch {}
+    // Подхватываем форму шага сделки
+    let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
+    try { const s = (ctx as any).getTradeStep?.(); if (s) step = s; } catch {}
+    const pickStep = () => {
+      const base = step.minSol + Math.random() * Math.max(0, step.maxSol - step.minSol);
+      const jitter = 1 + (Math.random()*2 - 1) * Math.min(0.5, Math.max(0, step.jitterPct));
+      return Math.max(0.00005, +(base * jitter).toFixed(6));
+    };
     const kp = ctx.keypair();
     const decimals = ctx.tokenDecimals();
     const priceNow = Math.max(1e-12, ctx.price());
@@ -282,14 +290,20 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           };
 
     try {
-      const vtx = await buildTradeTxPumpPortal(payload);
-      vtx.sign([kp]);
-
-      const sig = await connection.sendRawTransaction(vtx.serialize(), {
-        skipPreflight: false,
-        maxRetries: 4,
-      });
-      await connection.confirmTransaction(sig, "confirmed");
+      // Разбиваем крупный шаг на 1..slicesMax маленьких под-ордеров, чтобы график выглядел естественно
+      const totalSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
+      const slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
+      const per = side === 'buy' ? Math.max(0.00005, totalSol / slices) : 0;
+      for (let si = 0; si < (side === 'buy' ? slices : 1); si++) {
+        const pay = side === 'buy' ? (si === slices-1 ? Math.max(0.00005, +(totalSol - per*(slices-1)).toFixed(6)) : per) : 0;
+        const pl = side === 'buy' ? { ...payload, amount: pay } : payload;
+        const vtx = await buildTradeTxPumpPortal(pl);
+        vtx.sign([kp]);
+        const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
+        await connection.confirmTransaction(sig, "confirmed");
+        // лёгкий джиттер между под-ордеров
+        if (side === 'buy' && si < slices-1) await sleep(200 + Math.floor(Math.random()*250));
+      }
 
       // success → reset backoff
       failStreak = 0;
@@ -297,7 +311,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       // optimistic local portfolio update
       if (side === "buy") {
-        const qty = sizeSol / priceNow;
+        const qty = (sizeSol || per) / priceNow;
         const newPos = bot.posToken + qty;
         bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + sizeSol) / newPos : priceNow;
         bot.posToken = newPos;
