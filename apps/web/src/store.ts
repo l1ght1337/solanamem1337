@@ -1018,11 +1018,26 @@ export const useStore = create<Store>()(
               const accClassic = aClassic ? ataInfos.get(aClassic) || null : null;
               const acc22 = a22 ? ataInfos.get(a22) || null : null;
               const raw = decodeAmount(accClassic) || decodeAmount(acc22);
-              tok = raw > 0 ? raw / Math.pow(10, decimals) : 0;
+              // Не обнуляем токен при временных сбоях чтения: если оба ATA пустые/недоступны — оставляем предыдущее значение
+              if (raw > 0) tok = raw / Math.pow(10, decimals);
             }
             const unreal = b.posToken * (priceNow - (b.avgSol || priceNow));
             return { ...b, solBalance: sol, tokenBalance: tok, unrealized: unreal };
           });
+
+          // Fallback для тех, у кого токенBalance остался 0, но posToken > 0: точечный getSPLBalance
+          if (mint && decimals != null) {
+            for (let i = 0; i < updated.length; i++) {
+              const b = updated[i];
+              if (b.posToken > 0 && b.tokenBalance <= 0) {
+                try {
+                  const raw = await getSPLBalance(connection, b.pubkey, mint);
+                  const tok = Number(raw) / Math.pow(10, decimals);
+                  if (tok > 0) updated[i] = { ...b, tokenBalance: tok };
+                } catch {}
+              }
+            }
+          }
 
           set({ bots: updated });
 
