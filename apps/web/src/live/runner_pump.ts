@@ -495,7 +495,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // Риск: защитный режим при большой просадке
       const portfolioNow = bot.solBalance + bot.posToken * p;
       if (baselineValue === 0) baselineValue = portfolioNow;
-      let risk = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 } as ReturnType<(typeof (ctx as any)['getRisk'])>;
+      let risk: any = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
       try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
       const protect = portfolioNow < baselineValue * (1 - Math.min(MAX_TOTAL_DRAWDOWN, risk.maxDrawdown));
 
