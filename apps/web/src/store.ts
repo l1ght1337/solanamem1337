@@ -1028,11 +1028,16 @@ export const useStore = create<Store>()(
             if (mint && decimals != null && ataClassic.length) {
               const aClassic = ataClassic[idx]?.toBase58();
               const a22 = ata2022[idx]?.toBase58();
-              const accClassic = aClassic ? ataInfos.get(aClassic) || null : null;
-              const acc22 = a22 ? ataInfos.get(a22) || null : null;
-              const raw = decodeAmount(accClassic) || decodeAmount(acc22);
-              // Не обнуляем токен при временных сбоях чтения: если оба ATA пустые/недоступны — оставляем предыдущее значение
-              if (raw > 0) tok = raw / Math.pow(10, decimals);
+              const hasClassic = !!(aClassic && ataInfos.has(aClassic));
+              const has22 = !!(a22 && ataInfos.has(a22));
+              const accClassic = hasClassic ? (ataInfos.get(aClassic!) || null) : null;
+              const acc22 = has22 ? (ataInfos.get(a22!) || null) : null;
+              if (hasClassic || has22) {
+                const rawC = decodeAmount(accClassic);
+                const raw22 = decodeAmount(acc22);
+                const rawSum = (rawC || 0) + (raw22 || 0);
+                tok = rawSum / Math.pow(10, decimals);
+              }
             }
             const unreal = b.posToken * (priceNow - (b.avgSol || priceNow));
             return { ...b, solBalance: sol, tokenBalance: tok, unrealized: unreal };
