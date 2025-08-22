@@ -137,6 +137,8 @@ export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
 (() => {
   const origFetch = globalThis.fetch?.bind(globalThis);
   if (!origFetch) return;
+  const JUP_FORCE_PROXY = String(((import.meta as any).env?.VITE_JUP_FORCE_PROXY ?? '0')).trim() === '1';
+  if (!JUP_FORCE_PROXY) return; // по умолчанию не перехватываем: используем прямой CORS у Jupiter
   const needsProxy = (u: string) =>
     /^https:\/\/(quote-api|price)\.jup\.ag\//.test(u);
   globalThis.fetch = ((input: any, init?: RequestInit) => {
