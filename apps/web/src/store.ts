@@ -499,6 +499,19 @@ export type Store = {
   tradeJitterPct: number;    // 0..0.5 — случайная вариация размера шага
   setTradeStep: (minSol: number, maxSol: number, slicesMax: number, jitterPct: number) => void;
   getTradeStep: () => { minSol: number; maxSol: number; slicesMax: number; jitterPct: number };
+
+  // Риск-настройки (пока без UI; при желании вынесем в контролы)
+  getRisk: () => {
+    maxImpact: number;          // максимум допустимой оценочной просадки котировки (0.0..1.0)
+    maxDrawdown: number;        // защита портфеля (0.0..1.0)
+    reserveSol: number;         // резерв SOL, ниже которого не покупаем
+    maxNotionalPerMin: number;  // лимит закупок SOL в минуту на бота
+    maxBuysPerMin: number;      // максимум покупок/мин
+    maxSellsPerMin: number;     // максимум продаж/мин
+    lossThrPct: number;         // падение после покупки, считаем как «неудачную» (например 0.8%)
+    lossWindowMs: number;       // окно наблюдения для неудачной покупки
+    lossCooldownMs: number;     // пауза покупок после серии неудачных
+  };
 };
 
 export const useStore = create<Store>()(
@@ -1440,6 +1453,19 @@ export const useStore = create<Store>()(
         maxSol: get().tradeStepMaxSol,
         slicesMax: get().tradeSlicesMax,
         jitterPct: get().tradeJitterPct,
+      }),
+
+      // Риск-настройки (пока без UI; при желании вынесем в контролы)
+      getRisk: () => ({
+        maxImpact: 0.10,
+        maxDrawdown: 0.25,
+        reserveSol: 0.0012,
+        maxNotionalPerMin: 0.02,
+        maxBuysPerMin: 6,
+        maxSellsPerMin: 10,
+        lossThrPct: 0.008,
+        lossWindowMs: 20000,
+        lossCooldownMs: 20000,
       }),
     }),
     {

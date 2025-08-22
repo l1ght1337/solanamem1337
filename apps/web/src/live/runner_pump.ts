@@ -231,6 +231,15 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     return { tokVal, total, a: tokVal / total };
   };
 
+  // per-bot rolling rate/limits state
+  let minWindowStart = Date.now();
+  let buysThisMin = 0;
+  let sellsThisMin = 0;
+  let notionalThisMin = 0; // суммарная сумма покупок в SOL
+  let lastBuyAtPrice: number | null = null;
+  let lastBuyAtTs: number = 0;
+  let lossCooldownUntil = 0;
+
   async function refreshOnChainBalances() {
     try {
       const kp = ctx.keypair();
@@ -249,6 +258,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     sizeSol: number,
     opts?: { sellTokens?: number }
   ) {
+    // Риск-профиль из стора (без UI)
+    let risk = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
+    try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
+
     // Подхватываем актуальные аллокации из UI (если переданы)
     try {
       const alloc = (ctx as any).getAlloc?.();
@@ -275,6 +288,17 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     if (side === "buy" && sizeSol <= 0) return;
     if (side === "sell" && (amountTok ?? bot.posToken) <= 0) return;
+
+    // Минутные лимиты и cooldown на потери
+    const nowTs = Date.now();
+    if (nowTs - minWindowStart >= 60_000) { minWindowStart = nowTs; buysThisMin = 0; sellsThisMin = 0; notionalThisMin = 0; }
+    if (side === 'buy') {
+      if (nowTs < lossCooldownUntil) return; // охлаждение после неудачных докупок
+      if (buysThisMin >= risk.maxBuysPerMin) return;
+      if (notionalThisMin + sizeSol > risk.maxNotionalPerMin) return;
+    } else {
+      if (sellsThisMin >= risk.maxSellsPerMin) return;
+    }
 
     const payload =
       side === "buy"
@@ -307,7 +331,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
           const fairOut = (pay / 1e9) / priceNow; // в токенах
           const out = Number(q.outAmount || 0) / Math.pow(10, decimals);
-          if (fairOut > 0 && out < fairOut * (1 - MAX_SINGLE_TRADE_IMPACT)) {
+          const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
+          if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
             warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
             return;
           }
@@ -319,7 +344,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           const q = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
           const fairOutSol = qty * priceNow;
           const outSol = Number(q.outAmount || 0) / 1e9;
-          if (fairOutSol > 0 && outSol < fairOutSol * (1 - MAX_SINGLE_TRADE_IMPACT)) {
+          const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
+          if (fairOutSol > 0 && outSol < fairOutSol * (1 - maxImpact)) {
             warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
             return;
           }
@@ -362,6 +388,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         bot.posToken = newPos;
         bot.solBalance = Math.max(0, (bot.solBalance ?? 0) - sizeSol - FEE_EST_SOL);
         bot.tokenBalance = bot.posToken;
+        // учёт минутных лимитов и «неудачных» покупок
+        buysThisMin++;
+        notionalThisMin += sizeSol;
+        lastBuyAtPrice = priceNow;
+        lastBuyAtTs = Date.now();
       } else {
         const sellQty = amountTok ?? bot.posToken;
         bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
@@ -369,6 +400,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
         bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - FEE_EST_SOL));
         bot.tokenBalance = bot.posToken;
+        sellsThisMin++;
       }
 
       bot.unrealized = bot.posToken * (priceNow - (bot.avgSol || priceNow));
@@ -457,7 +489,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // Риск: защитный режим при большой просадке
       const portfolioNow = bot.solBalance + bot.posToken * p;
       if (baselineValue === 0) baselineValue = portfolioNow;
-      const protect = portfolioNow < baselineValue * (1 - MAX_TOTAL_DRAWDOWN);
+      let risk = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 } as ReturnType<(typeof (ctx as any)['getRisk'])>;
+      try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
+      const protect = portfolioNow < baselineValue * (1 - Math.min(MAX_TOTAL_DRAWDOWN, risk.maxDrawdown));
 
       // Считываем шаг исполнения
       let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
@@ -468,7 +502,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         return Math.max(0.00005, +(base * jitter).toFixed(6));
       };
 
-      const reserve = Math.max(MIN_KEEP_SOL, 0.0009);
+      const reserve = Math.max(MIN_KEEP_SOL, risk.reserveSol || 0.0009);
       const baseSize = Math.max(
         step.minSol,
         Math.min(bot.budgetSol || ctx.tradeSize() || step.maxSol, bot.solBalance - (reserve + step.minSol))
