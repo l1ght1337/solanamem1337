@@ -927,6 +927,7 @@ export const useStore = create<Store>()(
             setTimeout(() => { get().refreshBalances(connection).catch(() => {}); }, 800);
           },
           getAlloc: () => get().getAlloc(),
+          getTradeStep: () => get().getTradeStep(),
         } as any);
 
         (bot as any).__stop = stop;

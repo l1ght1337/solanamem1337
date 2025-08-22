@@ -409,9 +409,18 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       const { a: allocTok, total } = alloc(p);
 
+      // Считываем шаг исполнения
+      let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
+      try { const s = (ctx as any).getTradeStep?.(); if (s) step = s; } catch {}
+      const pickStep = () => {
+        const base = step.minSol + Math.random() * Math.max(0, step.maxSol - step.minSol);
+        const jitter = 1 + (Math.random()*2 - 1) * Math.min(0.5, Math.max(0, step.jitterPct));
+        return Math.max(0.00005, +(base * jitter).toFixed(6));
+      };
+
       const baseSize = Math.max(
-        0.00015,
-        Math.min(bot.budgetSol || ctx.tradeSize(), bot.solBalance - (MIN_KEEP_SOL + 0.00015))
+        step.minSol,
+        Math.min(bot.budgetSol || ctx.tradeSize() || step.maxSol, bot.solBalance - (MIN_KEEP_SOL + step.minSol))
       );
       const haveSol = bot.solBalance > MIN_KEEP_SOL + 0.00015;
 
@@ -422,7 +431,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const excessVal = Math.max(0, currentTokVal - desiredTokVal);
         const tokToSell = Math.min(
           bot.posToken,
-          roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+          roundTok(Math.max(bot.posToken * 0.1, (excessVal * 0.4) / p), ctx.tokenDecimals())
         );
         if (tokToSell > 0) {
           await trade("sell", 0, { sellTokens: tokToSell });
@@ -435,7 +444,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       if (haveSol && allocTok < MIN_ALLOC) {
         const targetVal = TARGET_ALLOC * total;
         const needVal = Math.max(0, targetVal - bot.posToken * p);
-        const buySol = Math.max(0, Math.min(baseSize, needVal));
+        const buySol = Math.max(0, Math.min(Math.max(baseSize, pickStep()), needVal));
         if (buySol > 0.00012) {
           await twapBuy(buySol);
           pending = false;
@@ -449,9 +458,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       switch (bot.strategy) {
         case "trend": {
-          if (haveSol && fast > 0.0009 && ch1m > -0.0005 && allocTok < MAX_ALLOC) {
-            const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
-            const size = Math.min(baseSize, headroomVal);
+          if (haveSol && (fast > 0.0006 || ch1m > 0.001) && allocTok < MAX_ALLOC) {
+            const headroomVal = Math.max(0, (TARGET_ALLOC + 0.12) * total - bot.posToken * p);
+            const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
           if (wantToSell(bot, p, 700, 400) || allocTok > MAX_ALLOC) {
@@ -459,7 +468,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
               bot.posToken,
-              roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+              roundTok(Math.max(bot.posToken * 0.15, (excessVal * 0.5) / p), ctx.tokenDecimals())
             );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
@@ -468,9 +477,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "revert": {
-          if (haveSol && fast < -0.0015 && allocTok < MAX_ALLOC) {
+          if (haveSol && (fast < -0.0012 || ch1m < -0.0018) && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.1) * total - bot.posToken * p);
-            const size = Math.min(baseSize, headroomVal);
+            const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
           if (wantToSell(bot, p, 80, 40) || allocTok > MAX_ALLOC) {
@@ -478,7 +487,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
               bot.posToken,
-              roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+              roundTok(Math.max(bot.posToken * 0.15, (excessVal * 0.5) / p), ctx.tokenDecimals())
             );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
@@ -487,9 +496,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "scalper": {
-          if (haveSol && Math.abs(fast) > 0.0022 && allocTok < MAX_ALLOC) {
-            const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
-            const size = Math.min(baseSize, headroomVal);
+          if (haveSol && Math.abs(fast) > 0.0018 && allocTok < MAX_ALLOC) {
+            const headroomVal = Math.max(0, (TARGET_ALLOC + 0.12) * total - bot.posToken * p);
+            const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.0001) { await twapBuy(size); did = true; break; }
           }
           if (wantToSell(bot, p, 120, 55) || allocTok > MAX_ALLOC) {
@@ -497,7 +506,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
               bot.posToken,
-              roundTok(Math.max(bot.posToken * 0.2, (excessVal * 0.6) / p), ctx.tokenDecimals())
+              roundTok(Math.max(bot.posToken * 0.12, (excessVal * 0.45) / p), ctx.tokenDecimals())
             );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
