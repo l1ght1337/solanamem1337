@@ -34,9 +34,10 @@ async function jupFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T> {
     ? RAW_PROXIES.split(',').map((s: string) => s.trim()).filter(Boolean)
     : []
 
-  const candidates = proxies.length
-    ? proxies.map((p: string) => `${p.replace(/\/+$/, '')}/x/pump${JUP_BASE}${path}`)
-    : [`${JUP_PUBLIC}${path}`]
+  const candidates: string[] = []
+  for (const p of proxies) candidates.push(`${p.replace(/\/+$/, '')}/x/pump${JUP_BASE}${path}`)
+  // Всегда добавляем публичный fallback в конце
+  candidates.push(`${JUP_PUBLIC}${path}`)
 
   let lastErr: any
   for (const url of candidates) {
@@ -63,12 +64,7 @@ export async function getJupiterQuote(opts: {
   onlyDirectRoutes?: boolean
 }): Promise<JupQuote> {
   const { inputMint, outputMint, amount, onlyDirectRoutes } = opts
-  const u =
-    `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}` +
-    `&outputMint=${outputMint}` +
-    `&amount=${amount}` +
-    `&slippageBps=50` +
-    (onlyDirectRoutes ? `&onlyDirectRoutes=true` : '')
+  const u = `/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=50` + (onlyDirectRoutes ? `&onlyDirectRoutes=true` : '')
   return jupFetch<JupQuote>(u)
 }
 
@@ -92,7 +88,6 @@ export async function swapFromQuoteWithKeypair(opts: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  // Browser-safe base64 decode (без Node Buffer, чтобы исключить полифилл и TDZ-ошибки)
   const b64 = String(swapRes.swapTransaction)
   const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
   const tx = VersionedTransaction.deserialize(raw)
@@ -101,7 +96,6 @@ export async function swapFromQuoteWithKeypair(opts: {
   return sig
 }
 
-// Smart: подбираем slippage по impact и делаем swap
 export async function jupiterSmartSwapWithKeypair(opts: {
   keypair: Keypair
   connection: Connection
@@ -119,7 +113,7 @@ export async function jupiterSmartSwapWithKeypair(opts: {
   } = opts
 
   const quote = await getJupiterQuote({ inputMint, outputMint, amount })
-  const impactPct = Number(quote.priceImpactPct ?? 0) // напр. 0.004 = 0.4%
+  const impactPct = Number(quote.priceImpactPct ?? 0)
   const extraBps = Math.max(minExtraBps, Math.ceil(impactPct * 10000 * alpha))
   const useBps = Math.min(maxSlippageBps, baseSlippageBps + extraBps)
 
