@@ -178,9 +178,10 @@ async function buildTradeTxPumpPortal(payload: Record<string, any>): Promise<Ver
 const FEE_EST_SOL = 0.00002; // ~20k lamports
 const MIN_KEEP_SOL = 0.0006;
 
-const TARGET_ALLOC = 0.55;
-const MAX_ALLOC = 0.8;
-const MIN_ALLOC = 0.2;
+// Цель: ~70% в токене / 30% в SOL (с коридором)
+const TARGET_ALLOC = 0.70;
+const MAX_ALLOC = 0.85; // при превышении — частичная продажа
+const MIN_ALLOC = 0.60; // при падении ниже — ребаланс в покупку
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
