@@ -236,6 +236,38 @@ export default function App() {
           <span style={{ color: "#97a6ba", fontSize: 12 }}>
             net: rps {getNetMetrics().rps} | q {getNetMetrics().queued} | in {getNetMetrics().inflight}
           </span>
+          {/* Аллокация 70/30 контролы */}
+          <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Alloc:</span>
+          <input
+            type="number"
+            min={0.05}
+            max={0.95}
+            step={0.01}
+            value={s.allocTarget}
+            onChange={(e) => s.setAlloc(Number(e.target.value), s.allocMin, s.allocMax)}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Target token allocation (0..1)"
+          />
+          <input
+            type="number"
+            min={0.05}
+            max={0.98}
+            step={0.01}
+            value={s.allocMin}
+            onChange={(e) => s.setAlloc(s.allocTarget, Number(e.target.value), s.allocMax)}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Min token allocation (rebalance buy)"
+          />
+          <input
+            type="number"
+            min={0.06}
+            max={0.98}
+            step={0.01}
+            value={s.allocMax}
+            onChange={(e) => s.setAlloc(s.allocTarget, s.allocMin, Number(e.target.value))}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Max token allocation (rebalance sell)"
+          />
           <input
             placeholder="Вставь ссылку BonkFun / LetsBonk (или mint)"
             value={s.tokenUrl}

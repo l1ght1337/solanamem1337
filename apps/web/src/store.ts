@@ -484,6 +484,13 @@ export type Store = {
   _mintDecimals?: number;
   _lastTopUp?: Record<string, number>;
   _ppSub?: any;
+
+  // Аллокация токен/SOL (цель и коридор), управляется из UI
+  allocTarget: number;    // 0..1
+  allocMin: number;       // нижняя граница, ребаланс в покупку
+  allocMax: number;       // верхняя граница, ребаланс в продажу
+  setAlloc: (t: number, min: number, max: number) => void;
+  getAlloc: () => { target: number; min: number; max: number };
 };
 
 export const useStore = create<Store>()(
@@ -908,8 +915,10 @@ export const useStore = create<Store>()(
 
           // после сделки мягкий refresh (SOL + токен) для всех ботов
           afterTrade: () => {
-            get().refreshBalances(connection).catch(() => {});
+            // Быстрый рефреш спустя небольшую задержку — улучшает UX
+            setTimeout(() => { get().refreshBalances(connection).catch(() => {}); }, 800);
           },
+          getAlloc: () => get().getAlloc(),
         } as any);
 
         (bot as any).__stop = stop;
@@ -1029,7 +1038,16 @@ export const useStore = create<Store>()(
       async tickReal() {
         const s = get();
         if (!s.tokenMint) return;
-        if (s.external.provider === "pumpportal") return; // pump.fun обновляет цену через WS
+        if (s.external.provider === "pumpportal") {
+          // даже при WS‑цене иногда подёргиваем балансы
+          const now = Date.now();
+          if (!((s as any)._lastLightRefresh)) (s as any)._lastLightRefresh = 0;
+          if (now - (s as any)._lastLightRefresh > 8000) {
+            (s as any)._lastLightRefresh = now;
+            try { await get().refreshBalances((window as any).__conn || ({} as any)); } catch {}
+          }
+          return;
+        }
 
         const tryOnce = async (prov: any) => {
           try {
@@ -1362,6 +1380,17 @@ export const useStore = create<Store>()(
 
         set({ bots: newBots });
       },
+
+      // Аллокация по умолчанию: 70% токен / 30% SOL, коридор 60..85
+      allocTarget: 0.70,
+      allocMin: 0.60,
+      allocMax: 0.85,
+      setAlloc: (t, min, max) => set({
+        allocTarget: Math.min(0.95, Math.max(0.05, Number(t) || 0.7)),
+        allocMin: Math.min(0.95, Math.max(0.05, Number(min) || 0.6)),
+        allocMax: Math.min(0.98, Math.max(0.06, Number(max) || 0.85)),
+      }),
+      getAlloc: () => ({ target: get().allocTarget, min: get().allocMin, max: get().allocMax }),
     }),
     {
       name: "meme-bundler:v1",
@@ -1373,6 +1402,10 @@ export const useStore = create<Store>()(
         if (!p.tradeRange) p.tradeRange = { minSol: 0.005, maxSol: 0.03 };
         p.tradeRange.minSol = toNum(p.tradeRange.minSol, 0.005);
         p.tradeRange.maxSol = toNum(p.tradeRange.maxSol, 0.03);
+        // Поддержка аллокации
+        if (typeof p.allocTarget !== 'number') p.allocTarget = 0.70;
+        if (typeof p.allocMin !== 'number') p.allocMin = 0.60;
+        if (typeof p.allocMax !== 'number') p.allocMax = 0.85;
         return p;
       },
       storage: createJSONStorage(() => localStorage),
@@ -1390,6 +1423,9 @@ export const useStore = create<Store>()(
         drainMinKeepSol: s.drainMinKeepSol,
         drainDelayMs: s.drainDelayMs,
         treasuryKeyId: s.treasuryKeyId,
+        allocTarget: s.allocTarget,
+        allocMin: s.allocMin,
+        allocMax: s.allocMax,
       }),
       onRehydrateStorage: () => (state) => {
         try {

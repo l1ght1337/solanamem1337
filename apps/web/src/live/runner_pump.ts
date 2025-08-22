@@ -179,9 +179,9 @@ const FEE_EST_SOL = 0.00002; // ~20k lamports
 const MIN_KEEP_SOL = 0.0006;
 
 // Цель: ~70% в токене / 30% в SOL (с коридором)
-const TARGET_ALLOC = 0.70;
-const MAX_ALLOC = 0.85; // при превышении — частичная продажа
-const MIN_ALLOC = 0.60; // при падении ниже — ребаланс в покупку
+let TARGET_ALLOC = 0.70;
+let MAX_ALLOC = 0.85; // при превышении — частичная продажа
+let MIN_ALLOC = 0.60; // при падении ниже — ребаланс в покупку
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -239,6 +239,15 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     sizeSol: number,
     opts?: { sellTokens?: number }
   ) {
+    // Подхватываем актуальные аллокации из UI (если переданы)
+    try {
+      const alloc = (ctx as any).getAlloc?.();
+      if (alloc && typeof alloc.target === 'number') {
+        TARGET_ALLOC = Math.min(0.95, Math.max(0.05, alloc.target));
+        MIN_ALLOC = Math.min(TARGET_ALLOC, Math.max(0.05, alloc.min ?? 0.6));
+        MAX_ALLOC = Math.max(TARGET_ALLOC, Math.min(0.98, alloc.max ?? 0.85));
+      }
+    } catch {}
     const kp = ctx.keypair();
     const decimals = ctx.tokenDecimals();
     const priceNow = Math.max(1e-12, ctx.price());
