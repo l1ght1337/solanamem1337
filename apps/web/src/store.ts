@@ -938,6 +938,9 @@ export const useStore = create<Store>()(
       // ===== Балансы + авто-донат =====
       async refreshBalances(connection) {
         try {
+          // простая защита от наложений
+          if ((get() as any)._rbBusy) return;
+          (get() as any)._rbBusy = true;
           const s = get();
           const mint = s.tokenMint || null;
 
@@ -1029,8 +1032,10 @@ export const useStore = create<Store>()(
             }
             set({ _lastTopUp: last });
           }
-        } catch (e: any) {
+        } catch (e) {
           get().addLog("warn", `refreshBalances: ${e?.message || String(e)}`);
+        } finally {
+          (get() as any)._rbBusy = false;
         }
       },
 

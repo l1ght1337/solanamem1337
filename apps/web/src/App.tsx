@@ -46,8 +46,8 @@ export default function App() {
   // авто-тикеры — чаще для цены
   useEffect(() => {
     if (!connection) return;
-    const id = setInterval(() => s.tickReal(), 3_000); // было 5s
-    const id2 = setInterval(() => s.refreshBalances(connection), 5_000);
+    const id = setInterval(() => s.tickReal(), 2_000);
+    const id2 = setInterval(() => s.refreshBalances(connection), 3_000);
     return () => {
       clearInterval(id);
       clearInterval(id2);
