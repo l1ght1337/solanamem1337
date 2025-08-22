@@ -10,6 +10,8 @@ import { getJupiterQuote, WSOL } from "../utils/jupiter";
 
 /* ───────────────────────────── Types ───────────────────────────── */
 type BotStrategy = "trend" | "revert" | "scalper";
+// расширим внутренний набор архетипов без ломающего изменения типа
+type InternalStrategy = BotStrategy | "momentum" | "range" | "maker";
 
 type LiveBot = {
   id: string;
@@ -324,19 +326,28 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         } catch {}
       }
 
-      // Разбиваем крупный шаг на 1..slicesMax маленьких под-ордеров, чтобы график выглядел естественно
+      // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
       const totalSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
+      const sellQtyTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
       const slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
-      const per = side === 'buy' ? Math.max(0.00005, totalSol / slices) : 0;
-      for (let si = 0; si < (side === 'buy' ? slices : 1); si++) {
-        const pay = side === 'buy' ? (si === slices-1 ? Math.max(0.00005, +(totalSol - per*(slices-1)).toFixed(6)) : per) : 0;
-        const pl = side === 'buy' ? { ...payload, amount: pay } : payload;
+      for (let si = 0; si < slices; si++) {
+        const isLast = si === slices - 1;
+        let pl = payload as any;
+        if (side === 'buy') {
+          const per = Math.max(0.00005, totalSol / slices);
+          const pay = isLast ? Math.max(0.00005, +(totalSol - per * (slices - 1)).toFixed(6)) : per;
+          pl = { ...payload, amount: pay };
+        } else {
+          const perTok = Math.max(0, sellQtyTok / slices);
+          const qty = isLast ? Math.max(0, roundTok(sellQtyTok - perTok * (slices - 1), decimals)) : roundTok(perTok, decimals);
+          pl = { ...payload, amount: qty };
+        }
         const vtx = await buildTradeTxPumpPortal(pl);
         vtx.sign([kp]);
         const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
         await connection.confirmTransaction(sig, "confirmed");
         // лёгкий джиттер между под-ордеров
-        if (side === 'buy' && si < slices-1) await sleep(200 + Math.floor(Math.random()*250));
+        if (si < slices-1) await sleep(220 + Math.floor(Math.random()*280));
       }
 
       // success → reset backoff
@@ -345,7 +356,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       // optimistic local portfolio update
       if (side === "buy") {
-        const qty = (sizeSol || per) / priceNow;
+        const qty = (sizeSol || totalSol) / priceNow;
         const newPos = bot.posToken + qty;
         bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + sizeSol) / newPos : priceNow;
         bot.posToken = newPos;
@@ -424,7 +435,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     pending = true;
     try {
       // periodic light on-chain refresh (keeps UI in sync even without trades)
-      if (now - lastLightRefresh > 15000) {
+      if (now - lastLightRefresh > 10000) {
         await refreshOnChainBalances();
         lastLightRefresh = now;
       }
@@ -457,11 +468,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         return Math.max(0.00005, +(base * jitter).toFixed(6));
       };
 
+      const reserve = Math.max(MIN_KEEP_SOL, 0.0009);
       const baseSize = Math.max(
         step.minSol,
-        Math.min(bot.budgetSol || ctx.tradeSize() || step.maxSol, bot.solBalance - (MIN_KEEP_SOL + step.minSol))
+        Math.min(bot.budgetSol || ctx.tradeSize() || step.maxSol, bot.solBalance - (reserve + step.minSol))
       );
-      const haveSol = bot.solBalance > MIN_KEEP_SOL + 0.00015;
+      const haveSol = bot.solBalance > reserve + 0.00015;
 
       /* ======= pre-strategy auto-rebalance ======= */
       if (bot.posToken > 0 && allocTok > MAX_ALLOC) {
@@ -495,7 +507,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       /* ================== strategies ================== */
       let did = false;
 
-      switch (bot.strategy) {
+      const strat = (bot.strategy as InternalStrategy);
+      switch (strat) {
         case "trend": {
           if (!protect && haveSol && (fast > 0.0006 || ch1m > 0.001) && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.12) * total - bot.posToken * p);
@@ -516,12 +529,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         case "revert": {
-          if (!protect && haveSol && (fast < -0.0012 || ch1m < -0.0018) && allocTok < MAX_ALLOC) {
+          if (!protect && haveSol && (fast < -0.0009 || ch1m < -0.0012) && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.1) * total - bot.posToken * p);
             const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
             if (size > 0.00012) { await twapBuy(size); did = true; break; }
           }
-          if (wantToSell(bot, p, 80, 40) || allocTok > MAX_ALLOC || protect) {
+          if (wantToSell(bot, p, 120, 60) || allocTok > MAX_ALLOC || protect) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(
@@ -547,6 +560,50 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               bot.posToken,
               roundTok(Math.max(bot.posToken * 0.12, (excessVal * 0.45) / p), ctx.tokenDecimals())
             );
+            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+            did = true;
+          }
+          break;
+        }
+
+        case "momentum": { // усиливает покупки при ускорении, продаёт по слабому стопу
+          if (!protect && haveSol && (fast > 0.001 || ch1m > 0.002) && allocTok < MAX_ALLOC) {
+            const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
+            const size = Math.min(Math.max(baseSize, pickStep()*1.2), headroomVal);
+            if (size > 0.00012) { await twapBuy(size); did = true; break; }
+          }
+          if (wantToSell(bot, p, 150, 80) || allocTok > MAX_ALLOC || protect) {
+            const desiredTokVal = TARGET_ALLOC * total;
+            const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
+            const part = Math.min(bot.posToken, roundTok(Math.max(bot.posToken * 0.18, (excessVal * 0.55) / p), ctx.tokenDecimals()));
+            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+            did = true;
+          }
+          break;
+        }
+
+        case "range": { // покупает у нижней кромки канала, продаёт у верхней
+          const mid = bot.avgSol || p;
+          const dev = (p - mid) / Math.max(1e-9, mid);
+          if (!protect && haveSol && dev < -0.01 && allocTok < MAX_ALLOC) {
+            const size = Math.min(Math.max(baseSize, pickStep()), (TARGET_ALLOC + 0.1) * total);
+            if (size > 0.00012) { await twapBuy(size); did = true; break; }
+          }
+          if (dev > 0.012 || allocTok > MAX_ALLOC || protect) {
+            const part = roundTok(Math.max(bot.posToken * 0.12, (bot.posToken * dev) / 2), ctx.tokenDecimals());
+            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+            did = true;
+          }
+          break;
+        }
+
+        case "maker": { // мелкие частые сделки вокруг текущей цены
+          if (!protect && allocTok < MAX_ALLOC && haveSol) {
+            const size = Math.min(pickStep() * 0.6, baseSize);
+            if (Math.random() < 0.6) { await twapBuy(size); did = true; break; }
+          }
+          if (bot.posToken > 0 && (allocTok > TARGET_ALLOC || protect || Math.random() < 0.25)) {
+            const part = roundTok(Math.max(bot.posToken * 0.07, (bot.posToken * Math.random() * 0.1)), ctx.tokenDecimals());
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
           }

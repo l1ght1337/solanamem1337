@@ -35,6 +35,9 @@ export default function BotRow({ bot }: { bot: LiveBot }) {
         <option value="trend">trend</option>
         <option value="revert">revert</option>
         <option value="scalper">scalper</option>
+        <option value="momentum">momentum</option>
+        <option value="range">range</option>
+        <option value="maker">maker</option>
       </select>
 
       <input

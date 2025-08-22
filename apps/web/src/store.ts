@@ -25,7 +25,7 @@ import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./uti
 import { getMintDecimals, getSPLBalance } from "./utils/solana";
 import { scheduleFetch, getNetMetrics } from "./utils/network";
 
-export type BotStrategy = "trend" | "revert" | "scalper";
+export type BotStrategy = "trend" | "revert" | "scalper" | "momentum" | "range" | "maker";
 
 export type LiveBot = {
   id: string;
@@ -1393,15 +1393,18 @@ export const useStore = create<Store>()(
         while (sum > total) { counts[0].n--; sum--; }
 
         const profiles = {
-          trend:  (i: number) => ({ strategy: "trend"  as const, speedMs: 5000 + ((i % 3) * 2000), budgetSol: 0.02 + ((i % 2) * 0.01) }),
-          revert: (i: number) => ({ strategy: "revert" as const, speedMs: 9000 + ((i % 3) * 3000), budgetSol: 0.015 }),
-          scalper:(i: number) => ({ strategy: "scalper"as const, speedMs: 1500 + ((i % 3) * 500),  budgetSol: 0.008 }),
-        };
+          trend:   (i: number) => ({ strategy: "trend"   as const, speedMs: 5000 + ((i % 3) * 2000), budgetSol: 0.02 + ((i % 2) * 0.01) }),
+          revert:  (i: number) => ({ strategy: "revert"  as const, speedMs: 9000 + ((i % 3) * 3000), budgetSol: 0.015 }),
+          scalper: (i: number) => ({ strategy: "scalper" as const, speedMs: 1500 + ((i % 3) * 500),  budgetSol: 0.008 }),
+          momentum:(i: number) => ({ strategy: "momentum"as const, speedMs: 4000 + ((i % 3) * 1500), budgetSol: 0.02 }),
+          range:   (i: number) => ({ strategy: "range"   as const, speedMs: 7000 + ((i % 3) * 2000), budgetSol: 0.015 }),
+          maker:   (i: number) => ({ strategy: "maker"   as const, speedMs: 2500 + ((i % 3) * 800),  budgetSol: 0.006 }),
+        } as const;
 
         let idx = 0;
         const newBots = bots.map((b) => {
           if (b.manualLock) return b;
-          let bucket: "trend" | "revert" | "scalper" = "trend";
+          let bucket: BotStrategy = "trend";
           for (const c of counts) { if (c.n > 0) { bucket = c.type as any; c.n--; break; } }
           const prof = profiles[bucket](idx++);
           return { ...b, ...prof };
