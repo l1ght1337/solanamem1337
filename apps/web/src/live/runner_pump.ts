@@ -300,19 +300,19 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     // Подхватываем актуальные аллокации из UI (если переданы)
     try {
-      const alloc = (ctx as any).getAlloc?.();
-      if (alloc && typeof alloc.target === 'number') {
-        TARGET_ALLOC = Math.min(0.95, Math.max(0.05, alloc.target));
-        MIN_ALLOC = Math.min(TARGET_ALLOC, Math.max(0.05, alloc.min ?? 0.6));
-        MAX_ALLOC = Math.max(TARGET_ALLOC, Math.min(0.98, alloc.max ?? 0.85));
+      const allocUi = (ctx as any).getAlloc?.();
+      if (allocUi && typeof allocUi.target === 'number') {
+        TARGET_ALLOC = Math.min(0.95, Math.max(0.05, allocUi.target));
+        MIN_ALLOC = Math.min(TARGET_ALLOC, Math.max(0.05, allocUi.min ?? 0.6));
+        MAX_ALLOC = Math.max(TARGET_ALLOC, Math.min(0.98, allocUi.max ?? 0.85));
       }
     } catch {}
     // Подхватываем форму шага сделки
-    let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
-    try { const s = (ctx as any).getTradeStep?.(); if (s) step = s; } catch {}
-    const pickStep = () => {
-      const base = step.minSol + Math.random() * Math.max(0, step.maxSol - step.minSol);
-      const jitter = 1 + (Math.random()*2 - 1) * Math.min(0.5, Math.max(0, step.jitterPct));
+    let stepCfg = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
+    try { const s = (ctx as any).getTradeStep?.(); if (s) stepCfg = s; } catch {}
+    const pickSolStep = () => {
+      const base = stepCfg.minSol + Math.random() * Math.max(0, stepCfg.maxSol - stepCfg.minSol);
+      const jitter = 1 + (Math.random()*2 - 1) * Math.min(0.5, Math.max(0, stepCfg.jitterPct));
       return Math.max(0.00005, +(base * jitter).toFixed(6));
     };
     const kp = ctx.keypair();
@@ -348,7 +348,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       if (spendInWindow + sizeSol > (safe.maxSpendSolPerWindow || 0.01)) return;
     }
 
-    const payload =
+    const plBase =
       side === "buy"
         ? {
             publicKey: kp.publicKey.toBase58(),
@@ -375,7 +375,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // Защита от сверхплохих котировок: Jupiter sanity check
       if (side === 'buy') {
         phase = 'jupQuoteBuy';
-        const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
+        const pay = Math.round(Math.max(0.00005, sizeSol || pickSolStep()) * 1e9);
         try {
           const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
           const fairOut = (pay / 1e9) / priceNow; // в токенах
@@ -404,28 +404,28 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
       phase = 'sliceExec';
-      let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
+      let remainingSol = side === 'buy' ? (sizeSol || pickSolStep()) : 0;
       let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
       const maxBuyPerSlice = Math.max(0.00005, Math.min((risk.maxBuySliceSol || 0.0018), capsLocal.buySlice));
       const maxSellPct = Math.min(0.5, Math.max(0.02, Math.min((risk.maxSellSliceTokPct || 0.12), capsLocal.sellPct)));
       const maxSellPerSlice = side === 'sell' ? roundTok((bot.posToken || 0) * maxSellPct, decimals) : 0;
-      let slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
+      let slices = Math.max(1, Math.min(stepCfg.slicesMax, Math.round(1 + Math.random() * (stepCfg.slicesMax - 1))));
       if (side === 'sell' && maxSellPerSlice > 0) {
         const need = Math.ceil(remainingTok / Math.max(1e-12, maxSellPerSlice));
-        slices = Math.min(step.slicesMax, Math.max(slices, need));
+        slices = Math.min(stepCfg.slicesMax, Math.max(slices, need));
       }
       for (let si = 0; si < slices; si++) {
-        let pl = payload as any;
+        let pl = plBase as any;
         if (side === 'buy') {
           const sliceSol = Math.min(maxBuyPerSlice, remainingSol);
           if (sliceSol <= 0.000049) break;
-          pl = { ...payload, amount: +sliceSol.toFixed(6) };
+          pl = { ...plBase, amount: +sliceSol.toFixed(6) };
           remainingSol = Math.max(0, +(remainingSol - sliceSol).toFixed(6));
         } else {
           const sliceTok = maxSellPerSlice > 0 ? Math.min(maxSellPerSlice, remainingTok) : remainingTok / Math.max(1, (slices - si));
           const qty = roundTok(Math.max(0, sliceTok), decimals);
           if (qty <= 0) break;
-          pl = { ...payload, amount: qty };
+          pl = { ...plBase, amount: qty };
           remainingTok = Math.max(0, remainingTok - qty);
         }
         phase = 'sendTx';
