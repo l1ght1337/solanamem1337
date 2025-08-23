@@ -531,7 +531,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   return () => { stopped = true; };
 
   let lastLightRefresh = 0;
-  let loopStage = "init";
 
   async function loop() {
     if (stopped || !bot.running) return;
@@ -552,7 +551,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     if (deferredSell && now >= deferredSell.dueAt && bot.posToken > 0) {
       pending = true;
       try {
-        loopStage = 'deferredSell';
         const qty = Math.min(bot.posToken * 0.2, Math.max(0, deferredSell.amountTok));
         if (qty > 0) await trade("sell", 0, { sellTokens: qty });
       } catch {}
@@ -565,7 +563,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     pending = true;
     try {
       // periodic light on-chain refresh (keeps UI in sync even without trades)
-      loopStage = 'lightRefresh';
       if (now - lastLightRefresh > 10000) {
         await refreshOnChainBalances();
         lastLightRefresh = now;
@@ -579,12 +576,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
       }
 
-      loopStage = 'readSignals';
       const p = Math.max(1e-12, ctx.price());
       const fast = ctx.changeFast?.(12) ?? 0;
       const ch1m = ctx.change1m();
 
-      loopStage = 'allocRisk';
       const { a: allocTok, total } = alloc(p);
 
       // Риск: защитный режим при большой просадке
@@ -598,7 +593,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       if (bot.posToken > 0) trailHighPrice = Math.max(trailHighPrice || p, p); else trailHighPrice = 0;
 
       // Считываем шаг исполнения и модифицируем под стратегию
-      loopStage = 'capsStep';
       let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
       try { const s = (ctx as any).getTradeStep?.(); if (s) step = s; } catch {}
       const caps = capsForStrategy(bot.strategy as InternalStrategy);
@@ -610,7 +604,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         return Math.max(0.00005, +(base * jitter).toFixed(6));
       };
 
-      loopStage = 'reserveCheck';
       const reserve = Math.max(MIN_KEEP_SOL, risk.reserveSol || 0.0009);
       const baseSize = Math.max(
         step.minSol,
@@ -624,6 +617,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const needSol = Math.max(0, (reserve + 0.0015) - bot.solBalance);
         const tokToSell = roundTok(Math.min(bot.posToken * 0.22, needSol / Math.max(1e-12, p)), ctx.tokenDecimals());
         if (tokToSell > 0) {
+          const strat = (bot.strategy as InternalStrategy);
           loopStage = 'emergencySell';
           await trade("sell", 0, { sellTokens: tokToSell });
           pending = false;
@@ -633,7 +627,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       /* ======= pre-strategy auto-rebalance ======= */
-      loopStage = 'preRebalance';
       if (bot.posToken > 0 && allocTok > MAX_ALLOC + eps) {
         const desiredTokVal = TARGET_ALLOC * total;
         const currentTokVal = bot.posToken * p;
@@ -653,7 +646,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      loopStage = 'buyRebalance';
       if (!protect && allocTok < MIN_ALLOC - eps) {
         // если SOL хватает — покупаем; иначе сначала продадим кусок, чтобы профинансировать покупку
         if (!haveSol) {
@@ -684,7 +676,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       let did = false;
 
       const strat = (bot.strategy as InternalStrategy);
-      loopStage = `strategy:${strat}`;
       switch (strat) {
         case "trend": {
           if (!protect && haveSol && (fast > 0.0006 || ch1m > 0.001) && allocTok < MAX_ALLOC) {
