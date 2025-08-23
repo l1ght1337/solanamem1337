@@ -398,9 +398,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         } catch {}
       }
 
-      // Safe-mode: запрет покупок в protect-режиме
-      if (side === 'buy' && safe?.blockBuyOnProtect && (protectGlobal || false)) return;
-
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
       let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
       let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
@@ -577,7 +574,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       let risk: any = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
       try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
       const protect = portfolioNow < baselineValue * (1 - Math.min(MAX_TOTAL_DRAWDOWN, risk.maxDrawdown));
-      const protectGlobal = protect;
 
       // Обновляем trailing high для momentum/общего стопа
       if (bot.posToken > 0) trailHighPrice = Math.max(trailHighPrice || p, p); else trailHighPrice = 0;
