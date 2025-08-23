@@ -317,7 +317,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     };
 
     try {
-      var kp = ctx.keypair();
+      const kp = ctx.keypair();
       var decimals = ctx.tokenDecimals();
       var priceNow = Math.max(1e-12, ctx.price());
       const nowTs = Date.now();
@@ -338,6 +338,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       // Safe-mode: запрет покупок до миграции (если включено)
       const safe = ctx.getSafe?.();
+      ctx.onLog('info', `[${bot.name}] trade start side=${side} size=${sizeSol.toFixed(6)} safe.sanity=${!(safe?.disableJupiterSanity)}`);
       if (side === 'buy' && safe?.requireMigration && !(ctx.isMigrated?.() ?? false)) {
         warnDebounced('safe: block buy before migration');
         return;
@@ -380,6 +381,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const quoteData = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
             const fairOut = (pay / 1e9) / priceNow; // в токенах
             const out = Number((quoteData as any).outAmount || 0) / Math.pow(10, decimals);
+            ctx.onLog('info', `[${bot.name}] jup sanity BUY pay=${(pay/1e9).toFixed(6)} out=${out.toFixed(6)} fair=${fairOut.toFixed(6)}`);
             const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
             if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
               warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
@@ -394,6 +396,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const quoteData = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
             const fairOutSol = qty * priceNow;
             const outSol = Number((quoteData as any).outAmount || 0) / 1e9;
+            ctx.onLog('info', `[${bot.name}] jup sanity SELL qtyTok=${qty.toFixed(6)} outSol=${outSol.toFixed(6)} fair=${fairOutSol.toFixed(6)}`);
             const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
             if (fairOutSol > 0 && outSol < fairOutSol * (1 - maxImpact)) {
               warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
@@ -415,6 +418,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const need = Math.ceil(remainingTok / Math.max(1e-12, maxSellPerSlice));
         slices = Math.min(stepCfg.slicesMax, Math.max(slices, need));
       }
+      ctx.onLog('info', `[${bot.name}] exec slices=${slices} buySliceMax=${maxBuyPerSlice} sellSliceMaxTok=${maxSellPerSlice}`);
       for (let si = 0; si < slices; si++) {
         let pl = plBase as any;
         if (side === 'buy') {
@@ -429,6 +433,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           pl = { ...plBase, amount: qty };
           remainingTok = Math.max(0, remainingTok - qty);
         }
+        ctx.onLog('info', `[${bot.name}] send slice ${si+1}/${slices} amount=${pl.amount}`);
         phase = 'sendTx';
         const vtx = await buildTradeTxPumpPortal(pl);
         vtx.sign([kp]);
@@ -502,6 +507,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       const msg = e?.message || String(e);
       bot.lastError = msg;
+      ctx.onLog('err', `[${bot.name}] trade error phase=${phase}: ${msg}`);
       pushUpdate({ lastError: bot.lastError });
       warnDebounced(`net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
     }
