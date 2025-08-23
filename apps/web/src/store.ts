@@ -512,8 +512,6 @@ export type Store = {
     minSliceGapMs: number;      // минимальная пауза между срезами
     maxSliceGapMs: number;      // максимальная пауза между срезами
   };
-
-  migrated: boolean; // Pump.fun migrated to Raydium
 };
 
 export const useStore = create<Store>()(
@@ -607,7 +605,7 @@ export const useStore = create<Store>()(
       setTokenUrl: (u) => {
         const mint = b58(u);
         const isPump = /pump\.fun/i.test(u);
-        set({ tokenUrl: u, tokenMint: mint, _mintDecimals: undefined, migrated: false });
+        set({ tokenUrl: u, tokenMint: mint, _mintDecimals: undefined });
         if (mint && isPump) {
           import("./external/pumpportal").then(({ attachPumpPortalFeed }) => {
             const s = get();
@@ -630,13 +628,13 @@ export const useStore = create<Store>()(
                   if (c.length > 1000) c = c.slice(-1000);
                   return { candles: c };
                 }),
-              onMigration: () => { set({ migrated: true }); get().addLog("info", "Token migrated from bonding curve → Raydium"); },
+              onMigration: () => get().addLog("info", "Token migrated from bonding curve → Raydium"),
             });
             set((s2) => ({ ...s2, external: { ...s2.external, provider: "pumpportal" }, _ppSub: sub }));
           });
         } else {
           try { (get() as any)._ppSub?.detach?.(); } catch {}
-          set({ _ppSub: undefined, external: { ...get().external, provider: "pumpportal" } });
+          set({ _ppSub: undefined });
         }
       },
 
@@ -879,15 +877,20 @@ export const useStore = create<Store>()(
         bot.running = true;
         set({ bots: [...s.bots] });
 
-        const run = await import("./live/runner_pump").then((m) => m.runBot);
+        const runnerLoader =
+          get().external.provider === "pumpportal"
+            ? () => import("./live/runner_pump").then((m) => m.runBot)
+            : () => import("./live/runner").then((m) => m.runBot);
+
+        const run = await runnerLoader();
 
         const stop = run(connection, bot, {
           mint: s.tokenMint!,
           slippageBps: () => safeBps(get().getSmartBps(), 50),
           twap: get().getTwapPlan(),
 
-          price: () => get().price || 0,
-          changeFast: (secs?: number) => get().getChangeFast(secs ?? 12),
+          price: () => get().price,
+          changeFast: (secs?: number) => get().getChangeFast(secs ?? 15),
           change1m: () => {
             const cs = get().candles;
             if (cs.length < 2) return 0;
@@ -896,7 +899,7 @@ export const useStore = create<Store>()(
             return (b - a) / Math.max(1e-9, a);
           },
 
-          keypair: () => getKeypair(bot.keyId) as Keypair,
+          keypair: () => kp as Keypair,
           tokenDecimals: () => get()._mintDecimals ?? 9,
           tradeSize: () => {
             const r = get().getTradeSize();
@@ -918,13 +921,13 @@ export const useStore = create<Store>()(
                 if (x.id !== patch.id) return x;
                 return {
                   ...x,
-                  last: patch.last ?? x.last,
-                  lastError: patch.lastError ?? x.lastError,
-                  fills: patch.fills ?? x.fills,
-                  posToken: patch.posToken ?? x.posToken,
-                  avgSol: patch.avgSol ?? x.avgSol,
-                  realized: patch.realized ?? x.realized,
-                  unrealized: patch.unrealized ?? x.unrealized,
+                  last: patch.last,
+                  lastError: patch.lastError,
+                  fills: patch.fills,
+                  posToken: patch.posToken,
+                  avgSol: patch.avgSol,
+                  realized: patch.realized,
+                  unrealized: patch.unrealized,
                   solBalance: patch.solBalance ?? x.solBalance,
                   tokenBalance: patch.tokenBalance ?? x.tokenBalance,
                 };
@@ -938,8 +941,6 @@ export const useStore = create<Store>()(
           },
           getAlloc: () => get().getAlloc(),
           getTradeStep: () => get().getTradeStep(),
-          getSafe: () => get().getSafe(),
-          isMigrated: () => get().migrated,
         } as any);
 
         (bot as any).__stop = stop;
@@ -1461,22 +1462,20 @@ export const useStore = create<Store>()(
 
       // Риск-настройки (пока без UI; при желании вынесем в контролы)
       getRisk: () => ({
-        maxImpact: 0.01,
-        maxDrawdown: 0.10,
-        reserveSol: 0.0100,
-        maxNotionalPerMin: 0.0005,
-        maxBuysPerMin: 1,
-        maxSellsPerMin: 8,
-        lossThrPct: 0.003,
-        lossWindowMs: 60000,
-        lossCooldownMs: 120000,
-        maxBuySliceSol: 0.0003,
-        maxSellSliceTokPct: 0.05,
-        minSliceGapMs: 300,
-        maxSliceGapMs: 1500,
+        maxImpact: 0.03,
+        maxDrawdown: 0.15,
+        reserveSol: 0.0030,
+        maxNotionalPerMin: 0.0030,
+        maxBuysPerMin: 2,
+        maxSellsPerMin: 6,
+        lossThrPct: 0.004,
+        lossWindowMs: 30000,
+        lossCooldownMs: 60000,
+        maxBuySliceSol: 0.0008,
+        maxSellSliceTokPct: 0.06,
+        minSliceGapMs: 250,
+        maxSliceGapMs: 1200,
       }),
-
-      migrated: false, // Pump.fun migrated to Raydium
     }),
     {
       name: "meme-bundler:v1",
@@ -1496,14 +1495,12 @@ export const useStore = create<Store>()(
         if (typeof p.allocTarget !== 'number') p.allocTarget = 0.70;
         if (typeof p.allocMin !== 'number') p.allocMin = 0.60;
         if (typeof p.allocMax !== 'number') p.allocMax = 0.85;
-        if (typeof p.migrated !== 'boolean') p.migrated = false;
         return p;
       },
       storage: createJSONStorage(() => localStorage),
       partialize: (s) => ({
         tokenUrl: s.tokenUrl,
         tokenMint: s.tokenMint,
-        migrated: s.migrated,
         bots: s.bots,
         slippageBps: s.slippageBps,
         useRandomSize: s.useRandomSize,
@@ -1532,13 +1529,3 @@ export const useStore = create<Store>()(
     }
   )
 );
-
-// Safe defaults
-export const getSafe = () => ({
-  requireMigration: false,
-  maxRoundtripLoss: 0.005,
-  windowMs: 30 * 60 * 1000,
-  maxSpendSolPerWindow: 0.002,
-  blockBuyOnProtect: true,
-  disableJupiterSanity: true,
-});
