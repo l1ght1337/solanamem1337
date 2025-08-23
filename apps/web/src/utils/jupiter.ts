@@ -89,8 +89,20 @@ export async function swapFromQuoteWithKeypair(opts: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  const b64 = String(swapRes.swapTransaction)
-  const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0))
+  const b64Raw = (swapRes && typeof (swapRes as any).swapTransaction === 'string')
+    ? String((swapRes as any).swapTransaction).trim()
+    : ''
+  if (!b64Raw) throw new Error('Jupiter swap: missing swapTransaction')
+  // normalize base64url to base64 and pad
+  const norm = b64Raw.replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '')
+  const padLen = (4 - (norm.length % 4)) % 4
+  const padded = norm + '='.repeat(padLen)
+  let raw: Uint8Array
+  try {
+    raw = Uint8Array.from(atob(padded), c => c.charCodeAt(0))
+  } catch (e) {
+    throw new Error('Jupiter swap: invalid base64 in swapTransaction')
+  }
   const tx = VersionedTransaction.deserialize(raw)
   tx.sign([keypair])
   const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 2 })
