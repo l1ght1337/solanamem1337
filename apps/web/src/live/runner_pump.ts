@@ -526,10 +526,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     }
   }
 
-  // desync start a bit across bots
-  setTimeout(loop, 100 + Math.floor(Math.random() * 500));
-  return () => { stopped = true; };
-
   let lastLightRefresh = 0;
 
   async function loop() {
@@ -827,4 +823,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
     }
   }
+
+  // desync start a bit across bots (defined after lastLightRefresh to avoid hoist issues)
+  setTimeout(loop, 100 + Math.floor(Math.random() * 500));
+  return () => { stopped = true; };
 }
