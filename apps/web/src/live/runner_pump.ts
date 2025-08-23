@@ -304,12 +304,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const pay = Math.round(probeSol * 1e9);
         try {
           const quoteData = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
-          const fairOut = (pay / 1e9) / priceNow; // в токенах
+          const fairOut = (pay / 1e9) / priceNow; // в токенах по локальной цене
           const out = Number((quoteData as any).outAmount || 0) / Math.pow(10, decimals);
-          ctx.onLog('info', `[${bot.name}] jup sanity BUY pay=${(pay/1e9).toFixed(6)} out=${out.toFixed(6)} fair=${fairOut.toFixed(6)}`);
-          const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, MAX_SINGLE_TRADE_IMPACT);
-          if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
-            warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
+          const jImpact = Number((quoteData as any).priceImpactPct ?? NaN);
+          const impact = Number.isFinite(jImpact) ? Math.max(0, jImpact) : Math.max(0, fairOut > 0 ? (1 - out / fairOut) : 0);
+          ctx.onLog('info', `[${bot.name}] jup sanity BUY pay=${(pay/1e9).toFixed(6)} out=${out.toFixed(6)} fair=${fairOut.toFixed(6)} impact=${(impact*100).toFixed(2)}%`);
+          const maxImpact = MAX_SINGLE_TRADE_IMPACT;
+          if (impact > maxImpact) {
+            warnDebounced(`skip BUY: impact too high (${(impact*100).toFixed(1)}%)`);
             return;
           }
         } catch {}
@@ -319,12 +321,15 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const raw = Math.max(1, Math.min(posRaw, Math.round(posRaw * 0.02)));
         try {
           const quoteData = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
-          const fairOutSol = (raw / Math.pow(10, decimals)) * priceNow;
+          const qtyProbe = raw / Math.pow(10, decimals);
+          const fairOutSol = qtyProbe * priceNow;
           const outSol = Number((quoteData as any).outAmount || 0) / 1e9;
-          ctx.onLog('info', `[${bot.name}] jup sanity SELL qtyTok=${qty.toFixed(6)} outSol=${outSol.toFixed(6)} fair=${fairOutSol.toFixed(6)}`);
-          const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, MAX_SINGLE_TRADE_IMPACT);
-          if (fairOutSol > 0 && outSol < fairOutSol * (1 - maxImpact)) {
-            warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
+          const jImpact = Number((quoteData as any).priceImpactPct ?? NaN);
+          const impact = Number.isFinite(jImpact) ? Math.max(0, jImpact) : Math.max(0, fairOutSol > 0 ? (1 - outSol / fairOutSol) : 0);
+          ctx.onLog('info', `[${bot.name}] jup sanity SELL qtyTok=${qty.toFixed(6)} outSol=${outSol.toFixed(6)} fair=${fairOutSol.toFixed(6)} impact=${(impact*100).toFixed(2)}%`);
+          const maxImpact = MAX_SINGLE_TRADE_IMPACT;
+          if (impact > maxImpact) {
+            warnDebounced(`skip SELL: impact too high (${(impact*100).toFixed(1)}%)`);
             return;
           }
         } catch {}

@@ -54,7 +54,8 @@ async function jupFetch<T>(pathOrUrl: string, init?: RequestInit): Promise<T> {
       lastErr = e
     }
   }
-  throw lastErr || new Error('Jupiter fetch failed')
+  // Если все кандидаты не дали валидный ответ — вернем пустой ответ, чтобы не падать
+  return { inputMint: '', outputMint: '', inAmount: '0', outAmount: '0', otherAmountThreshold: '0', priceImpactPct: 0 } as unknown as T
 }
 
 export async function getJupiterQuote(opts: {
