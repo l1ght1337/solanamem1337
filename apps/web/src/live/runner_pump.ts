@@ -579,15 +579,28 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         Math.min(bot.budgetSol || ctx.tradeSize() || step.maxSol, bot.solBalance - (reserve + step.minSol))
       );
       const haveSol = bot.solBalance > reserve + 0.00015;
+      const eps = 0.005; // гистерезис коридора
+
+      // ======= emergency: нет SOL для комиссий/ребаланса — продадим немного токена сразу
+      if (bot.posToken > 0 && bot.solBalance < reserve) {
+        const needSol = Math.max(0, (reserve + 0.0015) - bot.solBalance);
+        const tokToSell = roundTok(Math.min(bot.posToken * 0.22, needSol / Math.max(1e-12, p)), ctx.tokenDecimals());
+        if (tokToSell > 0) {
+          await trade("sell", 0, { sellTokens: tokToSell });
+          pending = false;
+          const jitter = 200 + Math.floor(Math.random() * 300);
+          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+        }
+      }
 
       /* ======= pre-strategy auto-rebalance ======= */
-      if (bot.posToken > 0 && allocTok > MAX_ALLOC) {
+      if (bot.posToken > 0 && allocTok > MAX_ALLOC + eps) {
         const desiredTokVal = TARGET_ALLOC * total;
         const currentTokVal = bot.posToken * p;
         const excessVal = Math.max(0, currentTokVal - desiredTokVal);
         // если сильно вышли за коридор — продаём агрессивнее к цели
         const over = allocTok - MAX_ALLOC;
-        const factor = over > 0.02 ? 0.8 : 0.5;
+        const factor = over > 0.03 ? 1.0 : over > 0.015 ? 0.75 : 0.5;
         const tokToSell = Math.min(
           bot.posToken,
           roundTok(Math.max(bot.posToken * 0.12, (excessVal * factor) / p), ctx.tokenDecimals())
@@ -600,7 +613,21 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      if (!protect && haveSol && allocTok < MIN_ALLOC) {
+      if (!protect && allocTok < MIN_ALLOC - eps) {
+        // если SOL хватает — покупаем; иначе сначала продадим кусок, чтобы профинансировать покупку
+        if (!haveSol) {
+          const targetVal = TARGET_ALLOC * total;
+          const needVal = Math.max(0, targetVal - bot.posToken * p);
+          // продадим небольшой кусок, чтобы получить SOL на будущие покупки
+          const tokToSell = roundTok(Math.max(bot.posToken * 0.08, Math.min(bot.posToken * 0.2, (needVal * 0.25) / p)), ctx.tokenDecimals());
+          if (tokToSell > 0) {
+            await trade("sell", 0, { sellTokens: tokToSell });
+            pending = false;
+            const jitter = 200 + Math.floor(Math.random() * 300);
+            return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+          }
+        }
+        // если SOL есть — покупаем к цели
         const targetVal = TARGET_ALLOC * total;
         const needVal = Math.max(0, targetVal - bot.posToken * p);
         const buySol = Math.max(0, Math.min(Math.max(baseSize, pickStep()), needVal));
