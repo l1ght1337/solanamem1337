@@ -48,6 +48,8 @@ type RunCtx = {
   tradeSize: () => number;
 
   isAiPaused?: () => boolean;
+  getSafe?: () => { requireMigration: boolean; maxRoundtripLoss: number; windowMs: number; maxSpendSolPerWindow: number; blockBuyOnProtect: boolean };
+  isMigrated?: () => boolean;
 
   onLog: (level: "info" | "ok" | "warn" | "err", msg: string) => void;
   onUpdate: (b: LiveBot) => void;
@@ -266,6 +268,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let buysThisMin = 0;
   let sellsThisMin = 0;
   let notionalThisMin = 0; // суммарная сумма покупок в SOL
+  let windowSpendStart = Date.now();
+  let spendInWindow = 0;   // суммарные покупки в окне safe‑режима
   let lastBuyAtPrice: number | null = null;
   let lastBuyAtTs: number = 0;
   let lossCooldownUntil = 0;
@@ -330,6 +334,18 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       if (sellsThisMin >= risk.maxSellsPerMin) return;
     }
 
+    // Safe-mode: запрет покупок до миграции (если включено)
+    const safe = ctx.getSafe?.();
+    if (side === 'buy' && safe?.requireMigration && !(ctx.isMigrated?.() ?? false)) {
+      warnDebounced('safe: block buy before migration');
+      return;
+    }
+    // Safe-mode: окно и лимит суммарных покупок
+    if (side === 'buy' && safe) {
+      if (nowTs - windowSpendStart >= (safe.windowMs || 900000)) { windowSpendStart = nowTs; spendInWindow = 0; }
+      if (spendInWindow + sizeSol > (safe.maxSpendSolPerWindow || 0.01)) return;
+    }
+
     const payload =
       side === "buy"
         ? {
@@ -381,6 +397,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           }
         } catch {}
       }
+
+      // Safe-mode: запрет покупок в protect-режиме
+      if (side === 'buy' && safe?.blockBuyOnProtect && (protectGlobal || false)) return;
 
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
       let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
@@ -434,6 +453,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         bot.tokenBalance = bot.posToken;
         buysInRow++; sellsInRow = 0; lastBuyTs = Date.now();
         if (trailHighPrice <= 0 || priceNow > trailHighPrice) trailHighPrice = priceNow;
+        notionalThisMin += sizeSol; spendInWindow += sizeSol;
       } else {
         const sellQty = amountTok ?? bot.posToken;
         bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
@@ -557,6 +577,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       let risk: any = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
       try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
       const protect = portfolioNow < baselineValue * (1 - Math.min(MAX_TOTAL_DRAWDOWN, risk.maxDrawdown));
+      const protectGlobal = protect;
 
       // Обновляем trailing high для momentum/общего стопа
       if (bot.posToken > 0) trailHighPrice = Math.max(trailHighPrice || p, p); else trailHighPrice = 0;

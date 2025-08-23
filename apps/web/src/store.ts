@@ -512,6 +512,8 @@ export type Store = {
     minSliceGapMs: number;      // минимальная пауза между срезами
     maxSliceGapMs: number;      // максимальная пауза между срезами
   };
+
+  migrated: boolean; // Pump.fun migrated to Raydium
 };
 
 export const useStore = create<Store>()(
@@ -605,7 +607,7 @@ export const useStore = create<Store>()(
       setTokenUrl: (u) => {
         const mint = b58(u);
         const isPump = /pump\.fun/i.test(u);
-        set({ tokenUrl: u, tokenMint: mint, _mintDecimals: undefined });
+        set({ tokenUrl: u, tokenMint: mint, _mintDecimals: undefined, migrated: false });
         if (mint && isPump) {
           import("./external/pumpportal").then(({ attachPumpPortalFeed }) => {
             const s = get();
@@ -628,7 +630,7 @@ export const useStore = create<Store>()(
                   if (c.length > 1000) c = c.slice(-1000);
                   return { candles: c };
                 }),
-              onMigration: () => get().addLog("info", "Token migrated from bonding curve → Raydium"),
+              onMigration: () => { set({ migrated: true }); get().addLog("info", "Token migrated from bonding curve → Raydium"); },
             });
             set((s2) => ({ ...s2, external: { ...s2.external, provider: "pumpportal" }, _ppSub: sub }));
           });
@@ -889,8 +891,8 @@ export const useStore = create<Store>()(
           slippageBps: () => safeBps(get().getSmartBps(), 50),
           twap: get().getTwapPlan(),
 
-          price: () => get().price,
-          changeFast: (secs?: number) => get().getChangeFast(secs ?? 15),
+          price: () => get().price || 0,
+          changeFast: (secs?: number) => get().getChangeFast(secs ?? 12),
           change1m: () => {
             const cs = get().candles;
             if (cs.length < 2) return 0;
@@ -899,7 +901,7 @@ export const useStore = create<Store>()(
             return (b - a) / Math.max(1e-9, a);
           },
 
-          keypair: () => kp as Keypair,
+          keypair: () => getKeypair(bot.keyId) as Keypair,
           tokenDecimals: () => get()._mintDecimals ?? 9,
           tradeSize: () => {
             const r = get().getTradeSize();
@@ -921,13 +923,13 @@ export const useStore = create<Store>()(
                 if (x.id !== patch.id) return x;
                 return {
                   ...x,
-                  last: patch.last,
-                  lastError: patch.lastError,
-                  fills: patch.fills,
-                  posToken: patch.posToken,
-                  avgSol: patch.avgSol,
-                  realized: patch.realized,
-                  unrealized: patch.unrealized,
+                  last: patch.last ?? x.last,
+                  lastError: patch.lastError ?? x.lastError,
+                  fills: patch.fills ?? x.fills,
+                  posToken: patch.posToken ?? x.posToken,
+                  avgSol: patch.avgSol ?? x.avgSol,
+                  realized: patch.realized ?? x.realized,
+                  unrealized: patch.unrealized ?? x.unrealized,
                   solBalance: patch.solBalance ?? x.solBalance,
                   tokenBalance: patch.tokenBalance ?? x.tokenBalance,
                 };
@@ -941,6 +943,8 @@ export const useStore = create<Store>()(
           },
           getAlloc: () => get().getAlloc(),
           getTradeStep: () => get().getTradeStep(),
+          getSafe: () => get().getSafe(),
+          isMigrated: () => get().migrated,
         } as any);
 
         (bot as any).__stop = stop;
@@ -1476,6 +1480,8 @@ export const useStore = create<Store>()(
         minSliceGapMs: 250,
         maxSliceGapMs: 1200,
       }),
+
+      migrated: false, // Pump.fun migrated to Raydium
     }),
     {
       name: "meme-bundler:v1",
@@ -1495,12 +1501,14 @@ export const useStore = create<Store>()(
         if (typeof p.allocTarget !== 'number') p.allocTarget = 0.70;
         if (typeof p.allocMin !== 'number') p.allocMin = 0.60;
         if (typeof p.allocMax !== 'number') p.allocMax = 0.85;
+        if (typeof p.migrated !== 'boolean') p.migrated = false;
         return p;
       },
       storage: createJSONStorage(() => localStorage),
       partialize: (s) => ({
         tokenUrl: s.tokenUrl,
         tokenMint: s.tokenMint,
+        migrated: s.migrated,
         bots: s.bots,
         slippageBps: s.slippageBps,
         useRandomSize: s.useRandomSize,
