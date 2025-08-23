@@ -636,7 +636,7 @@ export const useStore = create<Store>()(
           });
         } else {
           try { (get() as any)._ppSub?.detach?.(); } catch {}
-          set({ _ppSub: undefined });
+          set({ _ppSub: undefined, external: { ...get().external, provider: "pumpportal" } });
         }
       },
 
@@ -879,12 +879,7 @@ export const useStore = create<Store>()(
         bot.running = true;
         set({ bots: [...s.bots] });
 
-        const runnerLoader =
-          get().external.provider === "pumpportal"
-            ? () => import("./live/runner_pump").then((m) => m.runBot)
-            : () => import("./live/runner").then((m) => m.runBot);
-
-        const run = await runnerLoader();
+        const run = await import("./live/runner_pump").then((m) => m.runBot);
 
         const stop = run(connection, bot, {
           mint: s.tokenMint!,
