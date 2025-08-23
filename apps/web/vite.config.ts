@@ -15,6 +15,11 @@ const hmrHost = gpUrl ? `${port}-${gpUrl.hostname}` : undefined;
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    sourcemap: true,
+    minify: 'terser',
+    terserOptions: { keep_classnames: true, keep_fnames: true },
+  },
   server: {
     host: true,           // слушать 0.0.0.0, чтобы Gitpod мог проксировать
     port,                 // фиксируем порт
