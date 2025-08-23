@@ -1461,19 +1461,19 @@ export const useStore = create<Store>()(
 
       // Риск-настройки (пока без UI; при желании вынесем в контролы)
       getRisk: () => ({
-        maxImpact: 0.03,
-        maxDrawdown: 0.15,
-        reserveSol: 0.0030,
-        maxNotionalPerMin: 0.0030,
-        maxBuysPerMin: 2,
-        maxSellsPerMin: 6,
-        lossThrPct: 0.004,
-        lossWindowMs: 30000,
-        lossCooldownMs: 60000,
-        maxBuySliceSol: 0.0008,
-        maxSellSliceTokPct: 0.06,
-        minSliceGapMs: 250,
-        maxSliceGapMs: 1200,
+        maxImpact: 0.01,
+        maxDrawdown: 0.10,
+        reserveSol: 0.0100,
+        maxNotionalPerMin: 0.0000,
+        maxBuysPerMin: 0,
+        maxSellsPerMin: 8,
+        lossThrPct: 0.003,
+        lossWindowMs: 60000,
+        lossCooldownMs: 120000,
+        maxBuySliceSol: 0.0003,
+        maxSellSliceTokPct: 0.05,
+        minSliceGapMs: 300,
+        maxSliceGapMs: 1500,
       }),
 
       migrated: false, // Pump.fun migrated to Raydium
@@ -1532,3 +1532,12 @@ export const useStore = create<Store>()(
     }
   )
 );
+
+// Safe defaults
+export const getSafe = () => ({
+  requireMigration: true,
+  maxRoundtripLoss: 0.005,
+  windowMs: 30 * 60 * 1000,
+  maxSpendSolPerWindow: 0.002,
+  blockBuyOnProtect: true,
+});
