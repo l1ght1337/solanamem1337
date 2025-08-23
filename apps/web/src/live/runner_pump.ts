@@ -413,13 +413,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       for (let si = 0; si < slices; si++) {
         let pl = payload as any;
         if (side === 'buy') {
-          const pay = Math.min(maxBuyPerSlice, remainingSol);
-          if (pay <= 0.000049) break;
-          pl = { ...payload, amount: +pay.toFixed(6) };
-          remainingSol = Math.max(0, +(remainingSol - pay).toFixed(6));
+          const sliceSol = Math.min(maxBuyPerSlice, remainingSol);
+          if (sliceSol <= 0.000049) break;
+          pl = { ...payload, amount: +sliceSol.toFixed(6) };
+          remainingSol = Math.max(0, +(remainingSol - sliceSol).toFixed(6));
         } else {
-          const perTok = maxSellPerSlice > 0 ? Math.min(maxSellPerSlice, remainingTok) : remainingTok / Math.max(1, (slices - si));
-          const qty = roundTok(Math.max(0, perTok), decimals);
+          const sliceTok = maxSellPerSlice > 0 ? Math.min(maxSellPerSlice, remainingTok) : remainingTok / Math.max(1, (slices - si));
+          const qty = roundTok(Math.max(0, sliceTok), decimals);
           if (qty <= 0) break;
           pl = { ...payload, amount: qty };
           remainingTok = Math.max(0, remainingTok - qty);
@@ -506,9 +506,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       await trade("buy", totalSol);
       return;
     }
-    const per = Math.max(0, totalSol / plan.slices);
+    const chunkSol = Math.max(0, totalSol / plan.slices);
     for (let i = 0; i < plan.slices; i++) {
-      await trade("buy", per);
+      await trade("buy", chunkSol);
       if (i < plan.slices - 1) await sleep(Math.max(300, plan.gapMs));
     }
   }
