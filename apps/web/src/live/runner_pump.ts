@@ -300,24 +300,30 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     try {
       // Защита от сверхплохих котировок: Jupiter sanity check
       if (side === 'buy') {
-        const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
+        const probeSol = Math.max(0.00005, Math.min(sizeSol || pickStep(), 0.001));
+        const pay = Math.round(probeSol * 1e9);
         try {
-          const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
+          const quoteData = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
           const fairOut = (pay / 1e9) / priceNow; // в токенах
-          const out = Number(q.outAmount || 0) / Math.pow(10, decimals);
-          if (fairOut > 0 && out < fairOut * (1 - MAX_SINGLE_TRADE_IMPACT)) {
+          const out = Number((quoteData as any).outAmount || 0) / Math.pow(10, decimals);
+          ctx.onLog('info', `[${bot.name}] jup sanity BUY pay=${(pay/1e9).toFixed(6)} out=${out.toFixed(6)} fair=${fairOut.toFixed(6)}`);
+          const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, MAX_SINGLE_TRADE_IMPACT);
+          if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
             warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
             return;
           }
         } catch {}
       } else {
         const qty = amountTok ?? bot.posToken;
-        const raw = Math.round(qty * Math.pow(10, decimals));
+        const posRaw = Math.max(1, Math.round(qty * Math.pow(10, decimals)));
+        const raw = Math.max(1, Math.min(posRaw, Math.round(posRaw * 0.02)));
         try {
-          const q = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
-          const fairOutSol = qty * priceNow;
-          const outSol = Number(q.outAmount || 0) / 1e9;
-          if (fairOutSol > 0 && outSol < fairOutSol * (1 - MAX_SINGLE_TRADE_IMPACT)) {
+          const quoteData = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
+          const fairOutSol = (raw / Math.pow(10, decimals)) * priceNow;
+          const outSol = Number((quoteData as any).outAmount || 0) / 1e9;
+          ctx.onLog('info', `[${bot.name}] jup sanity SELL qtyTok=${qty.toFixed(6)} outSol=${outSol.toFixed(6)} fair=${fairOutSol.toFixed(6)}`);
+          const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, MAX_SINGLE_TRADE_IMPACT);
+          if (fairOutSol > 0 && outSol < fairOutSol * (1 - maxImpact)) {
             warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
             return;
           }
