@@ -251,6 +251,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     if (now - lastWarnTs > 2000) { lastWarnTs = now; log("warn", s); }
   };
 
+  function pushUpdate(p: Partial<LiveBot>) {
+    ctx.onUpdate({ id: bot.id, ...p } as any);
+  }
+
   const alloc = (priceNow: number) => {
     const tokVal = bot.posToken * priceNow;
     const total = Math.max(1e-9, tokVal + bot.solBalance);
@@ -275,7 +279,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
       bot.solBalance = sol;
       bot.tokenBalance = tok;
-      ctx.onUpdate(bot);
+      pushUpdate({ solBalance: sol, tokenBalance: tok });
     } catch { /* soft */ }
   }
 
@@ -450,7 +454,17 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               .slippageBps()
               .toFixed(0)}bps`;
 
-      ctx.onUpdate(bot);
+      pushUpdate({
+        last: bot.last,
+        fills: bot.fills,
+        posToken: bot.posToken,
+        avgSol: bot.avgSol,
+        realized: bot.realized,
+        unrealized: bot.unrealized,
+        solBalance: bot.solBalance,
+        tokenBalance: bot.tokenBalance,
+        lastError: undefined,
+      });
       log("ok", `${side.toUpperCase()} executed`);
 
       // force on-chain refresh for this bot
@@ -463,7 +477,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       nextRetryAt = Date.now() + cool;
 
       bot.lastError = e?.message || String(e);
-      ctx.onUpdate(bot);
+      pushUpdate({ lastError: bot.lastError });
       warnDebounced(`net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
     }
   }
@@ -525,7 +539,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       if (ctx.isAiPaused && ctx.isAiPaused()) {
         bot.last = "ai:off";
-        ctx.onUpdate(bot);
+        pushUpdate({ last: bot.last });
         pending = false;
         const jitter = 200 + Math.floor(Math.random() * 300);
         return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
@@ -741,11 +755,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
         bot.last = "hold";
         bot.unrealized = bot.posToken * (p - (bot.avgSol || p));
-        ctx.onUpdate(bot);
+        pushUpdate({ last: bot.last, unrealized: bot.unrealized, fills: bot.fills });
       }
     } catch (e: any) {
       bot.lastError = e?.message || String(e);
-      ctx.onUpdate(bot);
+      pushUpdate({ lastError: bot.lastError });
       warnDebounced(String(e?.message || e));
     } finally {
       pending = false;
