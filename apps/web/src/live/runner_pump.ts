@@ -400,11 +400,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     }
   }
 
+  let lastLightRefresh = 0;
+
   // desync start a bit across bots
   setTimeout(loop, 100 + Math.floor(Math.random() * 500));
   return () => { stopped = true; };
-
-  let lastLightRefresh = 0;
 
   async function loop() {
     if (stopped || !bot.running) return;
