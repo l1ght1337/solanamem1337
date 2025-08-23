@@ -292,6 +292,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     sizeSol: number,
     opts?: { sellTokens?: number }
   ) {
+    let phase = "init";
     const capsLocal = capsForStrategy(bot.strategy as InternalStrategy);
     // Риск-профиль из стора (без UI)
     let risk = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
@@ -373,6 +374,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     try {
       // Защита от сверхплохих котировок: Jupiter sanity check
       if (side === 'buy') {
+        phase = 'jupQuoteBuy';
         const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
         try {
           const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
@@ -385,6 +387,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           }
         } catch {}
       } else {
+        phase = 'jupQuoteSell';
         const qty = amountTok ?? bot.posToken;
         const raw = Math.round(qty * Math.pow(10, decimals));
         try {
@@ -400,6 +403,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
+      phase = 'sliceExec';
       let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
       let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
       const maxBuyPerSlice = Math.max(0.00005, Math.min((risk.maxBuySliceSol || 0.0018), capsLocal.buySlice));
@@ -424,6 +428,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           pl = { ...payload, amount: qty };
           remainingTok = Math.max(0, remainingTok - qty);
         }
+        phase = 'sendTx';
         const vtx = await buildTradeTxPumpPortal(pl);
         vtx.sign([kp]);
         const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
@@ -494,7 +499,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const cool = Math.min(20000, 1000 * failStreak); // 1s → 20s
       nextRetryAt = Date.now() + cool;
 
-      bot.lastError = e?.message || String(e);
+      const msg = e?.message || String(e);
+      const st = e?.stack ? String(e.stack).split('\n')[0] : '';
+      bot.lastError = `phase=${phase} ${msg}${st ? ' ['+st+']' : ''}`;
       pushUpdate({ lastError: bot.lastError });
       warnDebounced(`net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
     }
