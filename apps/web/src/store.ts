@@ -1464,8 +1464,8 @@ export const useStore = create<Store>()(
         maxImpact: 0.01,
         maxDrawdown: 0.10,
         reserveSol: 0.0100,
-        maxNotionalPerMin: 0.0000,
-        maxBuysPerMin: 0,
+        maxNotionalPerMin: 0.0005,
+        maxBuysPerMin: 1,
         maxSellsPerMin: 8,
         lossThrPct: 0.003,
         lossWindowMs: 60000,
@@ -1535,7 +1535,7 @@ export const useStore = create<Store>()(
 
 // Safe defaults
 export const getSafe = () => ({
-  requireMigration: true,
+  requireMigration: false,
   maxRoundtripLoss: 0.005,
   windowMs: 30 * 60 * 1000,
   maxSpendSolPerWindow: 0.002,
