@@ -276,7 +276,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
   async function refreshOnChainBalances() {
     try {
-      const kp = ctx.keypair();
+      var kp = ctx.keypair();
       const lam = await connection.getBalance(kp.publicKey, "processed");
       const sol = lam / LAMPORTS_PER_SOL;
       const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
@@ -317,9 +317,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     };
 
     try {
-      const kp = ctx.keypair();
-      const decimals = ctx.tokenDecimals();
-      const priceNow = Math.max(1e-12, ctx.price());
+      var kp = ctx.keypair();
+      var decimals = ctx.tokenDecimals();
+      var priceNow = Math.max(1e-12, ctx.price());
       const nowTs = Date.now();
       const amountTok = side === "sell" && opts?.sellTokens ? roundTok(opts.sellTokens, decimals) : undefined;
 
