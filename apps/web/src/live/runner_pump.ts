@@ -500,8 +500,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       nextRetryAt = Date.now() + cool;
 
       const msg = e?.message || String(e);
-      const st = e?.stack ? String(e.stack).split('\n')[0] : '';
-      bot.lastError = `phase=${phase} ${msg}${st ? ' ['+st+']' : ''}`;
+      bot.lastError = msg;
       pushUpdate({ lastError: bot.lastError });
       warnDebounced(`net fail (${failStreak}) — ${bot.lastError}; retry in ${Math.round(cool / 1000)}s`);
     }
@@ -821,9 +820,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         pushUpdate({ last: bot.last, unrealized: bot.unrealized, fills: bot.fills });
       }
     } catch (e: any) {
-      bot.lastError = `loop:${loopStage} ${e?.message || String(e)}`;
+      bot.lastError = e?.message || String(e);
       pushUpdate({ lastError: bot.lastError });
-      warnDebounced(String(e?.message || e));
+      warnDebounced(bot.lastError);
     } finally {
       pending = false;
       const jitter = 200 + Math.floor(Math.random() * 300);
