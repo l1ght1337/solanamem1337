@@ -225,6 +225,25 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let lastBuyTs = 0;
   let lastSellTs = 0;
   let trailHighPrice = 0;
+  let deferredSell: { dueAt: number; amountTok: number } | null = null;
+
+  function scheduleSell(amountTok: number, minMs: number, maxMs: number) {
+    const now = Date.now();
+    const delay = Math.max(0, minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs)));
+    deferredSell = { dueAt: now + delay, amountTok: Math.max(0, amountTok) };
+  }
+
+  function capsForStrategy(strat: InternalStrategy) {
+    switch (strat) {
+      case "trend":    return { buySlice: 0.0015, sellPct: 0.10, stepMulMin: 1.0, stepMulMax: 1.0 };
+      case "revert":   return { buySlice: 0.0012, sellPct: 0.14, stepMulMin: 0.8, stepMulMax: 0.9 };
+      case "scalper":  return { buySlice: 0.0009, sellPct: 0.08, stepMulMin: 0.5, stepMulMax: 0.6 };
+      case "momentum": return { buySlice: 0.0018, sellPct: 0.12, stepMulMin: 1.1, stepMulMax: 1.3 };
+      case "range":    return { buySlice: 0.0010, sellPct: 0.10, stepMulMin: 0.7, stepMulMax: 0.9 };
+      case "maker":    return { buySlice: 0.0006, sellPct: 0.06, stepMulMin: 0.4, stepMulMax: 0.5 };
+      default:          return { buySlice: 0.0012, sellPct: 0.10, stepMulMin: 1.0, stepMulMax: 1.0 } as any;
+    }
+  }
 
   const log = (lvl: "info" | "ok" | "warn" | "err", s: string) => ctx.onLog(lvl, `[${bot.name}] ${s}`);
   const warnDebounced = (s: string) => {
@@ -362,8 +381,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
       let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
       let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
-      const maxBuyPerSlice = Math.max(0.00005, (risk.maxBuySliceSol || 0.0018));
-      const maxSellPct = Math.min(0.5, Math.max(0.02, risk.maxSellSliceTokPct || 0.12));
+      const maxBuyPerSlice = Math.max(0.00005, Math.min((risk.maxBuySliceSol || 0.0018), caps.buySlice));
+      const maxSellPct = Math.min(0.5, Math.max(0.02, Math.min((risk.maxSellSliceTokPct || 0.12), caps.sellPct)));
       const maxSellPerSlice = side === 'sell' ? roundTok((bot.posToken || 0) * maxSellPct, decimals) : 0;
       let slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
       if (side === 'sell' && maxSellPerSlice > 0) {
@@ -483,6 +502,19 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       return;
     }
 
+    // Исполнить отложенную небольшую продажу (для разнообразия паттернов)
+    if (deferredSell && now >= deferredSell.dueAt && bot.posToken > 0) {
+      pending = true;
+      try {
+        const qty = Math.min(bot.posToken * 0.2, Math.max(0, deferredSell.amountTok));
+        if (qty > 0) await trade("sell", 0, { sellTokens: qty });
+      } catch {}
+      deferredSell = null;
+      pending = false;
+      const jitter = 200 + Math.floor(Math.random() * 300);
+      return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+    }
+
     pending = true;
     try {
       // periodic light on-chain refresh (keeps UI in sync even without trades)
@@ -515,9 +547,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // Обновляем trailing high для momentum/общего стопа
       if (bot.posToken > 0) trailHighPrice = Math.max(trailHighPrice || p, p); else trailHighPrice = 0;
 
-      // Считываем шаг исполнения
+      // Считываем шаг исполнения и модифицируем под стратегию
       let step = { minSol: 0.0003, maxSol: 0.003, slicesMax: 3, jitterPct: 0.18 };
       try { const s = (ctx as any).getTradeStep?.(); if (s) step = s; } catch {}
+      const caps = capsForStrategy(bot.strategy as InternalStrategy);
+      step.minSol = +(step.minSol * caps.stepMulMin).toFixed(6);
+      step.maxSol = +(step.maxSol * caps.stepMulMax).toFixed(6);
       const pickStep = () => {
         const base = step.minSol + Math.random() * Math.max(0, step.maxSol - step.minSol);
         const jitter = 1 + (Math.random()*2 - 1) * Math.min(0.5, Math.max(0, step.jitterPct));
@@ -602,6 +637,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             );
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
+          } else if (buysInRow > 0 && bot.posToken > 0) {
+            // После покупок запланируем лёгкую продажу для "пилы"
+            const planned = roundTok(Math.max(bot.posToken * 0.04, bot.posToken * 0.03 + Math.random() * bot.posToken * 0.03), ctx.tokenDecimals());
+            if (!deferredSell && planned > 0) scheduleSell(planned, 1600, 3400);
           }
           break;
         }
@@ -674,10 +713,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const size = Math.min(pickStep() * 0.6, baseSize);
             if (Math.random() < 0.6) { await twapBuy(size); did = true; break; }
           }
-          if (bot.posToken > 0 && (allocTok > TARGET_ALLOC || protect || Math.random() < 0.25)) {
+          if (bot.posToken > 0 && (allocTok > TARGET_ALLOC || protect || Math.random() < 0.35)) {
             const part = roundTok(Math.max(bot.posToken * 0.07, (bot.posToken * Math.random() * 0.1)), ctx.tokenDecimals());
             await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
             did = true;
+          } else if (!did && bot.posToken > 0 && !deferredSell) {
+            const planned = roundTok(Math.max(bot.posToken * 0.03, bot.posToken * 0.02 + Math.random() * bot.posToken * 0.03), ctx.tokenDecimals());
+            scheduleSell(planned, 1200, 2600);
           }
           break;
         }
