@@ -315,63 +315,62 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const jitter = 1 + (Math.random()*2 - 1) * Math.min(0.5, Math.max(0, stepCfg.jitterPct));
       return Math.max(0.00005, +(base * jitter).toFixed(6));
     };
-    const kp = ctx.keypair();
-    const decimals = ctx.tokenDecimals();
-    const priceNow = Math.max(1e-12, ctx.price());
-
-    const amountTok =
-      side === "sell" && opts?.sellTokens ? roundTok(opts.sellTokens, decimals) : undefined;
-
-    if (side === "buy" && sizeSol <= 0) return;
-    if (side === "sell" && (amountTok ?? bot.posToken) <= 0) return;
-
-    // Минутные лимиты и cooldown на потери
-    const nowTs = Date.now();
-    if (nowTs - minWindowStart >= 60_000) { minWindowStart = nowTs; buysThisMin = 0; sellsThisMin = 0; notionalThisMin = 0; }
-    if (side === 'buy') {
-      if (nowTs < lossCooldownUntil) return; // охлаждение после неудачных докупок
-      if (buysThisMin >= risk.maxBuysPerMin) return;
-      if (notionalThisMin + sizeSol > risk.maxNotionalPerMin) return;
-    } else {
-      if (sellsThisMin >= risk.maxSellsPerMin) return;
-    }
-
-    // Safe-mode: запрет покупок до миграции (если включено)
-    const safe = ctx.getSafe?.();
-    if (side === 'buy' && safe?.requireMigration && !(ctx.isMigrated?.() ?? false)) {
-      warnDebounced('safe: block buy before migration');
-      return;
-    }
-    // Safe-mode: окно и лимит суммарных покупок
-    if (side === 'buy' && safe) {
-      if (nowTs - windowSpendStart >= (safe.windowMs || 900000)) { windowSpendStart = nowTs; spendInWindow = 0; }
-      if (spendInWindow + sizeSol > (safe.maxSpendSolPerWindow || 0.01)) return;
-    }
-
-    const plBase =
-      side === "buy"
-        ? {
-            publicKey: kp.publicKey.toBase58(),
-            action: "buy",
-            mint: ctx.mint,
-            denominatedInSol: "true",
-            amount: sizeSol,
-            slippage: (ctx.slippageBps() || 50) / 100,
-            priorityFee: 0.00001,
-            pool: "auto",
-          }
-        : {
-            publicKey: kp.publicKey.toBase58(),
-            action: "sell",
-            mint: ctx.mint,
-            denominatedInSol: "false",
-            amount: amountTok ?? roundTok(bot.posToken, decimals),
-            slippage: (ctx.slippageBps() || 50) / 100,
-            priorityFee: 0.00001,
-            pool: "auto",
-          };
 
     try {
+      const kp = ctx.keypair();
+      const decimals = ctx.tokenDecimals();
+      const priceNow = Math.max(1e-12, ctx.price());
+      const nowTs = Date.now();
+      const amountTok = side === "sell" && opts?.sellTokens ? roundTok(opts.sellTokens, decimals) : undefined;
+
+      if (side === "buy" && sizeSol <= 0) return;
+      if (side === "sell" && (amountTok ?? bot.posToken) <= 0) return;
+
+      // Минутные лимиты и cooldown на потери
+      if (nowTs - minWindowStart >= 60_000) { minWindowStart = nowTs; buysThisMin = 0; sellsThisMin = 0; notionalThisMin = 0; }
+      if (side === 'buy') {
+        if (nowTs < lossCooldownUntil) return; // охлаждение после неудачных докупок
+        if (buysThisMin >= risk.maxBuysPerMin) return;
+        if (notionalThisMin + sizeSol > risk.maxNotionalPerMin) return;
+      } else {
+        if (sellsThisMin >= risk.maxSellsPerMin) return;
+      }
+
+      // Safe-mode: запрет покупок до миграции (если включено)
+      const safe = ctx.getSafe?.();
+      if (side === 'buy' && safe?.requireMigration && !(ctx.isMigrated?.() ?? false)) {
+        warnDebounced('safe: block buy before migration');
+        return;
+      }
+      // Safe-mode: окно и лимит суммарных покупок
+      if (side === 'buy' && safe) {
+        if (nowTs - windowSpendStart >= (safe.windowMs || 900000)) { windowSpendStart = nowTs; spendInWindow = 0; }
+        if (spendInWindow + sizeSol > (safe.maxSpendSolPerWindow || 0.01)) return;
+      }
+
+      const plBase =
+        side === "buy"
+          ? {
+              publicKey: kp.publicKey.toBase58(),
+              action: "buy",
+              mint: ctx.mint,
+              denominatedInSol: "true",
+              amount: sizeSol,
+              slippage: (ctx.slippageBps() || 50) / 100,
+              priorityFee: 0.00001,
+              pool: "auto",
+            }
+          : {
+              publicKey: kp.publicKey.toBase58(),
+              action: "sell",
+              mint: ctx.mint,
+              denominatedInSol: "false",
+              amount: amountTok ?? roundTok(bot.posToken, decimals),
+              slippage: (ctx.slippageBps() || 50) / 100,
+              priorityFee: 0.00001,
+              pool: "auto",
+            };
+
       // Защита от сверхплохих котировок: Jupiter sanity check
       if (side === 'buy') {
         phase = 'jupQuoteBuy';
