@@ -1540,4 +1540,5 @@ export const getSafe = () => ({
   windowMs: 30 * 60 * 1000,
   maxSpendSolPerWindow: 0.002,
   blockBuyOnProtect: true,
+  disableJupiterSanity: true,
 });
