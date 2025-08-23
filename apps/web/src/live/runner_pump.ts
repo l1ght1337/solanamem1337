@@ -337,14 +337,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       // Safe-mode: запрет покупок до миграции (если включено)
-      const safe = ctx.getSafe?.();
+      const safe = (typeof (ctx as any).getSafe === 'function') ? (ctx as any).getSafe() : {} as any;
       ctx.onLog('info', `[${bot.name}] trade start side=${side} size=${sizeSol.toFixed(6)} safe.sanity=${!(safe?.disableJupiterSanity)}`);
       if (side === 'buy' && safe?.requireMigration && !(ctx.isMigrated?.() ?? false)) {
         warnDebounced('safe: block buy before migration');
         return;
       }
       // Safe-mode: окно и лимит суммарных покупок
-      if (side === 'buy' && safe) {
+      if (side === 'buy' && safe && typeof safe === 'object') {
         if (nowTs - windowSpendStart >= (safe.windowMs || 900000)) { windowSpendStart = nowTs; spendInWindow = 0; }
         if (spendInWindow + sizeSol > (safe.maxSpendSolPerWindow || 0.01)) return;
       }
@@ -373,7 +373,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             };
 
       // Защита от сверхплохих котировок: Jupiter sanity check
-      if (!(safe?.disableJupiterSanity)) {
+      if (!(safe && (safe as any).disableJupiterSanity)) {
         if (side === 'buy') {
           phase = 'jupQuoteBuy';
           const pay = Math.round(Math.max(0.00005, sizeSol || pickSolStep()) * 1e9);
