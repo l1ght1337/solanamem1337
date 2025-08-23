@@ -443,7 +443,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       // optimistic local portfolio update
       if (side === "buy") {
-        const qty = (sizeSol || totalSol) / priceNow;
+        const qty = sizeSol / priceNow;
         const newPos = bot.posToken + qty;
         bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + sizeSol) / newPos : priceNow;
         bot.posToken = newPos;
