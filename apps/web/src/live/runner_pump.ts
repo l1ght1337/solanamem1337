@@ -376,9 +376,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         phase = 'jupQuoteBuy';
         const pay = Math.round(Math.max(0.00005, sizeSol || pickSolStep()) * 1e9);
         try {
-          const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
+          const quoteData = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
           const fairOut = (pay / 1e9) / priceNow; // в токенах
-          const out = Number(q.outAmount || 0) / Math.pow(10, decimals);
+          const out = Number((quoteData as any).outAmount || 0) / Math.pow(10, decimals);
           const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
           if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
             warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
@@ -390,9 +390,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const qty = amountTok ?? bot.posToken;
         const raw = Math.round(qty * Math.pow(10, decimals));
         try {
-          const q = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
+          const quoteData = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: raw });
           const fairOutSol = qty * priceNow;
-          const outSol = Number(q.outAmount || 0) / 1e9;
+          const outSol = Number((quoteData as any).outAmount || 0) / 1e9;
           const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
           if (fairOutSol > 0 && outSol < fairOutSol * (1 - maxImpact)) {
             warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
