@@ -360,28 +360,36 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
-      const totalSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
-      const sellQtyTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
-      const slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
+      let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
+      let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
+      const maxBuyPerSlice = Math.max(0.00005, (risk.maxBuySliceSol || 0.0018));
+      const maxSellPct = Math.min(0.5, Math.max(0.02, risk.maxSellSliceTokPct || 0.12));
+      const maxSellPerSlice = side === 'sell' ? roundTok((bot.posToken || 0) * maxSellPct, decimals) : 0;
+      let slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
+      if (side === 'sell' && maxSellPerSlice > 0) {
+        const need = Math.ceil(remainingTok / Math.max(1e-12, maxSellPerSlice));
+        slices = Math.min(step.slicesMax, Math.max(slices, need));
+      }
       for (let si = 0; si < slices; si++) {
-        const isLast = si === slices - 1;
         let pl = payload as any;
         if (side === 'buy') {
-          const per = Math.min(Math.max(0.00005, totalSol / slices), (risk.maxBuySliceSol || 0.0018));
-          const pay = isLast ? Math.max(0.00005, +(totalSol - per * (slices - 1)).toFixed(6)) : per;
-          pl = { ...payload, amount: pay };
+          const pay = Math.min(maxBuyPerSlice, remainingSol);
+          if (pay <= 0.000049) break;
+          pl = { ...payload, amount: +pay.toFixed(6) };
+          remainingSol = Math.max(0, +(remainingSol - pay).toFixed(6));
         } else {
-          const maxPct = Math.min(0.5, Math.max(0.02, risk.maxSellSliceTokPct || 0.12));
-          const perTok = Math.min(Math.max(0, sellQtyTok / slices), bot.posToken * maxPct);
-          const qty = isLast ? Math.max(0, roundTok(sellQtyTok - perTok * (slices - 1), decimals)) : roundTok(perTok, decimals);
+          const perTok = maxSellPerSlice > 0 ? Math.min(maxSellPerSlice, remainingTok) : remainingTok / Math.max(1, (slices - si));
+          const qty = roundTok(Math.max(0, perTok), decimals);
+          if (qty <= 0) break;
           pl = { ...payload, amount: qty };
+          remainingTok = Math.max(0, remainingTok - qty);
         }
         const vtx = await buildTradeTxPumpPortal(pl);
         vtx.sign([kp]);
         const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
         await connection.confirmTransaction(sig, "confirmed");
         // лёгкий джиттер между под-ордеров
-        if (si < slices-1) {
+        if (si < slices-1 && (side === 'buy' ? remainingSol > 0 : remainingTok > 0)) {
           const gmin = Math.max(120, (risk.minSliceGapMs || 200));
           const gmax = Math.max(gmin+50, (risk.maxSliceGapMs || 850));
           const gap = gmin + Math.floor(Math.random() * (gmax - gmin));
@@ -676,11 +684,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       if (!did) {
-        // универсальное бритьё позиции: после 2+ покупок подряд или просто по таймеру
+        // универсальное бритьё позиции: после 2+ покупок подряд или по таймеру — без рандома
         if (bot.posToken > 0) {
           const sinceSell = Date.now() - (lastSellTs || 0);
-          if (buysInRow >= 2 || (sinceSell > Math.max(8000, bot.speedMs * 2) && Math.random() < 0.2)) {
-            const shave = roundTok(Math.max(bot.posToken * 0.05, bot.posToken * Math.random() * 0.06), ctx.tokenDecimals());
+          if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
+            const shave = roundTok(Math.max(bot.posToken * 0.05, bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04), ctx.tokenDecimals());
             if (shave > 0) {
               await trade("sell", 0, { sellTokens: shave });
               pending = false;
