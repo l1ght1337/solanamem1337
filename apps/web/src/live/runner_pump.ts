@@ -58,7 +58,7 @@ type RunCtx = {
 /* ─────────────────────── Net bases & utilities ─────────────────────── */
 // prefer your backend → custom pump API → public pump portal
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
-const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "";
+const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pumpportal.fun"].filter(Boolean);
 
 // === очередь с ограничением конкурентности (глобально на вкладку)
