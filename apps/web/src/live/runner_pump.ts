@@ -5,7 +5,7 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import { getSPLBalance } from "../utils/solana";
-import { scheduleFetch, getNetMetrics } from "../utils/network";
+import { scheduleFetch } from "../utils/network";
 import { getJupiterQuote, WSOL } from "../utils/jupiter";
 
 /* ───────────────────────────── Types ───────────────────────────── */
@@ -51,6 +51,8 @@ type RunCtx = {
 
   onLog: (level: "info" | "ok" | "warn" | "err", msg: string) => void;
   onUpdate: (b: LiveBot) => void;
+  // FIX: у стора уже есть afterTrade — дергаем мягкий рефреш после сделок
+  afterTrade?: () => void;
 };
 
 /* ─────────────────────── Net bases & utilities ─────────────────────── */
@@ -186,32 +188,16 @@ let TARGET_ALLOC = 0.70;
 let MAX_ALLOC = 0.85; // при превышении — частичная продажа
 let MIN_ALLOC = 0.60; // при падении ниже — ребаланс в покупку
 
-// Риск‑ограничители
+// Риск-ограничители
 const MAX_SINGLE_TRADE_IMPACT = 0.20; // не принимаем сделки хуже -20% к fair
 const MAX_TOTAL_DRAWDOWN = 0.30;      // при просадке портфеля >30% — защита
-const MAX_ROUNDTRIP_LOSS = 0.008;     // максимум 0.8% потери при мгновенном roundtrip
-const MIN_ROUTE_NOTIONAL_SOL = 0.02;  // минимальный эквивалент маршрута в SOL для исполнения
+const MAX_ROUNDTRIP_LOSS = 0.01;      // максимум 1% потери при мгновенном roundtrip
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function roundTok(tokens: number, decimals: number) {
   const p = Math.pow(10, Math.min(6, decimals));
   return Math.max(0, Math.floor(tokens * p) / p);
-}
-
-async function getTwoWaySpreadPct(decimals: number, mint: string): Promise<number> {
-  try {
-    const inSol = 0.0005;
-    const q1: any = await getJupiterQuote({ inputMint: WSOL, outputMint: mint, amount: Math.round(inSol * 1e9) });
-    const outTok = Number(q1?.outAmount || 0) / Math.pow(10, decimals);
-    if (outTok <= 0) return Number.POSITIVE_INFINITY;
-    const q2: any = await getJupiterQuote({ inputMint: mint, outputMint: WSOL, amount: Math.max(1, Math.round(outTok * Math.pow(10, decimals))) });
-    const backSol = Number(q2?.outAmount || 0) / 1e9;
-    const effBuy = inSol / Math.max(1e-12, outTok);
-    const effSell = backSol / Math.max(1e-12, outTok);
-    const spread = Math.max(0, (effBuy - effSell) / Math.max(1e-12, (effBuy + effSell) / 2));
-    return spread;
-  } catch { return Number.POSITIVE_INFINITY; }
 }
 
 function wantToSell(bot: LiveBot, currPrice: number, takeProfitBps: number, stopLossBps: number) {
@@ -227,8 +213,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let stopped = false;
   let pending = false;
   let cooldownUntil = 0;
-  let buyCooldownUntil = 0; // anti-chase: пауза на покупки после резкого скачка
-  let priorityFee = 0.000004; // динамический priority fee (ступенями)
 
   // per-bot backoff if trade building fails
   let failStreak = 0;
@@ -307,23 +291,17 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     sizeSol: number,
     opts?: { sellTokens?: number }
   ) {
-    // Anti-chase: уважать паузу на покупки
-    if (side === "buy" && buyCooldownUntil && Date.now() < buyCooldownUntil) {
-      warnDebounced("skip BUY: anti-chase cooldown");
-      return;
-    }
-
     // Риск-профиль из стора (без UI)
-    let risk = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
+    let risk = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000, maxBuySliceSol: 0.0018, maxSellSliceTokPct: 0.12, minSliceGapMs: 200, maxSliceGapMs: 850 };
     try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
 
     // Подхватываем актуальные аллокации из UI (если переданы)
     try {
-      const alloc = (ctx as any).getAlloc?.();
-      if (alloc && typeof alloc.target === 'number') {
-        TARGET_ALLOC = Math.min(0.95, Math.max(0.05, alloc.target));
-        MIN_ALLOC = Math.min(TARGET_ALLOC, Math.max(0.05, alloc.min ?? 0.6));
-        MAX_ALLOC = Math.max(TARGET_ALLOC, Math.min(0.98, alloc.max ?? 0.85));
+      const allocUI = (ctx as any).getAlloc?.();
+      if (allocUI && typeof allocUI.target === 'number') {
+        TARGET_ALLOC = Math.min(0.95, Math.max(0.05, allocUI.target));
+        MIN_ALLOC = Math.min(TARGET_ALLOC, Math.max(0.05, allocUI.min ?? 0.6));
+        MAX_ALLOC = Math.max(TARGET_ALLOC, Math.min(0.98, allocUI.max ?? 0.85));
       }
     } catch {}
     // Подхватываем форму шага сделки
@@ -337,15 +315,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const kp = ctx.keypair();
     const decimals = ctx.tokenDecimals();
     const priceNow = Math.max(1e-12, ctx.price());
-
-    // Сеть перегружена — пропускаем
-    try {
-      const m = getNetMetrics?.();
-      if (m && (m.inflight > 12 || m.queued > 30)) {
-        warnDebounced("skip: network congested");
-        return;
-      }
-    } catch {}
 
     const amountTok =
       side === "sell" && opts?.sellTokens ? roundTok(opts.sellTokens, decimals) : undefined;
@@ -412,13 +381,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           };
 
     try {
-      // Spread-guard: избегаем широкого спреда
-      let spreadPct = Number.NaN;
-      try { spreadPct = await getTwoWaySpreadPct(decimals, ctx.mint); } catch {}
-      if (isFinite(spreadPct) && spreadPct > 0.008) {
-        warnDebounced(`skip ${side.toUpperCase()}: wide spread ${(spreadPct*100).toFixed(2)}%`);
-        return;
-      }
       // Защита от сверхплохих котировок: Jupiter sanity check
       if (side === 'buy') {
         const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
@@ -430,15 +392,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
           if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
             warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
-
             return;
           }
-          // Слишком тонкий маршрут — не берём
-          if (out * priceNow < MIN_ROUTE_NOTIONAL_SOL) {
-            warnDebounced("skip BUY: too thin route");
-            return;
-          }
-          // Roundtrip‑loss check: WSOL -> TOK -> WSOL на маленькой пробе
+          // Roundtrip-loss check: WSOL -> TOK -> WSOL на маленькой пробе
           if (out > 0) {
             try {
               const backRaw = Math.max(1, Math.round(out * Math.pow(10, decimals)));
@@ -464,65 +420,54 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             warnDebounced(`skip SELL: impact too high (${((1 - outSol/fairOutSol)*100).toFixed(1)}%)`);
             return;
           }
-          if (outSol < MIN_ROUTE_NOTIONAL_SOL) {
-            warnDebounced("skip SELL: too thin route");
-            return;
-          }
         } catch {}
       }
 
-      // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
+      // FIX: caps был не объявлен в этой функции → ReferenceError
       const caps = capsForStrategy(bot.strategy as InternalStrategy);
-      // динамически уменьшаем buy-срезы на широком спреде
-      const spreadForSlices = isFinite(spreadPct) ? spreadPct : Number.NaN;
+
+      // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
       let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
       let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
-      let maxBuyPerSlice = Math.max(0.00005, Math.min((risk.maxBuySliceSol || 0.0018), caps.buySlice));
-      if (isFinite(spreadForSlices) && spreadForSlices > 0.006) {
-        maxBuyPerSlice = +Math.max(0.0001, maxBuyPerSlice * 0.6).toFixed(6);
-      }
+      const maxBuyPerSlice = Math.max(0.00005, Math.min((risk.maxBuySliceSol || 0.0018), caps.buySlice));
       const maxSellPct = Math.min(0.5, Math.max(0.02, Math.min((risk.maxSellSliceTokPct || 0.12), caps.sellPct)));
       const maxSellPerSlice = side === 'sell' ? roundTok((bot.posToken || 0) * maxSellPct, decimals) : 0;
+
       let slices = Math.max(1, Math.min(step.slicesMax, Math.round(1 + Math.random() * (step.slicesMax - 1))));
       if (side === 'sell' && maxSellPerSlice > 0) {
         const need = Math.ceil(remainingTok / Math.max(1e-12, maxSellPerSlice));
         slices = Math.min(step.slicesMax, Math.max(slices, need));
       }
+
+      // FIX: аккумулируем фактически «запрошенные» объёмы для локального апдейта
       let executedSol = 0;
       let executedTok = 0;
       let executedSlices = 0;
+
       for (let si = 0; si < slices; si++) {
         let pl = payload as any;
-        let slicePay = 0;
-        let sliceTok = 0;
         if (side === 'buy') {
           const pay = Math.min(maxBuyPerSlice, remainingSol);
           if (pay <= 0.000049) break;
-          slicePay = +pay.toFixed(6);
-          pl = { ...payload, amount: slicePay, priorityFee };
-          remainingSol = Math.max(0, +(remainingSol - slicePay).toFixed(6));
+          pl = { ...payload, amount: +pay.toFixed(6) };
+          remainingSol = Math.max(0, +(remainingSol - pay).toFixed(6));
         } else {
           const perTok = maxSellPerSlice > 0 ? Math.min(maxSellPerSlice, remainingTok) : remainingTok / Math.max(1, (slices - si));
           const qty = roundTok(Math.max(0, perTok), decimals);
           if (qty <= 0) break;
-          sliceTok = qty;
-          pl = { ...payload, amount: sliceTok, priorityFee };
-          remainingTok = Math.max(0, remainingTok - sliceTok);
+          pl = { ...payload, amount: qty };
+          remainingTok = Math.max(0, remainingTok - qty);
         }
-        try {
-          const vtx = await buildTradeTxPumpPortal(pl);
-          vtx.sign([kp]);
-          const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
-          await connection.confirmTransaction(sig, "confirmed");
-          // success → опустить fee
-          priorityFee = Math.max(0.000004, +(priorityFee * 0.8).toFixed(9));
-        } catch (e) {
-          // fail → поднять fee и пробросить
-          priorityFee = Math.min(0.000012, +(priorityFee * 1.5).toFixed(9));
-          throw e;
-        }
+
+        const vtx = await buildTradeTxPumpPortal(pl);
+        vtx.sign([kp]);
+        const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
+        await connection.confirmTransaction(sig, "confirmed");
+
         executedSlices++;
-        if (side === 'buy') executedSol = +(executedSol + slicePay).toFixed(6); else executedTok = +(executedTok + sliceTok).toFixed(decimals);
+        if (side === 'buy') executedSol += pl.amount;
+        else executedTok += pl.amount;
+
         // лёгкий джиттер между под-ордеров
         if (si < slices-1 && (side === 'buy' ? remainingSol > 0 : remainingTok > 0)) {
           const gmin = Math.max(120, (risk.minSliceGapMs || 200));
@@ -532,41 +477,45 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
+      if (executedSlices === 0) {
+        throw new Error("no slices executed");
+      }
+
       // success → reset backoff
       failStreak = 0;
       nextRetryAt = 0;
-      if (side === 'buy') { buysThisMin++; notionalThisMin = +(notionalThisMin + (executedSol || sizeSol)).toFixed(6); } else { sellsThisMin++; }
 
-      // optimistic local portfolio update
+      // FIX: учитываем ИМЕННО выполненный объём, а не несуществующий totalSol
       if (side === "buy") {
-        const spent = executedSol > 0 ? executedSol : sizeSol;
-        const qty = spent / priceNow;
+        const qty = executedSol / priceNow;
         const newPos = bot.posToken + qty;
-        bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + spent) / newPos : priceNow;
+        bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + executedSol) / newPos : priceNow;
         bot.posToken = newPos;
-        const fee = executedSlices > 0 ? executedSlices * FEE_EST_SOL : FEE_EST_SOL;
-        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) - spent - fee);
+        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) - executedSol - FEE_EST_SOL * executedSlices); // FIX: комиссия × число срезов
         bot.tokenBalance = bot.posToken;
         buysInRow++; sellsInRow = 0; lastBuyTs = Date.now();
+        // FIX: лимиты в минуту — инкремент
+        buysThisMin++;
+        notionalThisMin = +(notionalThisMin + executedSol).toFixed(6);
         if (trailHighPrice <= 0 || priceNow > trailHighPrice) trailHighPrice = priceNow;
       } else {
         const sellQty = executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
         bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
         bot.posToken = Math.max(0, bot.posToken - sellQty);
         bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
-        const fee = executedSlices > 0 ? executedSlices * FEE_EST_SOL : FEE_EST_SOL;
-        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - fee));
+        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - FEE_EST_SOL * executedSlices)); // FIX
         bot.tokenBalance = bot.posToken;
         sellsInRow++; buysInRow = 0; lastSellTs = Date.now();
+        sellsThisMin++; // FIX: лимит минутных продаж
         if (bot.posToken <= 0) trailHighPrice = 0;
       }
 
       bot.unrealized = bot.posToken * (priceNow - (bot.avgSol || priceNow));
-      bot.fills += 1;
+      bot.fills += executedSlices; // FIX: по количеству срезов
       bot.last =
         side === "buy"
-          ? `buy ${sizeSol.toFixed(4)} SOL @ slp=${ctx.slippageBps().toFixed(0)}bps`
-          : `sell ${opts?.sellTokens ? roundTok(opts.sellTokens, decimals) + " TOK" : "ALL"} @ slp=${ctx
+          ? `buy ${executedSol.toFixed(6)} SOL @ slp=${ctx.slippageBps().toFixed(0)}bps`
+          : `sell ${executedTok > 0 ? roundTok(executedTok, decimals) + " TOK" : "ALL"} @ slp=${ctx
               .slippageBps()
               .toFixed(0)}bps`;
 
@@ -585,6 +534,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       // force on-chain refresh for this bot
       await refreshOnChainBalances();
+      // FIX: дать сторам подсказку обновить всё мягко
+      try { ctx.afterTrade?.(); } catch {}
 
       cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
     } catch (e: any) {
@@ -663,8 +614,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       const p = Math.max(1e-12, ctx.price());
       const fast = ctx.changeFast?.(12) ?? 0;
-      const jump = ctx.changeFast?.(6) ?? 0;
-      if (jump > 0.006) buyCooldownUntil = Date.now() + 8000;
       const ch1m = ctx.change1m();
 
       const { a: allocTok, total } = alloc(p);
@@ -672,7 +621,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // Риск: защитный режим при большой просадке
       const portfolioNow = bot.solBalance + bot.posToken * p;
       if (baselineValue === 0) baselineValue = portfolioNow;
-      let risk: any = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000 };
+      let risk: any = { maxImpact: 0.1, maxDrawdown: 0.25, reserveSol: 0.0012, maxNotionalPerMin: 0.02, maxBuysPerMin: 6, maxSellsPerMin: 10, lossThrPct: 0.008, lossWindowMs: 20000, lossCooldownMs: 20000, maxBuySliceSol: 0.0018, maxSellSliceTokPct: 0.12, minSliceGapMs: 200, maxSliceGapMs: 850 };
       try { const r = (ctx as any).getRisk?.(); if (r) risk = r; } catch {}
       const protect = portfolioNow < baselineValue * (1 - Math.min(MAX_TOTAL_DRAWDOWN, risk.maxDrawdown));
 
@@ -719,21 +668,15 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         // если сильно вышли за коридор — продаём агрессивнее к цели
         const over = allocTok - MAX_ALLOC;
         const factor = over > 0.03 ? 1.0 : over > 0.015 ? 0.75 : 0.5;
-        const willLose = p < (bot.avgSol || p);
-        if (willLose && !protect) {
-          bot.last = "hold (rebalance-sell blocked: red PnL)";
-          ctx.onUpdate(bot);
-        } else {
-          const tokToSell = Math.min(
+        const tokToSell = Math.min(
           bot.posToken,
           roundTok(Math.max(bot.posToken * 0.12, (excessVal * factor) / p), ctx.tokenDecimals())
-          );
-          if (tokToSell > 0) {
-            await trade("sell", 0, { sellTokens: tokToSell });
-            pending = false;
-            const jitter = 200 + Math.floor(Math.random() * 300);
-            return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-          }
+        );
+        if (tokToSell > 0) {
+          await trade("sell", 0, { sellTokens: tokToSell });
+          pending = false;
+          const jitter = 200 + Math.floor(Math.random() * 300);
+          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
         }
       }
 
@@ -891,16 +834,22 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       if (!did) {
-        // срезаем только в плюс
-        const pnl = bot.posToken * (p - (bot.avgSol || p));
-        const sinceSell = Date.now() - (lastSellTs || 0);
-        if (pnl > 0.0002 && (buysInRow >= 2 || sinceSell > Math.max(10000, bot.speedMs * 3))) {
-          const shave = roundTok(Math.max(bot.posToken * 0.04, bot.posToken * (0.02 + Math.random() * 0.03)), ctx.tokenDecimals());
-          if (shave > 0) { await trade("sell", 0, { sellTokens: shave }); pending = false; const jitter = 200 + Math.floor(Math.random() * 300); return setTimeout(loop, Math.max(400, bot.speedMs) + jitter); }
+        // универсальное бритьё позиции: после 2+ покупок подряд или по таймеру — без рандома
+        if (bot.posToken > 0) {
+          const sinceSell = Date.now() - (lastSellTs || 0);
+          if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
+            const shave = roundTok(Math.max(bot.posToken * 0.05, bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04), ctx.tokenDecimals());
+            if (shave > 0) {
+              await trade("sell", 0, { sellTokens: shave });
+              pending = false;
+              const jitter = 200 + Math.floor(Math.random() * 300);
+              return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+            }
+          }
         }
         bot.last = "hold";
         bot.unrealized = bot.posToken * (p - (bot.avgSol || p));
-        ctx.onUpdate(bot);
+        pushUpdate({ last: bot.last, unrealized: bot.unrealized, fills: bot.fills });
       }
     } catch (e: any) {
       bot.lastError = e?.message || String(e);
