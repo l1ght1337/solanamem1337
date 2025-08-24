@@ -423,6 +423,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
       // Разбиваем сделки на под-ордера и для продаж тоже, чтобы избежать больших единичных продаж
+      const caps = capsForStrategy(bot.strategy as InternalStrategy);
       let remainingSol = side === 'buy' ? (sizeSol || pickStep()) : 0;
       let remainingTok = side === 'sell' ? (amountTok ?? bot.posToken) : 0;
       const maxBuyPerSlice = Math.max(0.00005, Math.min((risk.maxBuySliceSol || 0.0018), caps.buySlice));
@@ -433,24 +434,33 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const need = Math.ceil(remainingTok / Math.max(1e-12, maxSellPerSlice));
         slices = Math.min(step.slicesMax, Math.max(slices, need));
       }
+      let executedSol = 0;
+      let executedTok = 0;
+      let executedSlices = 0;
       for (let si = 0; si < slices; si++) {
         let pl = payload as any;
+        let slicePay = 0;
+        let sliceTok = 0;
         if (side === 'buy') {
           const pay = Math.min(maxBuyPerSlice, remainingSol);
           if (pay <= 0.000049) break;
-          pl = { ...payload, amount: +pay.toFixed(6) };
-          remainingSol = Math.max(0, +(remainingSol - pay).toFixed(6));
+          slicePay = +pay.toFixed(6);
+          pl = { ...payload, amount: slicePay };
+          remainingSol = Math.max(0, +(remainingSol - slicePay).toFixed(6));
         } else {
           const perTok = maxSellPerSlice > 0 ? Math.min(maxSellPerSlice, remainingTok) : remainingTok / Math.max(1, (slices - si));
           const qty = roundTok(Math.max(0, perTok), decimals);
           if (qty <= 0) break;
-          pl = { ...payload, amount: qty };
-          remainingTok = Math.max(0, remainingTok - qty);
+          sliceTok = qty;
+          pl = { ...payload, amount: sliceTok };
+          remainingTok = Math.max(0, remainingTok - sliceTok);
         }
         const vtx = await buildTradeTxPumpPortal(pl);
         vtx.sign([kp]);
         const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
         await connection.confirmTransaction(sig, "confirmed");
+        executedSlices++;
+        if (side === 'buy') executedSol = +(executedSol + slicePay).toFixed(6); else executedTok = +(executedTok + sliceTok).toFixed(decimals);
         // лёгкий джиттер между под-ордеров
         if (si < slices-1 && (side === 'buy' ? remainingSol > 0 : remainingTok > 0)) {
           const gmin = Math.max(120, (risk.minSliceGapMs || 200));
@@ -463,23 +473,27 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       // success → reset backoff
       failStreak = 0;
       nextRetryAt = 0;
+      if (side === 'buy') { buysThisMin++; notionalThisMin = +(notionalThisMin + (executedSol || sizeSol)).toFixed(6); } else { sellsThisMin++; }
 
       // optimistic local portfolio update
       if (side === "buy") {
-        const qty = (sizeSol || totalSol) / priceNow;
+        const spent = executedSol > 0 ? executedSol : sizeSol;
+        const qty = spent / priceNow;
         const newPos = bot.posToken + qty;
-        bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + sizeSol) / newPos : priceNow;
+        bot.avgSol = newPos > 0 ? (bot.avgSol * bot.posToken + spent) / newPos : priceNow;
         bot.posToken = newPos;
-        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) - sizeSol - FEE_EST_SOL);
+        const fee = executedSlices > 0 ? executedSlices * FEE_EST_SOL : FEE_EST_SOL;
+        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) - spent - fee);
         bot.tokenBalance = bot.posToken;
         buysInRow++; sellsInRow = 0; lastBuyTs = Date.now();
         if (trailHighPrice <= 0 || priceNow > trailHighPrice) trailHighPrice = priceNow;
       } else {
-        const sellQty = amountTok ?? bot.posToken;
+        const sellQty = executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
         bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
         bot.posToken = Math.max(0, bot.posToken - sellQty);
         bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
-        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - FEE_EST_SOL));
+        const fee = executedSlices > 0 ? executedSlices * FEE_EST_SOL : FEE_EST_SOL;
+        bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - fee));
         bot.tokenBalance = bot.posToken;
         sellsInRow++; buysInRow = 0; lastSellTs = Date.now();
         if (bot.posToken <= 0) trailHighPrice = 0;
