@@ -1,3 +1,4 @@
+// apps/web/src/store.ts
 import "./polyfills";
 import { confirmSigHttp } from "./utils/confirm";
 import { create } from "zustand";
@@ -15,14 +16,14 @@ import {
 import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
+  createTransferCheckedInstruction,
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
 import { fetchExternalPrice } from "./store-price-feeds";
 import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./utils/keyring";
 import { getMintDecimals, getSPLBalance } from "./utils/solana";
-import { scheduleFetch } from "./utils/network";
-import { getJupiterQuote, WSOL } from "./utils/jupiter";
+import { scheduleFetch, getNetMetrics } from "./utils/network";
 
 export type BotStrategy = "trend" | "revert" | "scalper" | "momentum" | "range" | "maker";
 
@@ -86,7 +87,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   }
 
   const baseInit: RequestInit = {
-    keepalive: false,
+    keepalive: false, // меньше висящих соединений
     credentials: "omit",
     cache: "no-store",
     mode: "cors",
@@ -103,8 +104,11 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
       const backoff = attempt === 0 ? 0 : 300 * attempt + Math.floor(Math.random() * 250);
       if (backoff) await new Promise((res) => setTimeout(res, backoff));
       try {
+        // планировщик ограничивает глобальную конкуренцию и rps
         const r = await scheduleFetch(url, { ...(baseInit as any), timeoutMs: 15_000, tries: 1 }, "pump");
+
         if (r.ok) { stickyBaseIdx = idx; return r; }
+
         if (r.status === 429 || r.status >= 500) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
           continue;
@@ -127,12 +131,14 @@ export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
   return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
 }
 
-/* ⛑ ГЛОБАЛЬНЫЙ АНТИ-CORS ПАТЧ ДЛЯ JUPITER */
+/* ⛑ ГЛОБАЛЬНЫЙ АНТИ-CORS ПАТЧ ДЛЯ JUPITER
+   Любой прямой fetch на https://quote-api.jup.ag/* или https://price.jup.ag/*
+   автоматически уходит через наш прокси (JUP_BASE) и много-прокси обёртку. */
 (() => {
   const origFetch = globalThis.fetch?.bind(globalThis);
   if (!origFetch) return;
   const JUP_FORCE_PROXY = String(((import.meta as any).env?.VITE_JUP_FORCE_PROXY ?? '0')).trim() === '1';
-  if (!JUP_FORCE_PROXY) return; // по умолчанию не перехватываем
+  if (!JUP_FORCE_PROXY) return; // по умолчанию не перехватываем: используем прямой CORS у Jupiter
   const needsProxy = (u: string) =>
     /^https:\/\/(quote-api|price)\.jup\.ag\//.test(u);
   globalThis.fetch = ((input: any, init?: RequestInit) => {
@@ -140,8 +146,11 @@ export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
     if (typeof url === "string" && needsProxy(url)) {
       try {
         const u = new URL(url);
+        // Превращаем https://quote-api.jup.ag/v6/quote?... -> {base}/jup/v6/quote?...
         return fetchFirstOk(`${JUP_BASE}${u.pathname}${u.search}`, init, 1);
-      } catch {}
+      } catch {
+        // если вдруг не распарсили — падаем обратно на обычный fetch
+      }
     }
     return origFetch(input as any, init);
   }) as any;
@@ -175,7 +184,7 @@ async function buildTradeTxPumpLocal(body: any): Promise<VersionedTransaction> {
     const j = await res.json().catch(() => ({} as any));
     const b64 = j?.serializedTransaction ?? j?.tx ?? j?.transaction ?? j?.vtx;
     if (!b64) throw new Error("trade fallback: no serializedTransaction");
-    const raw = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const raw = Uint8Array.from(atob(String(b64)), (c) => c.charCodeAt(0));
     return VersionedTransaction.deserialize(raw);
   }
 }
@@ -273,6 +282,7 @@ async function detectTokenProgram(connection: Connection, mint: PublicKey) {
     const info = await connection.getAccountInfo(mint);
     return info?.owner?.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
   } catch {
+    // Fail-safe: если RPC дал странный ответ — используем классический TOKEN_PROGRAM_ID
     return TOKEN_PROGRAM_ID;
   }
 }
@@ -298,8 +308,9 @@ async function ensureWalletAta(connection: Connection, walletPubkey: string, min
   const mintPk = new PublicKey(mint);
   const walletPk = new PublicKey(walletPubkey);
 
+  // Попробуем оба варианта программ, чтобы не падать при сбое detect
   const programGuess = await detectTokenProgram(connection, mintPk);
-  const candidates = [programGuess, programGuess === TOKEN_2022_PROGRAM_ID ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID];
+  const candidates = [programGuess, programGuess === TOKEN_2022_PROGRAM_ID ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID];
 
   for (const programId of candidates) {
     const ata = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
@@ -309,6 +320,7 @@ async function ensureWalletAta(connection: Connection, walletPubkey: string, min
     } catch {}
   }
 
+  // Создадим с предполагаемой программой, при ошибке попробуем второй
   for (const programId of candidates) {
     try {
       const ata = await getAssociatedTokenAddress(mintPk, walletPk, false, programId);
@@ -319,7 +331,9 @@ async function ensureWalletAta(connection: Connection, walletPubkey: string, min
       const { signature } = await ph.signAndSendTransaction(tx);
       await confirmSigHttp(connection, signature);
       return ata;
-    } catch {}
+    } catch (e) {
+      // попробуем следующий programId
+    }
   }
   throw new Error("ensureWalletAta: failed to create ATA for wallet");
 }
@@ -342,7 +356,8 @@ async function sendTransferWithRetry(
       await confirmSigHttp(connection, sig);
       return sig;
     } catch (e: any) {
-      lastErr = e?.message || String(e);
+      const m = e?.message || String(e);
+      lastErr = m;
       await new Promise((r) => setTimeout(r, 300));
     }
   }
@@ -365,15 +380,15 @@ const safeBps = (bps: any, fallback = 50) =>
 
 const sanitizeSmartMM = (mm?: Partial<SmartMM>): SmartMM => {
   const m: any = mm || {};
-  const min = Math.max(1, toNum(m.minBps, 15));
-  const max = Math.max(min, toNum(m.maxBps, 120));
+  const min = Math.max(1, toNum(m.minBps, 20));
+  const max = Math.max(min, toNum(m.maxBps, 200));
   return {
     enabled: !!m.enabled,
     minBps: min,
     maxBps: max,
-    alpha: Math.min(0.99, Math.max(0.01, toNum(m.alpha, 0.65))),
-    twapSec: Math.max(0, Math.floor(toNum(m.twapSec, 150))),
-    twapSlices: Math.max(1, Math.floor(toNum(m.twapSlices, 5))),
+    alpha: Math.min(0.99, Math.max(0.01, toNum(m.alpha, 0.6))),
+    twapSec: Math.max(0, Math.floor(toNum(m.twapSec, 120))),
+    twapSlices: Math.max(1, Math.floor(toNum(m.twapSlices, 4))),
   };
 };
 
@@ -473,7 +488,7 @@ export type Store = {
   setAlloc: (t: number, min: number, max: number) => void;
   getAlloc: () => { target: number; min: number; max: number };
 
-  // Размер шага сделки и форма исполнения
+  // Размер шага сделки и форма исполнения (уменьшили шаги для снижения импакта)
   tradeStepMinSol: number;
   tradeStepMaxSol: number;
   tradeSlicesMax: number;
@@ -481,21 +496,21 @@ export type Store = {
   setTradeStep: (minSol: number, maxSol: number, slicesMax: number, jitterPct: number) => void;
   getTradeStep: () => { minSol: number; maxSol: number; slicesMax: number; jitterPct: number };
 
-  // Риск-настройки
+  // Риск-настройки (пока без UI; при желании вынесем в контролы)
   getRisk: () => {
-    maxImpact: number;
-    maxDrawdown: number;
-    reserveSol: number;
-    maxNotionalPerMin: number;
-    maxBuysPerMin: number;
-    maxSellsPerMin: number;
-    lossThrPct: number;
-    lossWindowMs: number;
-    lossCooldownMs: number;
-    maxBuySliceSol: number;
-    maxSellSliceTokPct: number;
-    minSliceGapMs: number;
-    maxSliceGapMs: number;
+    maxImpact: number;          // максимум допустимой оценочной просадки котировки (0.0..1.0)
+    maxDrawdown: number;        // защита портфеля (0.0..1.0)
+    reserveSol: number;         // резерв SOL, ниже которого не покупаем
+    maxNotionalPerMin: number;  // лимит закупок SOL в минуту на бота
+    maxBuysPerMin: number;      // максимум покупок/мин
+    maxSellsPerMin: number;     // максимум продаж/мин
+    lossThrPct: number;         // падение после покупки, считаем как «неудачную» (например 0.8%)
+    lossWindowMs: number;       // окно наблюдения для неудачной покупки
+    lossCooldownMs: number;     // пауза покупок после серии неудачных
+    maxBuySliceSol: number;     // максимум SOL на один buy-срез
+    maxSellSliceTokPct: number; // максимум процента позиции на один sell-срез
+    minSliceGapMs: number;      // минимальная пауза между срезами
+    maxSliceGapMs: number;      // максимальная пауза между срезами
   };
 };
 
@@ -540,8 +555,7 @@ export const useStore = create<Store>()(
         return Math.max(0.000001, +val.toFixed(6));
       },
 
-      // ↓ более консервативные дефолты smartMM
-      smartMM: { enabled: true, minBps: 15, maxBps: 120, alpha: 0.65, twapSec: 150, twapSlices: 5 },
+      smartMM: { enabled: true, minBps: 20, maxBps: 200, alpha: 0.6, twapSec: 120, twapSlices: 4 },
 
       getSmartBps() {
         const s = get();
@@ -922,11 +936,11 @@ export const useStore = create<Store>()(
 
           // после сделки мягкий refresh (SOL + токен) для всех ботов
           afterTrade: () => {
+            // Быстрый рефреш спустя небольшую задержку — улучшает UX
             setTimeout(() => { get().refreshBalances(connection).catch(() => {}); }, 800);
           },
           getAlloc: () => get().getAlloc(),
           getTradeStep: () => get().getTradeStep(),
-          getRisk: () => get().getRisk(),
         } as any);
 
         (bot as any).__stop = stop;
@@ -946,6 +960,7 @@ export const useStore = create<Store>()(
       // ===== Балансы + авто-донат =====
       async refreshBalances(connection) {
         try {
+          // простая защита от наложений
           if ((get() as any)._rbBusy) return;
           (get() as any)._rbBusy = true;
           const s = get();
@@ -996,313 +1011,478 @@ export const useStore = create<Store>()(
             }
           }
 
-          const readU64LE = (buf: Uint8Array, off: number): number => {
-            let x = 0n;
-            for (let i = 0; i < 8; i++) x += BigInt(buf[off + i] ?? 0) << (8n * BigInt(i));
-            const max = Number.MAX_SAFE_INTEGER;
-            const asNum = Number(x);
-            return asNum > max ? max : asNum;
-          };
-
           const decodeAmount = (acc: import("@solana/web3.js").AccountInfo<Buffer> | null): number => {
-            if (!acc || decimals == null) return 0;
+            if (!acc) return 0;
             const data = acc.data as unknown as Uint8Array;
             if (!data || data.byteLength < 72) return 0;
-            const raw = readU64LE(data, 64);
-            return raw / Math.pow(10, decimals);
+            const view = new DataView(data.buffer, data.byteOffset + 64, 8);
+            const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+            const full = (BigInt(hi) << 32n) + BigInt(lo);
+            return Number(full);
           };
 
-          const updates: Partial<LiveBot & { id: string }>[] = [];
-          for (let i = 0; i < botsList.length; i++) {
-            const b = botsList[i];
-            const solLam = solInfos[i]?.lamports ?? 0;
-            let sol = solLam / LAMPORTS_PER_SOL;
-
+          const updated = botsList.map((b, idx) => {
+            const acc = solInfos[idx];
+            const sol = acc ? (acc.lamports || 0) / LAMPORTS_PER_SOL : b.solBalance;
             let tok = b.tokenBalance;
-            if (mint && decimals != null) {
-              const infoClassic = ataClassic[i] ? ataInfos.get(ataClassic[i].toBase58()) ?? null : null;
-              const info2022 = ata2022[i] ? ataInfos.get(ata2022[i].toBase58()) ?? null : null;
-              const t1 = decodeAmount(infoClassic);
-              const t2 = decodeAmount(info2022);
-              const decoded = Math.max(t1, t2);
-              if (decoded > 0 || (infoClassic || info2022)) tok = decoded;
-              else {
-                // fallback на медленный способ, если не нашли ATA
+            if (mint && decimals != null && ataClassic.length) {
+              const aClassic = ataClassic[idx]?.toBase58();
+              const a22 = ata2022[idx]?.toBase58();
+              const hasClassic = !!(aClassic && ataInfos.has(aClassic));
+              const has22 = !!(a22 && ataInfos.has(a22));
+              const accClassic = hasClassic ? (ataInfos.get(aClassic!) || null) : null;
+              const acc22 = has22 ? (ataInfos.get(a22!) || null) : null;
+              if (hasClassic || has22) {
+                const rawC = decodeAmount(accClassic);
+                const raw22 = decodeAmount(acc22);
+                const rawSum = (rawC || 0) + (raw22 || 0);
+                tok = rawSum / Math.pow(10, decimals);
+              }
+            }
+            const unreal = b.posToken * (priceNow - (b.avgSol || priceNow));
+            return { ...b, solBalance: sol, tokenBalance: tok, unrealized: unreal };
+          });
+
+          // Fallback для тех, у кого токенBalance остался 0, но posToken > 0: точечный getSPLBalance
+          if (mint && decimals != null) {
+            for (let i = 0; i < updated.length; i++) {
+              const b = updated[i];
+              if (b.posToken > 0 && b.tokenBalance <= 0) {
                 try {
                   const raw = await getSPLBalance(connection, b.pubkey, mint);
-                  tok = Number(raw) / Math.pow(10, decimals);
+                  const tok = Number(raw) / Math.pow(10, decimals);
+                  if (tok > 0) updated[i] = { ...b, tokenBalance: tok };
                 } catch {}
               }
             }
-
-            // posToken — это "позиция" у раннера. Тут не трогаем, только балансы.
-            const unrealized = (b.posToken || tok) * (priceNow - (b.avgSol || priceNow));
-            updates.push({ id: b.id, solBalance: sol, tokenBalance: tok, unrealized });
           }
 
-          set((st) => ({
-            bots: st.bots.map((x) => {
-              const u = updates.find((p) => p.id === x.id);
-              if (!u) return x;
-              return { ...x, solBalance: u.solBalance ?? x.solBalance, tokenBalance: u.tokenBalance ?? x.tokenBalance, unrealized: u.unrealized ?? x.unrealized };
-            }),
-          }));
+          set({ bots: updated });
 
-          // авто-донат, если включен (не чаще раза в минуту на бота)
-          if (s.autoTopUp && s.treasuryKeyId) {
-            const lastMap = s._lastTopUp || {};
-            for (const b of get().bots) {
-              if (b.solBalance < s.minFeeSol) {
-                const last = lastMap[b.id] || 0;
-                if (Date.now() - last > 60_000) {
-                  try { await get().topUpBot(connection, b.id); } catch {}
-                  (lastMap as any)[b.id] = Date.now();
+          // авто-донат
+          const { autoTopUp, minFeeSol, topUpBot } = get();
+          if (autoTopUp) {
+            const nowTs = Date.now();
+            const last = get()._lastTopUp || {};
+            for (const b of updated) {
+              if (b.solBalance < minFeeSol) {
+                if (!last[b.id] || nowTs - last[b.id] > 30_000) {
+                  try { await topUpBot(connection, b.id); } catch {}
+                  last[b.id] = Date.now();
                 }
               }
             }
-            set({ _lastTopUp: lastMap });
+            set({ _lastTopUp: last });
           }
-        } catch (e: any) {
-          get().addLog("warn", `refreshBalances: ${e?.message || e}`);
+        } catch (e) {
+          get().addLog("warn", `refreshBalances: ${e?.message || String(e)}`);
         } finally {
           (get() as any)._rbBusy = false;
         }
       },
 
+      // Прайс/свечи + тики
       async tickReal() {
-        try {
-          const s = get();
-          if (s.external.provider === "pumpportal") return; // стрим уже обновляет
-          if (!s.tokenUrl && !s.tokenMint) return;
-
-          const price = await fetchExternalPrice(s.external, s.tokenUrl, s.tokenMint || undefined);
-          if (Number.isFinite(price) && price > 0) {
-            set((st) => {
-              const tnow = Date.now();
-              const ticks = (st.ticks || []).concat({ t: tnow, p: price });
-              const cut = tnow - 60_000;
-              return { price, ticks: ticks.filter((x) => x.t > cut) };
-            });
+        const s = get();
+        if (!s.tokenMint) return;
+        if (s.external.provider === "pumpportal") {
+          // даже при WS‑цене иногда подёргиваем балансы
+          const now = Date.now();
+          if (!((s as any)._lastLightRefresh)) (s as any)._lastLightRefresh = 0;
+          if (now - (s as any)._lastLightRefresh > 8000) {
+            (s as any)._lastLightRefresh = now;
+            try { await get().refreshBalances((window as any).__conn || ({} as any)); } catch {}
           }
-        } catch (e: any) {
-          get().addLog("warn", `tickReal: ${e?.message || e}`);
+          return;
         }
+
+        const tryOnce = async (prov: any) => {
+          try {
+            return await fetchExternalPrice({ ...prov, endpoint: prov.endpoint, apiKey: prov.apiKey }, s.tokenMint!);
+          } catch { return null; }
+        };
+
+        const candidates = [
+          s.external,
+          { provider: "dexscreener", endpoint: "https://api.dexscreener.com" },
+          { provider: "jupiter", endpoint: "https://price.jup.ag" },
+          { provider: "solanatracker", endpoint: "https://api.solanatracker.io" },
+        ];
+
+        let p: number | null = null;
+        for (const c of candidates) {
+          p = await tryOnce(c);
+          if (p && isFinite(p) && p > 0) break;
+        }
+        if (!p) return;
+
+        set((st) => {
+          const t = Date.now();
+          const m = Math.floor(t / 60000) * 60000;
+          const last = (st.candles as any).at?.(-1);
+          let c = st.candles.slice();
+          if (!last || last.t !== m) c.push({ t: m, open: p!, high: p!, low: p!, close: p!, volume: 0 });
+          else { last.high = Math.max(last.high, p!); last.low = Math.min(last.low, p!); last.close = p!; }
+          if (c.length > 1000) c = c.slice(-1000);
+
+          const now = Date.now();
+          const ticks = (st.ticks || []).concat({ t: now, p: p! });
+          const cut = now - 60_000;
+
+          const bots = st.bots.map((b) => ({ ...b, unrealized: b.posToken * (p! - (b.avgSol || p!)) }));
+          return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
+        });
       },
 
+      // === Pump: создать токен и автопокупка ===
       async createPumpToken(connection, creatorPubkey, params) {
         try {
-          const { name, symbol, image, description, website, twitter, initialBuySol = 0 } = params;
-          const slippagePct = 10;
+          const slippagePct = safeBps(get().getSmartBps(), 50) / 100;
           const { mint, signature } = await buildCreateViaLightning({
-            name, symbol, image, description, website, twitter, initialBuySol, slippagePct, priorityFeeSol: 0.00001,
+            name: params.name, symbol: params.symbol, image: params.image,
+            description: params.description, website: params.website, twitter: params.twitter,
+            initialBuySol: params.initialBuySol || 0,
+            slippagePct, priorityFeeSol: 0.00001,
           });
-          set({ tokenMint: mint, tokenUrl: `https://pump.fun/${mint}`, _mintDecimals: undefined });
-          get().addLog("ok", `Создан токен ${symbol} (${name}) mint=${mint}${signature ? ` (${signature.slice(0,8)}…)` : ""}`);
 
-          try { await ensureWalletAta(connection, creatorPubkey, mint); } catch {}
+          get().addLog("ok", `Token created (Lightning): ${mint}${signature ? ` (${signature.slice(0, 8)}…)` : ""}`);
+          set((s) => ({ ...s, tokenUrl: mint, tokenMint: mint, external: { ...s.external, provider: "pumpportal" } }));
+
+          await get().buyAllBotsOnPump(connection, { keepFeeSol: Math.max(0.002, get().minFeeSol) });
+          await get().refreshBalances(connection);
+          return;
         } catch (e: any) {
-          get().addLog("err", `Create token error: ${e?.message || e}`);
+          get().addLog("warn", `Lightning create failed → fallback to Local: ${e?.message || String(e)}`);
+        }
+
+        try {
+          const body = {
+            publicKey: creatorPubkey,
+            name: params.name,
+            symbol: params.symbol,
+            image: params.image,
+            description: params.description || "",
+            twitter: params.twitter || "",
+            website: params.website || "",
+            decimals: params.decimals ?? 6,
+            createMetadata: true,
+            initialBuySol: params.initialBuySol || 0,
+          };
+          const { tx, mint } = await buildCreateTxPumpLocal(body);
+
+          const ph = (window as any).solana;
+          if (!ph?.signAndSendTransaction) throw new Error("Phantom должен поддерживать signAndSendTransaction (vtx)");
+          const { signature } = await ph.signAndSendTransaction(tx);
+          await confirmSigHttp(connection, signature);
+
+          const tokenMint = mint || get().tokenMint;
+          if (tokenMint) {
+            get().addLog("ok", `Token created (Local): ${tokenMint} (${signature.slice(0, 8)}…)`);
+            set((s) => ({ ...s, tokenUrl: tokenMint, tokenMint: tokenMint, external: { ...s.external, provider: "pumpportal" } }));
+          } else {
+            get().addLog("warn", "Token created, но API не вернул mint — укажи адрес вручную");
+          }
+
+          await get().buyAllBotsOnPump(connection, { keepFeeSol: Math.max(0.002, get().minFeeSol) });
+          await get().refreshBalances(connection);
+        } catch (e: any) {
+          get().addLog("err", `Create token failed: ${e?.message || String(e)}`);
         }
       },
 
-      async buyAllBotsOnPump(connection, opts) {
-        const keep = Math.max(0.0009, opts?.keepFeeSol ?? get().minFeeSol);
-        const slp = safeBps(get().getSmartBps(), 50);
+      async buyAllBotsOnPump(connection, opts = {}) {
+        const keep = Math.max(0.0005, (opts as any).keepFeeSol ?? get().minFeeSol);
         const s = get();
-        if (!s.tokenMint) { s.addLog("warn", "Buy all: mint не задан"); return; }
-
-        for (const b of s.bots) {
+        if (!s.tokenMint) { s.addLog("warn", "Auto-buy: mint не задан"); return; }
+        for (let i = 0; i < s.bots.length; i++) {
+          const b = s.bots[i];
+          const spend = Math.max(0, +(b.solBalance - keep).toFixed(6));
+          if (spend <= 0) { s.addLog("info", `Auto-buy ${b.name}: нечего тратить`); continue; }
           try {
-            const have = Math.max(0, b.solBalance - keep);
-            const step = s.getTradeSize() || b.budgetSol;
-            const pay = Math.min(have, Math.max(0.00005, step));
-            if (pay <= 0) { s.addLog("info", `Buy ${b.name}: недостаточно SOL`); continue; }
-
-            const payload = {
-              publicKey: getKeypair(b.keyId).publicKey.toBase58(),
+            // sanity: impact + roundtrip guard
+            const dec = s._mintDecimals ?? 9;
+            const pay = Math.round(spend * 1e9);
+            const q1: any = await getJupiterQuote({ inputMint: WSOL, outputMint: s.tokenMint!, amount: pay });
+            const outTok = Number(q1?.outAmount || 0) / Math.pow(10, dec);
+            const priceNow = s.price || 0;
+            if (outTok > 0 && priceNow > 0) {
+              const fairOut = spend / priceNow;
+              const impact = Math.max(0, fairOut > 0 ? (1 - outTok / fairOut) : 0);
+              if (impact > 0.015) { s.addLog("warn", `Auto-buy ${b.name}: skip (impact ${(impact*100).toFixed(1)}%)`); continue; }
+              const q2: any = await getJupiterQuote({ inputMint: s.tokenMint!, outputMint: WSOL, amount: Math.max(1, Math.round(outTok * Math.pow(10, dec))) });
+              const backSol = Number(q2?.outAmount || 0) / 1e9;
+              const loss = Math.max(0, 1 - backSol / Math.max(1e-12, spend));
+              if (loss > 0.006) { s.addLog("warn", `Auto-buy ${b.name}: skip (roundtrip ${(loss*100).toFixed(1)}%)`); continue; }
+            }
+            const kp = getKeypair(b.keyId);
+            const vtx = await buildTradeTxPumpLocal({
+              publicKey: kp.publicKey.toBase58(),
               action: "buy",
               mint: s.tokenMint,
               denominatedInSol: "true",
-              amount: +pay.toFixed(6),
-              slippage: slp / 100,
-              priorityFee: 0.00001,
-              pool: "auto",
-            };
-
-            const vtx = await buildTradeTxPumpLocal(payload);
-            const kp = getKeypair(b.keyId);
-            vtx.sign([kp]);
-            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
-            await confirmSigHttp(connection, sig);
-            s.addLog("ok", `BUY ${b.name}: ${pay.toFixed(6)} SOL (${sig.slice(0,8)}…)`);
-          } catch (e: any) {
-            s.addLog("warn", `BUY ${b.name} fail: ${e?.message || e}`);
-          }
-          await new Promise((r) => setTimeout(r, 400 + Math.floor(Math.random()*400)));
-        }
-
-        await get().refreshBalances(connection);
-      },
-
-      async buyAllBotsAtPercentOnPump(connection, percent, opts) {
-        const keep = Math.max(0.0009, opts?.keepFeeSol ?? get().minFeeSol);
-        const slp = safeBps(get().getSmartBps(), 50);
-        const s = get();
-        if (!s.tokenMint) { s.addLog("warn", "Buy %: mint не задан"); return; }
-        const pc = Math.max(0, Math.min(1, percent));
-
-        for (const b of s.bots) {
-          try {
-            const have = Math.max(0, b.solBalance - keep);
-            const pay = +(have * pc).toFixed(6);
-            if (pay <= 0.00005) { s.addLog("info", `Buy% ${b.name}: недостаточно SOL`); continue; }
-
-            const payload = {
-              publicKey: getKeypair(b.keyId).publicKey.toBase58(),
-              action: "buy",
-              mint: s.tokenMint,
-              denominatedInSol: "true",
-              amount: pay,
-              slippage: slp / 100,
-              priorityFee: 0.00001,
-              pool: "auto",
-            };
-
-            const vtx = await buildTradeTxPumpLocal(payload);
-            const kp = getKeypair(b.keyId);
-            vtx.sign([kp]);
-            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
-            await confirmSigHttp(connection, sig);
-            s.addLog("ok", `BUY% ${b.name}: ${pay.toFixed(6)} SOL (${sig.slice(0,8)}…)`);
-          } catch (e: any) {
-            s.addLog("warn", `BUY% ${b.name} fail: ${e?.message || e}`);
-          }
-          await new Promise((r) => setTimeout(r, 350 + Math.floor(Math.random()*450)));
-        }
-
-        await get().refreshBalances(connection);
-      },
-
-      async buyAllBots80OnPump(connection, opts) {
-        return get().buyAllBotsAtPercentOnPump(connection, 0.8, opts);
-      },
-
-      async sellAllToWalletOnPump(connection, walletPubkey, opts) {
-        const s = get();
-        const keep = Math.max(0.0009, opts?.keepFeeSol ?? s.minFeeSol);
-        if (!s.tokenMint) { s.addLog("warn", "Sell all → wallet: mint не задан"); return; }
-
-        try { await ensureWalletAta(connection, walletPubkey, s.tokenMint); } catch {}
-
-        // 1) Продаём все токены у каждого бота
-        for (const b of s.bots) {
-          try {
-            const decimals = s._mintDecimals ?? (await getMintDecimalsFast(connection, new PublicKey(s.tokenMint)) ?? 9);
-            const qtyTok = b.tokenBalance;
-            if (qtyTok <= 0) continue;
-
-            const payload = {
-              publicKey: getKeypair(b.keyId).publicKey.toBase58(),
-              action: "sell",
-              mint: s.tokenMint,
-              denominatedInSol: "false",
-              amount: Number(qtyTok.toFixed(Math.min(6, decimals))),
+              amount: spend,
               slippage: safeBps(get().getSmartBps(), 50) / 100,
               priorityFee: 0.00001,
               pool: "auto",
+            });
+            vtx.sign([kp]);
+            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
+            await confirmSigHttp(connection, sig);
+            s.addLog("ok", `Auto-buy ${b.name}: ${spend.toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
+          } catch (e: any) {
+            s.addLog("warn", `Auto-buy ${s.bots[i].name}: ${e?.message || String(e)}`);
+          }
+          if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
+        }
+      },
+
+      /** ===== Новая: все боты покупают на percent своего SOL ===== */
+      async buyAllBotsAtPercentOnPump(connection, percent, opts = {}) {
+        const keep = Math.max(0.0005, (opts as any).keepFeeSol ?? get().minFeeSol);
+        const pct = Math.min(1, Math.max(0, Number(percent) || 0));
+        const s = get();
+        if (!s.tokenMint) { s.addLog("warn", "Buy%: mint не задан"); return; }
+
+        for (let i = 0; i < s.bots.length; i++) {
+          const b = s.bots[i];
+          const base = Math.max(0, b.solBalance - keep);
+          const spend = Math.max(0, +(base * pct).toFixed(6));
+          if (spend <= 0) { s.addLog("info", `Buy% ${b.name}: нечего тратить`); continue; }
+          try {
+            // sanity: impact + roundtrip guard
+            const dec = s._mintDecimals ?? 9;
+            const pay = Math.round(spend * 1e9);
+            const q1: any = await getJupiterQuote({ inputMint: WSOL, outputMint: s.tokenMint!, amount: pay });
+            const outTok = Number(q1?.outAmount || 0) / Math.pow(10, dec);
+            const priceNow = s.price || 0;
+            if (outTok > 0 && priceNow > 0) {
+              const fairOut = spend / priceNow;
+              const impact = Math.max(0, fairOut > 0 ? (1 - outTok / fairOut) : 0);
+              if (impact > 0.015) { s.addLog("warn", `Buy% ${b.name}: skip (impact ${(impact*100).toFixed(1)}%)`); continue; }
+              const q2: any = await getJupiterQuote({ inputMint: s.tokenMint!, outputMint: WSOL, amount: Math.max(1, Math.round(outTok * Math.pow(10, dec))) });
+              const backSol = Number(q2?.outAmount || 0) / 1e9;
+              const loss = Math.max(0, 1 - backSol / Math.max(1e-12, spend));
+              if (loss > 0.006) { s.addLog("warn", `Buy% ${b.name}: skip (roundtrip ${(loss*100).toFixed(1)}%)`); continue; }
+            }
+            const kp = getKeypair(b.keyId);
+            const vtx = await buildTradeTxPumpLocal({
+              publicKey: kp.publicKey.toBase58(),
+              action: "buy",
+              mint: s.tokenMint,
+              denominatedInSol: "true",
+              amount: spend,
+              slippage: safeBps(get().getSmartBps(), 50) / 100,
+              priorityFee: 0.00001,
+              pool: "auto",
+            });
+            vtx.sign([kp]);
+            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
+            await confirmSigHttp(connection, sig);
+            s.addLog("ok", `Buy% ${b.name}: ${(spend).toFixed(6)} SOL (${sig.slice(0, 8)}…)`);
+          } catch (e: any) {
+            s.addLog("warn", `Buy% ${s.bots[i].name}: ${e?.message || String(e)}`);
+          }
+          if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
+        }
+      },
+
+      async buyAllBots80OnPump(connection, opts = {}) {
+        await get().buyAllBotsAtPercentOnPump(connection, 0.8, opts);
+      },
+
+      // === Sell ALL — боты → кошелёк → одна продажа
+      async sellAllToWalletOnPump(connection, walletPubkey) {
+        const s = get();
+        if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
+
+        const mintPk = new PublicKey(s.tokenMint);
+        const walletPk = new PublicKey(walletPubkey);
+        let decimals = s._mintDecimals;
+        if (decimals == null) {
+          // Сначала быстрый raw-декод; если не получилось — обычный helper
+          const fast = await getMintDecimalsFast(connection as Connection, mintPk);
+          decimals = fast ?? null;
+          if (decimals == null) {
+            try { decimals = await getMintDecimals(connection, s.tokenMint); } catch {}
+          }
+          if (decimals != null) set({ _mintDecimals: decimals });
+        }
+        decimals = (decimals ?? 9);
+
+        for (let i = 0; i < s.bots.length; i++) {
+          const b = s.bots[i];
+          try {
+            const kp = getKeypair(b.keyId);
+            // Определяем используемую программу по существующему ATA (без getAccountInfo на mint)
+            const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
+            const src22 = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
+            const dstClassic = await getAssociatedTokenAddress(mintPk, walletPk, false, TOKEN_PROGRAM_ID);
+            const dst22 = await getAssociatedTokenAddress(mintPk, walletPk, false, TOKEN_2022_PROGRAM_ID);
+
+            const infos = await connection.getMultipleAccountsInfo([srcClassic, src22, dstClassic, dst22]);
+            const [srcCInfo, src22Info, dstCInfo, dst22Info] = infos;
+
+            // локальный декодер amount из ATA
+            const decodeAmount = (acc: any): bigint => {
+              try {
+                if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+                return (BigInt(hi) << 32n) + BigInt(lo);
+              } catch { return 0n; }
             };
 
-            const vtx = await buildTradeTxPumpLocal(payload);
-            const kp = getKeypair(b.keyId);
-            vtx.sign([kp]);
-            const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
+            const amtC = decodeAmount(srcCInfo);
+            const amt22 = decodeAmount(src22Info);
+
+            let useProgram = TOKEN_PROGRAM_ID;
+            let srcAta = srcClassic; let dstAta = dstClassic; let dstInfo = dstCInfo; let amountRaw = amtC;
+            if (amt22 > 0n || (!srcCInfo && src22Info)) { // предпочитаем 2022, если там есть баланс или только он существует
+              useProgram = TOKEN_2022_PROGRAM_ID; srcAta = src22; dstAta = dst22; dstInfo = dst22Info; amountRaw = amt22;
+            }
+            if (amountRaw <= 0n) { s.addLog("info", `Sell ALL: у ${b.name} токенов нет`); continue; }
+
+            const tx = new Transaction();
+            if (!dstInfo) tx.add(createAssociatedTokenAccountInstruction(kp.publicKey, dstAta, walletPk, mintPk, useProgram));
+            // Если decimals по-прежнему не удалось получить корректно — сделаем transfer без checked
+            if (typeof decimals === "number" && Number.isFinite(decimals)) {
+              tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], useProgram));
+            } else {
+              // fallback на не-checked передачу
+              const { createTransferInstruction } = await import("@solana/spl-token");
+              tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], useProgram));
+            }
+
+            const { blockhash } = await connection.getLatestBlockhash("finalized");
+            tx.feePayer = kp.publicKey;
+            (tx as any).recentBlockhash = blockhash;
+            tx.sign(kp);
+            const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
             await confirmSigHttp(connection, sig);
-            s.addLog("ok", `SELL ${b.name}: ${qtyTok.toFixed(6)} TOK (${sig.slice(0,8)}…)`);
+
+            s.addLog("ok", `Sell ALL: ${b.name} → wallet ${Number(amountRaw) / Math.pow(10, decimals)} TOK (${sig.slice(0, 8)}…)`);
           } catch (e: any) {
-            s.addLog("warn", `SELL ${b.name} fail: ${e?.message || e}`);
+            s.addLog("warn", `Sell ALL transfer ${s.bots[i].name}: ${e?.message || String(e)}`);
           }
-          await new Promise((r) => setTimeout(r, 400 + Math.floor(Math.random()*400)));
+          if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
         }
 
-        await get().refreshBalances(connection);
+        try {
+          const rawWallet = await getSPLBalance(connection, walletPubkey, s.tokenMint);
+          const amountTok = Number(rawWallet as any) / Math.pow(10, decimals);
+          if (amountTok <= 0) { s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи"); return; }
 
-        // 2) Переводим SOL на кошелёк
-        for (const b of get().bots) {
-          try {
-            const send = Math.max(0, b.solBalance - keep);
-            if (send <= 0.00001) continue;
-            const lamports = Math.floor(send * LAMPORTS_PER_SOL);
-            const kp = getKeypair(b.keyId);
-            const sig = await sendTransferWithRetry(connection, kp, new PublicKey(walletPubkey), lamports, 3);
-            s.addLog("ok", `→ Wallet ${b.name}: ${send.toFixed(6)} SOL (${sig.slice(0,8)}…)`);
-          } catch (e: any) {
-            s.addLog("warn", `Transfer ${b.name} → wallet fail: ${e?.message || e}`);
-          }
-          await new Promise((r) => setTimeout(r, 350 + Math.floor(Math.random()*450)));
+          const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
+          const vtx = await buildTradeTxPumpLocal({
+            publicKey: walletPubkey,
+            action: "sell",
+            mint: s.tokenMint,
+            denominatedInSol: "false",
+            amount: amountRounded,
+            slippage: safeBps(get().getSmartBps(), 50) / 100,
+            priorityFee: 0.00001,
+            pool: "auto",
+          });
+
+          const ph = (window as any).solana;
+          if (!ph?.signAndSendTransaction) throw new Error("Phantom не поддерживает signAndSendTransaction");
+          const { signature } = await ph.signAndSendTransaction(vtx);
+          await confirmSigHttp(connection, signature);
+          s.addLog("ok", `Sell ALL: кошелёк продал ~${amountRounded} TOK (${signature.slice(0, 8)}…)`);
+        } catch (e: any) {
+          get().addLog("err", `Sell ALL sell-phase: ${e?.message || String(e)}`);
         }
 
         await get().refreshBalances(connection);
       },
 
-      // ===== Авто-режим (лёгкие сигналы)
+      // Авто-профили
       autoMode: false,
-      autoCfg: { slopeLookback: 10, volLookback: 10, slopeThr: 0.002, volThr: 0.006 },
+      autoCfg: { slopeLookback: 20, volLookback: 20, slopeThr: 0.002, volThr: 0.004 },
       autoTick() {
         const s = get();
         if (!s.autoMode) return;
         const cs = s.candles;
-        if (!cs.length) return;
+        if (cs.length < 25) return;
 
-        const look = Math.min(cs.length, Math.max(3, s.autoCfg.slopeLookback));
-        const last = cs.slice(-look);
-        const p0 = last[0].close;
-        const p1 = last[last.length - 1].close;
-        const slope = (p1 - p0) / Math.max(1e-9, p0);
+        const { slopeLookback, volLookback, slopeThr, volThr } = s.autoCfg;
+        const lastN = cs.slice(-Math.max(slopeLookback, volLookback));
+        const prices = lastN.map((c) => c.close);
+        const p0 = prices[0];
+        const p1 = prices[prices.length - 1].close;
+        if (!p0) return;
 
-        const vols = cs.slice(-Math.max(3, s.autoCfg.volLookback));
-        const mean = vols.reduce((a, c) => a + c.close, 0) / vols.length;
-        const sd = Math.sqrt(vols.reduce((a, c) => a + (c.close - mean) ** 2, 0) / vols.length) / Math.max(1e-9, mean);
+        const slope = (p1 - p0) / p0;
+        const mean = prices.reduce((a, b) => a + b, 0) / prices.length;
+        const sd = Math.sqrt(prices.reduce((a, b) => a + (b - mean) * (b - mean), 0) / prices.length) / Math.max(1e-9, mean);
 
-        // Простая адаптация стратегии в рантайме
-        const newStrat: BotStrategy | null =
-          slope > s.autoCfg.slopeThr && sd > s.autoCfg.volThr ? "momentum"
-          : slope > s.autoCfg.slopeThr ? "trend"
-          : slope < -s.autoCfg.slopeThr ? "revert"
-          : null;
+        const trending = Math.abs(slope) > slopeThr;
+        const noisy = sd > volThr;
 
-        if (newStrat) {
-          set((st) => ({ bots: st.bots.map((b) => b.running ? { ...b, strategy: newStrat } : b) }));
+        let desired: Array<{ type: "trend" | "revert" | "scalper"; share: number }>;
+        if (trending) {
+          desired = noisy
+            ? [{ type: "trend", share: 0.6 }, { type: "scalper", share: 0.25 }, { type: "revert", share: 0.15 }]
+            : [{ type: "trend", share: 0.7 }, { type: "revert", share: 0.2 }, { type: "scalper", share: 0.1 }];
+        } else {
+          desired = noisy
+            ? [{ type: "revert", share: 0.55 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.15 }]
+            : [{ type: "revert", share: 0.6 }, { type: "trend", share: 0.3 }, { type: "scalper", share: 0.1 }];
         }
+
+        const bots = [...s.bots];
+        const free = bots.filter((b) => !b.manualLock);
+        if (free.length === 0) return;
+
+        const total = free.length;
+        const counts = desired.map((x) => ({ type: x.type, n: Math.round(x.share * total) }));
+        let sum = counts.reduce((a, c) => a + c.n, 0);
+        while (sum < total) { counts[0].n++; sum++; }
+        while (sum > total) { counts[0].n--; sum--; }
+
+        const profiles = {
+          trend:   (i: number) => ({ strategy: "trend"   as const, speedMs: 5000 + ((i % 3) * 2000), budgetSol: 0.02 + ((i % 2) * 0.01) }),
+          revert:  (i: number) => ({ strategy: "revert"  as const, speedMs: 9000 + ((i % 3) * 3000), budgetSol: 0.015 }),
+          scalper: (i: number) => ({ strategy: "scalper" as const, speedMs: 1500 + ((i % 3) * 500),  budgetSol: 0.008 }),
+          momentum:(i: number) => ({ strategy: "momentum"as const, speedMs: 4000 + ((i % 3) * 1500), budgetSol: 0.02 }),
+          range:   (i: number) => ({ strategy: "range"   as const, speedMs: 7000 + ((i % 3) * 2000), budgetSol: 0.015 }),
+          maker:   (i: number) => ({ strategy: "maker"   as const, speedMs: 2500 + ((i % 3) * 800),  budgetSol: 0.006 }),
+        } as const;
+
+        let idx = 0;
+        const newBots = bots.map((b) => {
+          if (b.manualLock) return b;
+          let bucket: BotStrategy = "trend";
+          for (const c of counts) { if (c.n > 0) { bucket = c.type as any; c.n--; break; } }
+          const prof = profiles[bucket](idx++);
+          return { ...b, ...prof };
+        });
+
+        set({ bots: newBots });
       },
 
-      _mintDecimals: undefined,
-      _lastTopUp: {},
-
-      // ====== Аллокации
-      allocTarget: 0.65,
-      allocMin: 0.55,
-      allocMax: 0.80,
-      setAlloc: (t, min, max) => {
-        const target = Math.min(0.95, Math.max(0.05, t));
-        const lo = Math.min(target, Math.max(0.05, min));
-        const hi = Math.max(target, Math.min(0.98, max));
-        set({ allocTarget: target, allocMin: lo, allocMax: hi });
-      },
+      // Аллокация по умолчанию: 70% токен / 30% SOL, коридор 60..85
+      allocTarget: 0.70,
+      allocMin: 0.60,
+      allocMax: 0.85,
+      setAlloc: (t, min, max) => set({
+        allocTarget: Math.min(0.95, Math.max(0.05, Number(t) || 0.7)),
+        allocMin: Math.min(0.95, Math.max(0.05, Number(min) || 0.6)),
+        allocMax: Math.min(0.98, Math.max(0.06, Number(max) || 0.85)),
+      }),
       getAlloc: () => ({ target: get().allocTarget, min: get().allocMin, max: get().allocMax }),
 
-      // ====== Форма исполнения
-      tradeStepMinSol: 0.0003,
-      tradeStepMaxSol: 0.003,
-      tradeSlicesMax: 3,
-      tradeJitterPct: 0.18,
-      setTradeStep: (minSol, maxSol, slicesMax, jitterPct) => {
-        set({
-          tradeStepMinSol: Math.max(0.00005, +minSol),
-          tradeStepMaxSol: Math.max(+minSol, +maxSol),
-          tradeSlicesMax: Math.max(1, Math.round(slicesMax)),
-          tradeJitterPct: Math.max(0, Math.min(0.5, +jitterPct)),
-        });
-      },
+      // Размер шага сделки и форма исполнения (уменьшили шаги для снижения импакта)
+      tradeStepMinSol: 0.0002,
+      tradeStepMaxSol: 0.0008,
+      tradeSlicesMax: 4,
+      tradeJitterPct: 0.25,
+      setTradeStep: (minSol, maxSol, slicesMax, jitterPct) => set({
+        tradeStepMinSol: Math.max(0.00005, Number(minSol) || 0.0002),
+        tradeStepMaxSol: Math.max(0.0001, Number(maxSol) || 0.0008),
+        tradeSlicesMax: Math.max(1, Math.floor(Number(slicesMax) || 4)),
+        tradeJitterPct: Math.min(0.5, Math.max(0, Number(jitterPct) || 0.25)),
+      }),
       getTradeStep: () => ({
         minSol: get().tradeStepMinSol,
         maxSol: get().tradeStepMaxSol,
@@ -1310,57 +1490,72 @@ export const useStore = create<Store>()(
         jitterPct: get().tradeJitterPct,
       }),
 
-      // ====== Риск
+      // Риск-настройки (пока без UI; при желании вынесем в контролы)
       getRisk: () => ({
-        maxImpact: 0.10,
-        maxDrawdown: 0.25,
-        reserveSol: 0.0012,
-        maxNotionalPerMin: 0.02,
-        maxBuysPerMin: 6,
-        maxSellsPerMin: 10,
-        lossThrPct: 0.008,
-        lossWindowMs: 20000,
-        lossCooldownMs: 20000,
-        maxBuySliceSol: 0.0018,
-        maxSellSliceTokPct: 0.12,
-        minSliceGapMs: 200,
-        maxSliceGapMs: 850,
+        maxImpact: 0.015,
+        maxDrawdown: 0.15,
+        reserveSol: 0.0050,
+        maxNotionalPerMin: 0.0015,
+        maxBuysPerMin: 1,
+        maxSellsPerMin: 6,
+        lossThrPct: 0.003,
+        lossWindowMs: 30000,
+        lossCooldownMs: 90000,
+        maxBuySliceSol: 0.0004,
+        maxSellSliceTokPct: 0.04,
+        minSliceGapMs: 400,
+        maxSliceGapMs: 1500,
       }),
     }),
     {
-      name: "live-bot-store",
+      name: "meme-bundler:v1",
       version: 3,
+      migrate: (persisted: any) => {
+        const p = persisted || {};
+        p.smartMM = sanitizeSmartMM(p.smartMM);
+        p.slippageBps = safeBps(p.slippageBps ?? 50, 50);
+        if (!p.tradeRange) p.tradeRange = { minSol: 0.005, maxSol: 0.03 };
+        p.tradeRange.minSol = toNum(p.tradeRange.minSol, 0.005);
+        p.tradeRange.maxSol = toNum(p.tradeRange.maxSol, 0.03);
+        if (typeof p.tradeStepMinSol !== 'number') p.tradeStepMinSol = 0.0003;
+        if (typeof p.tradeStepMaxSol !== 'number') p.tradeStepMaxSol = 0.0030;
+        if (typeof p.tradeSlicesMax !== 'number') p.tradeSlicesMax = 3;
+        if (typeof p.tradeJitterPct !== 'number') p.tradeJitterPct = 0.18;
+        // Поддержка аллокации
+        if (typeof p.allocTarget !== 'number') p.allocTarget = 0.70;
+        if (typeof p.allocMin !== 'number') p.allocMin = 0.60;
+        if (typeof p.allocMax !== 'number') p.allocMax = 0.85;
+        return p;
+      },
       storage: createJSONStorage(() => localStorage),
-      partialize: (s: Store) => ({
+      partialize: (s) => ({
         tokenUrl: s.tokenUrl,
         tokenMint: s.tokenMint,
-        external: s.external,
-        bots: s.bots.map((b) => ({
-          id: b.id, name: b.name, strategy: b.strategy, budgetSol: b.budgetSol, speedMs: b.speedMs,
-          aiEnabled: b.aiEnabled, manualLock: b.manualLock, keyId: b.keyId, pubkey: b.pubkey,
-          solBalance: b.solBalance, tokenBalance: b.tokenBalance, posToken: b.posToken, avgSol: b.avgSol,
-          realized: b.realized, unrealized: b.unrealized, fills: b.fills,
-        })),
+        bots: s.bots,
         slippageBps: s.slippageBps,
         useRandomSize: s.useRandomSize,
         tradeRange: s.tradeRange,
+        tradeStepMinSol: s.tradeStepMinSol,
+        tradeStepMaxSol: s.tradeStepMaxSol,
+        tradeSlicesMax: s.tradeSlicesMax,
+        tradeJitterPct: s.tradeJitterPct,
         smartMM: s.smartMM,
-        treasuryKeyId: s.treasuryKeyId,
+        allocTarget: s.allocTarget,
+        allocMin: s.allocMin,
+        allocMax: s.allocMax,
         autoTopUp: s.autoTopUp,
         minFeeSol: s.minFeeSol,
         topUpToSol: s.topUpToSol,
         drainMinKeepSol: s.drainMinKeepSol,
         drainDelayMs: s.drainDelayMs,
-        autoMode: s.autoMode,
-        autoCfg: s.autoCfg,
-        allocTarget: s.allocTarget,
-        allocMin: s.allocMin,
-        allocMax: s.allocMax,
-        tradeStepMinSol: s.tradeStepMinSol,
-        tradeStepMaxSol: s.tradeStepMaxSol,
-        tradeSlicesMax: s.tradeSlicesMax,
-        tradeJitterPct: s.tradeJitterPct,
+        treasuryKeyId: s.treasuryKeyId,
       }),
+      onRehydrateStorage: () => (state) => {
+        try {
+          const u = state?.tokenUrl;
+          if (u) setTimeout(() => { try { get().setTokenUrl(u); } catch {} }, 0);
+        } catch {}
+      },
     }
   )
 );
