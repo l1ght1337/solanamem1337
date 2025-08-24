@@ -629,15 +629,26 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
-            fills: {b.fills} &nbsp; | &nbsp; avg: {b.avgSol.toFixed(9)} &nbsp; | &nbsp; realized:{" "}
-            <span style={{ color: "#23d18b" }}>{b.realized.toFixed(5)} SOL</span> &nbsp; | &nbsp; unrlzd:{" "}
-            <span style={{ color: "#23d18b" }}>{b.unrealized.toFixed(5)} SOL</span> &nbsp; | &nbsp; SOL {b.solBalance.toFixed(4)} | TOK{" "}
-            {b.tokenBalance.toFixed(3)} &nbsp; | &nbsp; last: {b.last || "hold"}
+            {(() => {
+              const fills = b.fills ?? 0;
+              const avg = (b.avgSol ?? 0).toFixed(9);
+              const realized = (b.realized ?? 0).toFixed(5);
+              const unrl = (b.unrealized ?? 0).toFixed(5);
+              const sol = (b.solBalance ?? 0).toFixed(4);
+              const tok = (b.tokenBalance ?? 0).toFixed(3);
+              return (
+                <>
+                  fills: {fills} &nbsp; | &nbsp; avg: {avg} &nbsp; | &nbsp; realized:{" "}
+                  <span style={{ color: "#23d18b" }}>{realized} SOL</span> &nbsp; | &nbsp; unrlzd:{" "}
+                  <span style={{ color: "#23d18b" }}>{unrl} SOL</span> &nbsp; | &nbsp; SOL {sol} | TOK {tok} &nbsp; | &nbsp; last: {b.last || "hold"}
+                </>
+              );
+            })()}
           </div>
 
-          {b.solBalance < s.minFeeSol && (
+          {(b.solBalance ?? 0) < s.minFeeSol && (
             <div style={{ marginTop: 6, color: "#ffb86c" }}>
-              Внимание: на боте мало SOL (есть {b.solBalance.toFixed(6)}, минимум {s.minFeeSol}).{" "}
+              Внимание: на боте мало SOL (есть {(b.solBalance ?? 0).toFixed(6)}, минимум {s.minFeeSol}).{" "}
               {s.autoTopUp && s.treasuryKeyId ? "Auto top-up включён." : "Включите auto top-up или пополните вручную."}
             </div>
           )}
