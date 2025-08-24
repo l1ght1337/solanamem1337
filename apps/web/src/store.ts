@@ -488,11 +488,11 @@ export type Store = {
   setAlloc: (t: number, min: number, max: number) => void;
   getAlloc: () => { target: number; min: number; max: number };
 
-  // Размер шага сделки и форма исполнения
+  // Размер шага сделки и форма исполнения (уменьшили шаги для снижения импакта)
   tradeStepMinSol: number;
   tradeStepMaxSol: number;
-  tradeSlicesMax: number;    // максимум кусочков для TWAP шага
-  tradeJitterPct: number;    // 0..0.5 — случайная вариация размера шага
+  tradeSlicesMax: number;
+  tradeJitterPct: number;
   setTradeStep: (minSol: number, maxSol: number, slicesMax: number, jitterPct: number) => void;
   getTradeStep: () => { minSol: number; maxSol: number; slicesMax: number; jitterPct: number };
 
@@ -1199,6 +1199,21 @@ export const useStore = create<Store>()(
           const spend = Math.max(0, +(b.solBalance - keep).toFixed(6));
           if (spend <= 0) { s.addLog("info", `Auto-buy ${b.name}: нечего тратить`); continue; }
           try {
+            // sanity: impact + roundtrip guard
+            const dec = s._mintDecimals ?? 9;
+            const pay = Math.round(spend * 1e9);
+            const q1: any = await getJupiterQuote({ inputMint: WSOL, outputMint: s.tokenMint!, amount: pay });
+            const outTok = Number(q1?.outAmount || 0) / Math.pow(10, dec);
+            const priceNow = s.price || 0;
+            if (outTok > 0 && priceNow > 0) {
+              const fairOut = spend / priceNow;
+              const impact = Math.max(0, fairOut > 0 ? (1 - outTok / fairOut) : 0);
+              if (impact > 0.015) { s.addLog("warn", `Auto-buy ${b.name}: skip (impact ${(impact*100).toFixed(1)}%)`); continue; }
+              const q2: any = await getJupiterQuote({ inputMint: s.tokenMint!, outputMint: WSOL, amount: Math.max(1, Math.round(outTok * Math.pow(10, dec))) });
+              const backSol = Number(q2?.outAmount || 0) / 1e9;
+              const loss = Math.max(0, 1 - backSol / Math.max(1e-12, spend));
+              if (loss > 0.006) { s.addLog("warn", `Auto-buy ${b.name}: skip (roundtrip ${(loss*100).toFixed(1)}%)`); continue; }
+            }
             const kp = getKeypair(b.keyId);
             const vtx = await buildTradeTxPumpLocal({
               publicKey: kp.publicKey.toBase58(),
@@ -1234,6 +1249,21 @@ export const useStore = create<Store>()(
           const spend = Math.max(0, +(base * pct).toFixed(6));
           if (spend <= 0) { s.addLog("info", `Buy% ${b.name}: нечего тратить`); continue; }
           try {
+            // sanity: impact + roundtrip guard
+            const dec = s._mintDecimals ?? 9;
+            const pay = Math.round(spend * 1e9);
+            const q1: any = await getJupiterQuote({ inputMint: WSOL, outputMint: s.tokenMint!, amount: pay });
+            const outTok = Number(q1?.outAmount || 0) / Math.pow(10, dec);
+            const priceNow = s.price || 0;
+            if (outTok > 0 && priceNow > 0) {
+              const fairOut = spend / priceNow;
+              const impact = Math.max(0, fairOut > 0 ? (1 - outTok / fairOut) : 0);
+              if (impact > 0.015) { s.addLog("warn", `Buy% ${b.name}: skip (impact ${(impact*100).toFixed(1)}%)`); continue; }
+              const q2: any = await getJupiterQuote({ inputMint: s.tokenMint!, outputMint: WSOL, amount: Math.max(1, Math.round(outTok * Math.pow(10, dec))) });
+              const backSol = Number(q2?.outAmount || 0) / 1e9;
+              const loss = Math.max(0, 1 - backSol / Math.max(1e-12, spend));
+              if (loss > 0.006) { s.addLog("warn", `Buy% ${b.name}: skip (roundtrip ${(loss*100).toFixed(1)}%)`); continue; }
+            }
             const kp = getKeypair(b.keyId);
             const vtx = await buildTradeTxPumpLocal({
               publicKey: kp.publicKey.toBase58(),
@@ -1442,16 +1472,16 @@ export const useStore = create<Store>()(
       }),
       getAlloc: () => ({ target: get().allocTarget, min: get().allocMin, max: get().allocMax }),
 
-      // Размер шага сделки и форма исполнения
-      tradeStepMinSol: 0.0003,
-      tradeStepMaxSol: 0.0030,
-      tradeSlicesMax: 3,
-      tradeJitterPct: 0.18,
+      // Размер шага сделки и форма исполнения (уменьшили шаги для снижения импакта)
+      tradeStepMinSol: 0.0002,
+      tradeStepMaxSol: 0.0008,
+      tradeSlicesMax: 4,
+      tradeJitterPct: 0.25,
       setTradeStep: (minSol, maxSol, slicesMax, jitterPct) => set({
-        tradeStepMinSol: Math.max(0.00005, Number(minSol) || 0.0003),
-        tradeStepMaxSol: Math.max(0.0001, Number(maxSol) || 0.003),
-        tradeSlicesMax: Math.max(1, Math.floor(Number(slicesMax) || 3)),
-        tradeJitterPct: Math.min(0.5, Math.max(0, Number(jitterPct) || 0.18)),
+        tradeStepMinSol: Math.max(0.00005, Number(minSol) || 0.0002),
+        tradeStepMaxSol: Math.max(0.0001, Number(maxSol) || 0.0008),
+        tradeSlicesMax: Math.max(1, Math.floor(Number(slicesMax) || 4)),
+        tradeJitterPct: Math.min(0.5, Math.max(0, Number(jitterPct) || 0.25)),
       }),
       getTradeStep: () => ({
         minSol: get().tradeStepMinSol,
@@ -1462,19 +1492,19 @@ export const useStore = create<Store>()(
 
       // Риск-настройки (пока без UI; при желании вынесем в контролы)
       getRisk: () => ({
-        maxImpact: 0.03,
+        maxImpact: 0.015,
         maxDrawdown: 0.15,
-        reserveSol: 0.0030,
-        maxNotionalPerMin: 0.0030,
-        maxBuysPerMin: 2,
+        reserveSol: 0.0050,
+        maxNotionalPerMin: 0.0015,
+        maxBuysPerMin: 1,
         maxSellsPerMin: 6,
-        lossThrPct: 0.004,
+        lossThrPct: 0.003,
         lossWindowMs: 30000,
-        lossCooldownMs: 60000,
-        maxBuySliceSol: 0.0008,
-        maxSellSliceTokPct: 0.06,
-        minSliceGapMs: 250,
-        maxSliceGapMs: 1200,
+        lossCooldownMs: 90000,
+        maxBuySliceSol: 0.0004,
+        maxSellSliceTokPct: 0.04,
+        minSliceGapMs: 400,
+        maxSliceGapMs: 1500,
       }),
     }),
     {
