@@ -20,20 +20,30 @@ export default function App() {
   const rpcPrimary = (import.meta.env as any).VITE_SOLANA_RPC_PRIMARY ?? (import.meta.env as any).VITE_RPC_PRIMARY;
   const rpcFallback = (import.meta.env as any).VITE_SOLANA_RPC_FALLBACK_1 ?? (import.meta.env as any).VITE_RPC_FALLBACK;
 
-  const rpcUrl = (rpcPrimary || rpcFallback || "") as string;
-  const connection = useMemo(() => (rpcUrl ? new Connection(rpcUrl, { commitment: "processed" }) : undefined), [rpcUrl]);
+  const [activeRpcUrl, setActiveRpcUrl] = useState<string>(() => (rpcPrimary || rpcFallback || ""));
+  const connection = useMemo(() => (activeRpcUrl ? new Connection(activeRpcUrl, { commitment: "processed" }) : undefined), [activeRpcUrl]);
 
   // RPC status for header
   const [rpcOk, setRpcOk] = useState<boolean | null>(null);
   const rpcHost = useMemo(() => {
-    try { return rpcUrl ? new URL(rpcUrl).host : ""; } catch { return rpcUrl || ""; }
-  }, [rpcUrl]);
+    try { return activeRpcUrl ? new URL(activeRpcUrl).host : ""; } catch { return activeRpcUrl || ""; }
+  }, [activeRpcUrl]);
   useEffect(() => {
     let stop = false;
     (async () => {
-      if (!connection) { setRpcOk(null); return; }
-      try { await connection.getSlot("processed"); if (!stop) setRpcOk(true); }
-      catch { if (!stop) setRpcOk(false); }
+      // если активный RPC не создан — попробуем первичный, иначе проверим активный
+      if (!activeRpcUrl) { setRpcOk(null); return; }
+      if (!connection) { setRpcOk(false); return; }
+      try {
+        await connection.getSlot("processed");
+        if (!stop) setRpcOk(true);
+      } catch {
+        if (!stop) setRpcOk(false);
+        // fallback: если первичный отличается от fallback — переключимся
+        if (rpcFallback && activeRpcUrl !== rpcFallback) {
+          setActiveRpcUrl(rpcFallback as string);
+        }
+      }
     })();
     const id = setInterval(async () => {
       if (!connection) return;
@@ -41,7 +51,7 @@ export default function App() {
       catch { if (!stop) setRpcOk(false); }
     }, 20000);
     return () => { stop = true; clearInterval(id); };
-  }, [connection]);
+  }, [connection, activeRpcUrl, rpcFallback]);
 
   // авто-тикеры — чаще для цены
   useEffect(() => {
@@ -204,8 +214,8 @@ export default function App() {
             Price <b>{s.price.toFixed(9)}</b> | Equity{" "}
             <b>{s.bots.reduce((a, b) => a + b.solBalance, 0).toFixed(3)} SOL</b>
           </div>
-          {!rpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
-          {rpcUrl && (
+          {!activeRpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
+          {activeRpcUrl && (
             <span style={{ color: rpcOk ? "#8aff8a" : rpcOk === false ? "#ff6b6b" : "#97a6ba", fontSize: 12 }}>
               RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"}
             </span>
