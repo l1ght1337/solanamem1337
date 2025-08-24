@@ -1,4 +1,3 @@
-// apps/web/src/store.ts
 import "./polyfills";
 import { confirmSigHttp } from "./utils/confirm";
 import { create } from "zustand";
