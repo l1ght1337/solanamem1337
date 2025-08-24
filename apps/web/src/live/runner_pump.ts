@@ -189,6 +189,7 @@ let MIN_ALLOC = 0.60; // при падении ниже — ребаланс в 
 // Риск‑ограничители
 const MAX_SINGLE_TRADE_IMPACT = 0.20; // не принимаем сделки хуже -20% к fair
 const MAX_TOTAL_DRAWDOWN = 0.30;      // при просадке портфеля >30% — защита
+const MAX_ROUNDTRIP_LOSS = 0.01;      // максимум 1% потери при мгновенном roundtrip
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -316,6 +317,30 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const amountTok =
       side === "sell" && opts?.sellTokens ? roundTok(opts.sellTokens, decimals) : undefined;
 
+    // Жесткие ограничения коридора перед исполнением
+    try {
+      const { total } = alloc(priceNow);
+      if (side === "buy" && sizeSol > 0) {
+        const currTokVal = bot.posToken * priceNow;
+        const maxBuyVal = Math.max(0, MAX_ALLOC * total - currTokVal);
+        const clamped = Math.min(sizeSol, maxBuyVal);
+        if (clamped <= 0.00012) return; // слишком маленькая или запрещенная покупка
+        sizeSol = +clamped.toFixed(6);
+      } else if (side === "sell") {
+        const minTokAfter = Math.max(0, (MIN_ALLOC * total) / Math.max(1e-12, priceNow));
+        const maxSellTok = Math.max(0, bot.posToken - minTokAfter);
+        if (opts?.sellTokens) {
+          const newAmt = Math.min(opts.sellTokens, maxSellTok);
+          if (newAmt <= 0) return; // нельзя продавать ниже MIN_ALLOC
+          (opts as any).sellTokens = newAmt;
+        } else if ((amountTok ?? bot.posToken) > 0) {
+          const capped = Math.min((amountTok ?? bot.posToken), maxSellTok);
+          if (capped <= 0) return;
+          (opts as any) = { ...(opts || {}), sellTokens: capped };
+        }
+      }
+    } catch {}
+
     if (side === "buy" && sizeSol <= 0) return;
     if (side === "sell" && (amountTok ?? bot.posToken) <= 0) return;
 
@@ -359,12 +384,27 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
         try {
           const q = await getJupiterQuote({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
+
           const fairOut = (pay / 1e9) / priceNow; // в токенах
           const out = Number(q.outAmount || 0) / Math.pow(10, decimals);
           const maxImpact = Math.min(MAX_SINGLE_TRADE_IMPACT, risk.maxImpact);
           if (fairOut > 0 && out < fairOut * (1 - maxImpact)) {
             warnDebounced(`skip BUY: impact too high (${((1 - out/fairOut)*100).toFixed(1)}%)`);
+
             return;
+          }
+          // Roundtrip‑loss check: WSOL -> TOK -> WSOL на маленькой пробе
+          if (out > 0) {
+            try {
+              const backRaw = Math.max(1, Math.round(out * Math.pow(10, decimals)));
+              const qb = await getJupiterQuote({ inputMint: ctx.mint, outputMint: WSOL, amount: backRaw });
+              const backSol = Number(qb.outAmount || 0) / 1e9;
+              const lossPct = Math.max(0, 1 - backSol / Math.max(1e-12, (pay / 1e9)));
+              if (isFinite(lossPct) && lossPct > MAX_ROUNDTRIP_LOSS) {
+                warnDebounced(`skip BUY: roundtrip loss ${(lossPct*100).toFixed(1)}%`);
+                return;
+              }
+            } catch {}
           }
         } catch {}
       } else {
