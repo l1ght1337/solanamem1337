@@ -63,7 +63,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunnerCtx) {
 
     const smart = ctx.smartSlippage || { enabled: false, maxBps: ctx.slippageBps, alpha: 1.0, minExtraBps: 0 }
     const base = ctx.slippageBps
-    const maxBps = smart.maxBps || base
+    const minClamp = 30, maxClamp = 120
+    const maxBps = Math.max(minClamp, Math.min(maxClamp, smart.maxBps || base))
 
     const { signature, usedSlippageBps, priceImpactPct } = await jupiterSmartSwapWithKeypair({
       keypair: ctx.keypair(), connection,
