@@ -1,4 +1,3 @@
-// apps/web/src/App.tsx
 import "./polyfills"; // <— важно: полифилл до всего остального
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -6,6 +5,7 @@ import { useStore } from "./store";
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
+import { confirmSigHttp } from "./utils/confirm"; // NEW: быстрый HTTP-confirm
 
 declare global {
   interface Window {
@@ -48,14 +48,40 @@ export default function App() {
     if (!connection) return;
     const id = setInterval(() => s.tickReal(), 3_000); // было 5s
     const id2 = setInterval(() => s.refreshBalances(connection), 5_000);
+    // NEW: авто-адаптация профилей ботов
+    const id3 = setInterval(() => s.autoTick(), 5_000);
     return () => {
       clearInterval(id);
       clearInterval(id2);
+      clearInterval(id3);
     };
   }, [connection, s]);
 
   // Phantom
   const [walletPubkey, setWalletPubkey] = useState<string>("");
+
+  // NEW: подписка на события кошелька (переключение аккаунта/отключение и т.п.)
+  useEffect(() => {
+    const p = window.solana;
+    if (!p) return;
+    const onConnect = () => setWalletPubkey(p.publicKey?.toString() || "");
+    const onDisconnect = () => setWalletPubkey("");
+    const onAccountChanged = (pubkey: any) => setWalletPubkey(pubkey ? pubkey.toString() : "");
+    try {
+      p.on?.("connect", onConnect);
+      p.on?.("disconnect", onDisconnect);
+      p.on?.("accountChanged", onAccountChanged);
+      if (p.isConnected && p.publicKey) setWalletPubkey(p.publicKey.toString());
+    } catch {}
+    return () => {
+      try {
+        p.off?.("connect", onConnect);
+        p.off?.("disconnect", onDisconnect);
+        p.off?.("accountChanged", onAccountChanged);
+      } catch {}
+    };
+  }, []);
+
   const connectWallet = async () => {
     const p = window.solana;
     if (!p || !p.isPhantom) {
@@ -115,7 +141,8 @@ export default function App() {
         tx.recentBlockhash = (await connection!.getLatestBlockhash()).blockhash;
         const signed = await window.solana.signTransaction(tx);
         const sig = await connection!.sendRawTransaction(signed.serialize(), { skipPreflight: true });
-        await connection!.confirmTransaction(sig, "confirmed");
+        // NEW: быстрое подтверждение
+        await confirmSigHttp(connection!, sig);
         s.addLog("ok", `Funded ${b.name}: ${perBot.toFixed(6)} SOL (${sig})`);
       } catch (e: any) {
         s.addLog("err", `Funding error ${b.name}: ${e?.message || e}`);
