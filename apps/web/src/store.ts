@@ -1211,7 +1211,7 @@ export const useStore = create<Store>()(
         const lastN = cs.slice(-Math.max(slopeLookback, volLookback));
         const prices = lastN.map((c) => c.close);
         const p0 = prices[0];
-        const p1 = prices[prices.length - 1].close;
+        const p1 = prices[prices.length - 1]; // ← FIX: без .close, т.к. это уже числа
         if (!p0) return;
 
         const slope = (p1 - p0) / p0;
