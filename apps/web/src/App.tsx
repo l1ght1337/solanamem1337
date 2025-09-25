@@ -8,6 +8,9 @@ import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
 import { getTxTelemetry } from "./utils/tx";
 import { getActiveConnection, getActiveRpcUrl, getRpcTelemetry, healthcheckAndMaybeFailover } from "./utils/connection";
+import { logger } from "./utils/logger";
+import { getTokenPriceSOL } from "./utils/priceFeed";
+import { parseMint as parsePumpMint } from "./utils/pump";
 import { parseLocaleNumber, safeParseNumber, toFixedOrZero } from "./utils/number";
 
 declare global {
@@ -34,6 +37,7 @@ export default function App() {
     (window as any).__conn = connection;
     const check = async () => {
       try {
+        logger.info("Boot: checking RPC health…");
         await healthcheckAndMaybeFailover();
         if (!stop) {
           setRpcOk(true);
@@ -65,6 +69,7 @@ export default function App() {
   const connectWallet = async () => {
     const p = window.solana;
     if (!p || !p.isPhantom) {
+      logger.warn("Phantom not detected");
       alert("Установите Phantom");
       return;
     }
@@ -346,6 +351,27 @@ export default function App() {
           <button onClick={() => s.tickReal()} style={btn}>
             Refresh price
           </button>
+          {/* explicit wire-up to robust price feed with parsing */}
+          <button
+            onClick={async () => {
+              try {
+                const mint = parsePumpMint(s.tokenUrl) || s.tokenMint;
+                if (!mint) { s.addLog("warn", "Price: mint не распознан"); return; }
+                const ac = new AbortController();
+                setTimeout(() => ac.abort(), 2500);
+                const res = await getTokenPriceSOL(mint, ac.signal);
+                if (res.price && isFinite(res.price)) {
+                  useStore.setState({ price: res.price });
+                  s.addLog("ok", `Price updated (${res.source}) ${res.price}`);
+                } else {
+                  s.addLog("warn", `Price N/A (${res.reason || 'unknown'})`);
+                }
+              } catch (e: any) {
+                s.addLog("err", `Refresh price error: ${e?.message || String(e)}`);
+              }
+            }}
+            style={btnSm}
+          >Quick price</button>
           <div style={{ opacity: 0.7 }}>{s.tokenMint ? `mint: ${s.tokenMint}` : "mint не распознан"}</div>
         </div>
 

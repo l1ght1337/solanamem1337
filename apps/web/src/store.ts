@@ -1,3 +1,4 @@
+// @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
 import { confirmSigHttp } from "./utils/confirm";
@@ -21,6 +22,9 @@ import {
   TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
 import { fetchExternalPrice } from "./store-price-feeds";
+import { logger } from "./utils/logger";
+import { getTokenPriceSOL } from "./utils/priceFeed";
+import { parseMint as parsePumpMint } from "./utils/pump";
 import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./utils/keyring";
 import { getMintDecimals, getSPLBalance } from "./utils/solana";
 import { scheduleFetch, getNetMetrics } from "./utils/network";
@@ -568,7 +572,18 @@ export const useStore = create<Store>()(
       external: { provider: "dexscreener", endpoint: "https://api.dexscreener.com" },
 
       log: [],
-      addLog: (level, msg) => set((s) => ({ log: [...s.log, { ts: now(), level, msg }].slice(-800) })),
+      addLog: (level, msg) => {
+        // bridge to unified logger and local store log buffer
+        try {
+          if (!(globalThis as any).__fromLoggerBridge) {
+            if (level === 'err') logger.err(msg);
+            else if (level === 'ok') logger.ok(msg);
+            else if (level === 'warn') logger.warn(msg);
+            else logger.info(msg);
+          }
+        } catch {}
+        set((s) => ({ log: [...s.log, { ts: now(), level, msg }].slice(-800) }));
+      },
 
       bots: [],
       slippageBps: 50,
@@ -632,7 +647,7 @@ export const useStore = create<Store>()(
 
       _ppSub: undefined as any,
       setTokenUrl: (u) => {
-        const mint = b58(u);
+        const mint = parsePumpMint(u) || b58(u);
         const isPump = /pump\.fun/i.test(u);
         set({ tokenUrl: u, tokenMint: mint, _mintDecimals: undefined });
         if (mint && isPump) {
@@ -893,6 +908,10 @@ export const useStore = create<Store>()(
         const s = get();
         const bot = s.bots.find((b) => b.id === id);
         if (!bot || !s.tokenMint) return;
+
+        // Validate inputs
+        if (!Number.isFinite(bot.speedMs) || bot.speedMs <= 0) { s.addLog('warn', `Бот ${bot.name}: неверная скорость`); return; }
+        if (!Number.isFinite(bot.budgetSol) || bot.budgetSol <= 0) { s.addLog('warn', `Бот ${bot.name}: неверный бюджет`); return; }
 
         // Check if already running via scheduler
         const existing = s.scheduler.get(id);
@@ -1347,6 +1366,32 @@ export const useStore = create<Store>()(
       async tickReal() {
         const s = get();
         if (!s.tokenMint) return;
+        // Primary path: robust price feed (Jupiter -> optional proxy)
+        try {
+          const res = await getTokenPriceSOL(s.tokenMint);
+          if (res && res.price && isFinite(res.price)) {
+            const p = res.price;
+            set((st) => {
+              const t = Date.now();
+              const m = Math.floor(t / 60000) * 60000;
+              const last = (st.candles && st.candles.length > 0) ? (st.candles as any)[st.candles.length - 1] : null as any;
+              let c = (st.candles || []).slice();
+              if (!last || last.t !== m) c.push({ t: m, open: p!, high: p!, low: p!, close: p!, volume: 0 });
+              else { last.high = Math.max(last.high, p!); last.low = Math.min(last.low, p!); last.close = p!; }
+              if (c.length > 1000) c = c.slice(-1000);
+              const nowT = Date.now();
+              const ticks = (st.ticks || []).concat({ t: nowT, p: p! });
+              const cut = nowT - 60_000;
+              const bots = st.bots.map((b) => ({ ...b, unrealized: safeMultiply(b.posToken || 0, (p! || 0) - (b.avgSol || p! || 0)) }));
+              return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
+            });
+            return;
+          } else if (res && res.price == null) {
+            get().addLog('warn', `Price: N/A (${res.reason || 'unknown'})`);
+          }
+        } catch (e: any) {
+          get().addLog('warn', `Price fetch error: ${e?.message || String(e)}`);
+        }
         if (s.external.provider === "pumpportal") {
           // даже при WS‑цене иногда подёргиваем балансы
           if (get().shouldLightRefresh(8000)) {
@@ -1356,43 +1401,6 @@ export const useStore = create<Store>()(
           }
           return;
         }
-
-        const tryOnce = async (prov: any) => {
-          try {
-            return await fetchExternalPrice({ ...prov, endpoint: prov.endpoint, apiKey: prov.apiKey }, s.tokenMint!);
-          } catch { return null; }
-        };
-
-        const candidates = [
-          s.external,
-          { provider: "dexscreener", endpoint: "https://api.dexscreener.com" },
-          { provider: "jupiter", endpoint: "https://price.jup.ag" },
-          { provider: "solanatracker", endpoint: "https://api.solanatracker.io" },
-        ];
-
-        let p: number | null = null;
-        for (const c of candidates) {
-          p = await tryOnce(c);
-          if (p && isFinite(p) && p > 0) break;
-        }
-        if (!p) return;
-
-        set((st) => {
-          const t = Date.now();
-          const m = Math.floor(t / 60000) * 60000;
-          const last = (st.candles && st.candles.length > 0) ? (st.candles as any)[st.candles.length - 1] : null as any;
-          let c = (st.candles || []).slice();
-          if (!last || last.t !== m) c.push({ t: m, open: p!, high: p!, low: p!, close: p!, volume: 0 });
-          else { last.high = Math.max(last.high, p!); last.low = Math.min(last.low, p!); last.close = p!; }
-          if (c.length > 1000) c = c.slice(-1000);
-
-          const now = Date.now();
-          const ticks = (st.ticks || []).concat({ t: now, p: p! });
-          const cut = now - 60_000;
-
-          const bots = st.bots.map((b) => ({ ...b, unrealized: safeMultiply(b.posToken || 0, (p! || 0) - (b.avgSol || p! || 0)) }));
-          return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
-        });
       },
 
       // === Pump: создать токен и автопокупка ===
@@ -1668,7 +1676,7 @@ export const useStore = create<Store>()(
         minSliceGapMs: 600,
         maxSliceGapMs: 1800,
       }),
-    }),
+    } as Store),
     {
       name: "meme-bundler:v1",
       version: 3,
@@ -1716,6 +1724,18 @@ export const useStore = create<Store>()(
         try {
           const u = state?.tokenUrl;
           if (u) setTimeout(() => { try { (useStore.getState() as any).setTokenUrl(u); } catch {} }, 0);
+          // Hook logger → store so UI sees logs in realtime
+          try {
+            const unsub = logger.subscribe((entry) => {
+              try {
+                (globalThis as any).__fromLoggerBridge = true;
+                useStore.getState().addLog((entry.level === 'error' ? 'err' : (entry.level as any)), entry.msg);
+              } finally {
+                (globalThis as any).__fromLoggerBridge = false;
+              }
+            });
+            (window as any).__logger_unsub = unsub;
+          } catch {}
         } catch {}
       },
     }

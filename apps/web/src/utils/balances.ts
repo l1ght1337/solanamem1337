@@ -1,4 +1,5 @@
 import { AccountInfo, Connection, PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 // Utility: split an array into chunks of size n
 function chunkArray<T>(arr: T[], n: number): T[][] {
@@ -56,5 +57,20 @@ export async function fetchMultipleAccountInfos(
     out.push(...infos);
   }
   return out;
+}
+
+export async function getOwnerTokenAccounts(connection: Connection, owner: PublicKey) {
+  try {
+    const resp = await connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID });
+    return (resp.value || []).map((it) => {
+      const ata = it.pubkey;
+      const info: any = (it.account.data as any).parsed?.info;
+      const mint = String(info?.mint || "");
+      const amount = Number(info?.tokenAmount?.amount || 0);
+      return { mint, ata, amount };
+    });
+  } catch {
+    return [] as Array<{ mint: string; ata: PublicKey; amount: number }>;
+  }
 }
 

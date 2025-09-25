@@ -8,3 +8,5 @@ RUNBOOK — Solana Meme Bundler
 • Treasury: set via UI (Set Treasury). Optional Sell ALL destination uses treasury when selected.
 • Warm-up: run mainnet warm-up after funding to precondition RPC and cache blockhashes.
 • Safety: never log private keys; only public addresses/signatures.
+
+See also apps/web/src/RUNBOOK.md for detailed healthcheck, logger, price feed and troubleshooting notes.

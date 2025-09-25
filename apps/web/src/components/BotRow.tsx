@@ -17,6 +17,7 @@ const rowStyle: React.CSSProperties = {
 export default function BotRow({ bot }: { bot: LiveBot }) {
   const updateBot = useStore(s => s.updateBot);
   const startBot  = useStore(s => s.startBot);
+  const getConn = () => (window as any).__conn;
   const stopBot   = useStore(s => s.stopBot);
   const removeBot = useStore(s => s.removeBot);
   const exportKey = useStore(s => s.exportBotKey);
@@ -83,7 +84,7 @@ export default function BotRow({ bot }: { bot: LiveBot }) {
 
       {bot.running
         ? <button onClick={() => stopBot(bot.id)} className="btn">Stop</button>
-        : <button onClick={() => startBot(bot.id, null as any)} className="btn">Start</button>}
+        : <button onClick={() => startBot(bot.id, getConn())} className="btn">Start</button>}
 
       <button onClick={() => {
         const sec = exportKey(bot.id);
