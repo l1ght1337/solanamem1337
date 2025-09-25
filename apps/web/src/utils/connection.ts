@@ -1,4 +1,4 @@
-import { Connection, Commitment, VersionedTransaction } from "@solana/web3.js";
+import { Connection, Commitment } from "@solana/web3.js";
 
 type RpcStats = {
   url: string;
@@ -11,8 +11,15 @@ type RpcStats = {
 
 const DEFAULT_COMMITMENT: Commitment = "confirmed";
 
+export type RpcEndpoint = { url: string; name: string };
+
 export function makeSmartConnection(url: string): Connection {
   return new Connection(url, { commitment: DEFAULT_COMMITMENT });
+}
+
+// compat alias with spec
+export function makeConnection(url: string): Connection {
+  return makeSmartConnection(url);
 }
 
 function percentile(arr: number[], p: number): number {
@@ -129,5 +136,29 @@ export async function healthcheckAndMaybeFailover(): Promise<void> {
     stats[activeIdx].lastError = e?.message || String(e);
     tryFailover();
   }
+}
+
+// Try endpoints one by one with a 1500ms timeout and simple RPC calls
+export async function pickHealthy(rpcs: RpcEndpoint[]): Promise<{ connection: Connection; endpoint: RpcEndpoint } | null> {
+  const list = (rpcs || []).filter((r) => r && r.url).slice();
+  for (const ep of list) {
+    const conn = makeConnection(ep.url);
+    const ok = await (async () => {
+      const ac = new AbortController();
+      const to = setTimeout(() => ac.abort(), 1500);
+      try {
+        // run a couple of cheap calls sequentially to avoid rate spikes
+        await conn.getLatestBlockhash("processed");
+        await conn.getSlot("processed");
+        clearTimeout(to);
+        return true;
+      } catch {
+        clearTimeout(to);
+        return false;
+      }
+    })();
+    if (ok) return { connection: conn, endpoint: ep };
+  }
+  return null;
 }
 
