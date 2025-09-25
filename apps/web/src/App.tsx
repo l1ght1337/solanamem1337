@@ -8,6 +8,7 @@ import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
 import { getTxTelemetry } from "./utils/tx";
 import { getActiveConnection, getActiveRpcUrl, getRpcTelemetry, healthcheckAndMaybeFailover } from "./utils/connection";
+import { parseLocaleNumber, safeParseNumber, toFixedOrZero } from "./utils/number";
 
 declare global {
   interface Window {
@@ -251,76 +252,92 @@ export default function App() {
           {/* Аллокация 70/30 контролы */}
           <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Alloc:</span>
           <input
+            id="alloc-target"
+            name="allocTarget"
             type="number"
             min={0.05}
             max={0.95}
             step={0.01}
             value={s.allocTarget}
-            onChange={(e) => s.setAlloc(Number(e.target.value), s.allocMin, s.allocMax)}
+            onChange={(e) => s.setAlloc(safeParseNumber(e.target.value), s.allocMin, s.allocMax)}
             style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Target token allocation (0..1)"
           />
           <input
+            id="alloc-min"
+            name="allocMin"
             type="number"
             min={0.05}
             max={0.98}
             step={0.01}
             value={s.allocMin}
-            onChange={(e) => s.setAlloc(s.allocTarget, Number(e.target.value), s.allocMax)}
+            onChange={(e) => s.setAlloc(s.allocTarget, safeParseNumber(e.target.value), s.allocMax)}
             style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Min token allocation (rebalance buy)"
           />
           <input
+            id="alloc-max"
+            name="allocMax"
             type="number"
             min={0.06}
             max={0.98}
             step={0.01}
             value={s.allocMax}
-            onChange={(e) => s.setAlloc(s.allocTarget, s.allocMin, Number(e.target.value))}
+            onChange={(e) => s.setAlloc(s.allocTarget, s.allocMin, safeParseNumber(e.target.value))}
             style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Max token allocation (rebalance sell)"
           />
           {/* Шаг сделок */}
           <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Step:</span>
           <input
+            id="trade-step-min"
+            name="tradeStepMinSol"
             type="number"
             min={0.00005}
             step={0.00005}
             value={s.tradeStepMinSol}
-            onChange={(e) => s.setTradeStep(Number(e.target.value), s.tradeStepMaxSol, s.tradeSlicesMax, s.tradeJitterPct)}
+            onChange={(e) => s.setTradeStep(safeParseNumber(e.target.value), s.tradeStepMaxSol, s.tradeSlicesMax, s.tradeJitterPct)}
             style={{ width: 80, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Min SOL per sub-order"
           />
           <input
+            id="trade-step-max"
+            name="tradeStepMaxSol"
             type="number"
             min={0.0001}
             step={0.0001}
             value={s.tradeStepMaxSol}
-            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, Number(e.target.value), s.tradeSlicesMax, s.tradeJitterPct)}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, safeParseNumber(e.target.value), s.tradeSlicesMax, s.tradeJitterPct)}
             style={{ width: 80, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Max SOL per sub-order"
           />
           <input
+            id="trade-slices-max"
+            name="tradeSlicesMax"
             type="number"
             min={1}
             max={5}
             step={1}
             value={s.tradeSlicesMax}
-            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, Number(e.target.value), s.tradeJitterPct)}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, safeParseNumber(e.target.value), s.tradeJitterPct)}
             style={{ width: 60, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Max slices per order"
           />
           <input
+            id="trade-jitter-pct"
+            name="tradeJitterPct"
             type="number"
             min={0}
             max={0.5}
             step={0.01}
             value={s.tradeJitterPct}
-            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, s.tradeSlicesMax, Number(e.target.value))}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, s.tradeSlicesMax, safeParseNumber(e.target.value))}
             style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
             title="Random jitter of step size (0..0.5)"
           />
           <input
+            id="token-url"
+            name="tokenUrl"
             placeholder="Вставь ссылку BonkFun / LetsBonk (или mint)"
             value={s.tokenUrl}
             onChange={(e) => s.setTokenUrl(e.target.value)}
@@ -337,23 +354,25 @@ export default function App() {
           <div style={{ fontWeight: 600, marginBottom: 8 }}>Create Pump.fun token + авто-покупка ботами</div>
           <div style={row}>
             <span>Name</span>
-            <input value={cName} onChange={(e) => setCName(e.target.value)} style={{ ...input, width: 160 }} />
+            <input id="create-name" name="name" value={cName} onChange={(e) => setCName(e.target.value)} style={{ ...input, width: 160 }} />
             <span>Symbol</span>
-            <input value={cSymbol} onChange={(e) => setCSymbol(e.target.value)} style={{ ...input, width: 120 }} />
+            <input id="create-symbol" name="symbol" value={cSymbol} onChange={(e) => setCSymbol(e.target.value)} style={{ ...input, width: 120 }} />
             <span>Image URL</span>
-            <input value={cImage} onChange={(e) => setCImage(e.target.value)} style={{ ...input, width: 260 }} />
+            <input id="create-image" name="image" value={cImage} onChange={(e) => setCImage(e.target.value)} style={{ ...input, width: 260 }} />
           </div>
           <div style={row}>
             <span>Desc</span>
-            <input value={cDesc} onChange={(e) => setCDesc(e.target.value)} style={{ ...input, width: 420 }} />
+            <input id="create-desc" name="description" value={cDesc} onChange={(e) => setCDesc(e.target.value)} style={{ ...input, width: 420 }} />
             <span>Decimals</span>
-            <input type="number" value={cDec} onChange={(e) => setCDec(+e.target.value)} style={{ ...input, width: 80 }} />
+            <input id="create-decimals" name="decimals" type="number" value={cDec} onChange={(e) => setCDec(safeParseNumber(e.target.value, 6))} style={{ ...input, width: 80 }} />
             <span>Initial buy (SOL)</span>
             <input
+              id="create-initial-buy"
+              name="initialBuy"
               type="number"
               step="0.001"
               value={cInitialBuy}
-              onChange={(e) => setCInitialBuy(+e.target.value)}
+              onChange={(e) => setCInitialBuy(safeParseNumber(e.target.value, 0))}
               style={{ ...input, width: 120 }}
             />
             <button onClick={createPump} style={btn}>
@@ -366,14 +385,18 @@ export default function App() {
         <div style={row}>
           <span>Slippage (bps)</span>
           <input
+            id="slippage-bps"
+            name="slippageBps"
             type="number"
             step="1"
             value={s.slippageBps}
-            onChange={(e) => useStore.setState({ slippageBps: Math.max(0, Number(e.target.value) || 0) })}
+            onChange={(e) => useStore.setState({ slippageBps: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 90 }}
           />
           <label style={toggle}>
             <input
+              id="use-random-size"
+              name="useRandomSize"
               type="checkbox"
               checked={s.useRandomSize}
               onChange={(e) => useStore.setState({ useRandomSize: e.target.checked })}
@@ -382,18 +405,22 @@ export default function App() {
           </label>
           <span>min</span>
           <input
+            id="trade-range-min"
+            name="tradeRangeMin"
             type="number"
             step="0.001"
             value={s.tradeRange.minSol}
-            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, minSol: Number(e.target.value) || 0 } })}
+            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, minSol: safeParseNumber(e.target.value, 0) } })}
             style={{ ...input, width: 90 }}
           />
           <span>max</span>
           <input
+            id="trade-range-max"
+            name="tradeRangeMax"
             type="number"
             step="0.001"
             value={s.tradeRange.maxSol}
-            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, maxSol: Number(e.target.value) || 0 } })}
+            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, maxSol: safeParseNumber(e.target.value, 0) } })}
             style={{ ...input, width: 90 }}
           />
         </div>
@@ -402,6 +429,8 @@ export default function App() {
         <div style={row}>
           <label style={toggle}>
             <input
+              id="smart-mm-enabled"
+              name="smartMMEnabled"
               type="checkbox"
               checked={s.smartMM.enabled}
               onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, enabled: e.target.checked } })}
@@ -410,38 +439,48 @@ export default function App() {
           </label>
           <span>minBps</span>
           <input
+            id="smart-mm-min-bps"
+            name="smartMMMinBps"
             type="number"
             value={s.smartMM.minBps}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, minBps: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, minBps: safeParseNumber(e.target.value, 20) } })}
             style={{ ...input, width: 80 }}
           />
           <span>maxBps</span>
           <input
+            id="smart-mm-max-bps"
+            name="smartMMMaxBps"
             type="number"
             value={s.smartMM.maxBps}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, maxBps: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, maxBps: safeParseNumber(e.target.value, 200) } })}
             style={{ ...input, width: 80 }}
           />
           <span>α</span>
           <input
+            id="smart-mm-alpha"
+            name="smartMMAlpha"
             type="number"
             step="0.05"
             value={s.smartMM.alpha}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, alpha: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, alpha: safeParseNumber(e.target.value, 0.6) } })}
             style={{ ...input, width: 80 }}
           />
           <span>TWAP</span>
           <input
+            id="smart-mm-twap-sec"
+            name="smartMMTwapSec"
             type="number"
             value={s.smartMM.twapSec}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSec: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSec: safeParseNumber(e.target.value, 120) } })}
             style={{ ...input, width: 80 }}
           />
           <span>slices</span>
           <input
+            id="smart-mm-twap-slices"
+            name="smartMMTwapSlices"
             type="number"
             value={s.smartMM.twapSlices}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSlices: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSlices: safeParseNumber(e.target.value, 4) } })}
             style={{ ...input, width: 80 }}
           />
           <span style={{ opacity: 0.75 }}>now bps: {s.getSmartBps()}</span>
@@ -450,23 +489,27 @@ export default function App() {
         {/* Комиссионный резерв / Treasury */}
         <div style={row}>
           <label style={toggle}>
-            <input type="checkbox" checked={s.autoTopUp} onChange={(e) => useStore.setState({ autoTopUp: e.target.checked })} />
+            <input id="auto-top-up" name="autoTopUp" type="checkbox" checked={s.autoTopUp} onChange={(e) => useStore.setState({ autoTopUp: e.target.checked })} />
             Auto top-up
           </label>
           <span>Min fee (SOL)</span>
           <input
+            id="min-fee-sol"
+            name="minFeeSol"
             type="number"
             step="0.001"
             value={s.minFeeSol}
-            onChange={(e) => useStore.setState({ minFeeSol: Math.max(0, +e.target.value || 0) })}
+            onChange={(e) => useStore.setState({ minFeeSol: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 90 }}
           />
           <span>Top-up to</span>
           <input
+            id="top-up-to-sol"
+            name="topUpToSol"
             type="number"
             step="0.001"
             value={s.topUpToSol}
-            onChange={(e) => useStore.setState({ topUpToSol: Math.max(0, +e.target.value || 0) })}
+            onChange={(e) => useStore.setState({ topUpToSol: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 90 }}
           />
           <TreasurySetter />
@@ -476,10 +519,12 @@ export default function App() {
         <div style={row}>
           <span>Fund total (SOL)</span>
           <input
+            id="fund-total"
+            name="fundTotal"
             type="number"
             step="0.001"
             value={fundTotal}
-            onChange={(e) => setFundTotal(+e.target.value)}
+            onChange={(e) => setFundTotal(safeParseNumber(e.target.value, 0))}
             style={{ ...input, width: 120 }}
           />
           <button onClick={fundAllEqually} style={btn}>
@@ -487,7 +532,7 @@ export default function App() {
           </button>
 
           <label style={{ ...toggle, marginLeft: 8 }}>
-            <input type="checkbox" checked={warmAfterFund} onChange={(e) => setWarmAfterFund(e.target.checked)} />
+            <input id="warm-after-fund" name="warmAfterFund" type="checkbox" checked={warmAfterFund} onChange={(e) => setWarmAfterFund(e.target.checked)} />
             Warm-up after fund (mainnet)
           </label>
           <button onClick={mainnetWarm} style={btn}>
@@ -498,18 +543,20 @@ export default function App() {
         <div style={row}>
           <span>Drain keep (SOL)</span>
           <input
+            id="drain-min-keep-sol"
+            name="drainMinKeepSol"
             type="number"
             step="0.001"
             value={s.drainMinKeepSol}
-            onChange={(e) => useStore.setState({ drainMinKeepSol: Math.max(0, +e.target.value || 0) })}
+            onChange={(e) => useStore.setState({ drainMinKeepSol: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 110 }}
           />
           <label style={toggle}>
-            <input type="radio" name="drainTo" checked={drainTo === "wallet"} onChange={() => setDrainTo("wallet")} />
+            <input id="drain-to-wallet" type="radio" name="drainTo" checked={drainTo === "wallet"} onChange={() => setDrainTo("wallet")} />
             to Wallet
           </label>
           <label style={toggle}>
-            <input type="radio" name="drainTo" checked={drainTo === "treasury"} onChange={() => setDrainTo("treasury")} />
+            <input id="drain-to-treasury" type="radio" name="drainTo" checked={drainTo === "treasury"} onChange={() => setDrainTo("treasury")} />
             to Treasury
           </label>
           <button onClick={drainAll} style={btn}>
@@ -534,11 +581,11 @@ export default function App() {
         {/* SELL ALL */}
         <div style={row}>
           <label style={toggle}>
-            <input type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'wallet'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'wallet' } })} />
+            <input id="sell-dest-wallet" type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'wallet'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'wallet' } })} />
             to Wallet
           </label>
           <label style={toggle}>
-            <input type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'treasury'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'treasury' } })} />
+            <input id="sell-dest-treasury" type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'treasury'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'treasury' } })} />
             to Treasury
           </label>
           <button
@@ -634,7 +681,7 @@ export default function App() {
               Copy
             </button>
 
-            <select value={b.strategy} onChange={(e) => s.updateBot(b.id, { strategy: e.target.value as any })} style={select}>
+            <select id={`bot-table-${b.id}-strategy`} name="strategy" value={b.strategy} onChange={(e) => s.updateBot(b.id, { strategy: e.target.value as any })} style={select}>
               <option value="trend">trend</option>
               <option value="revert">revert</option>
               <option value="scalper">scalper</option>
@@ -645,27 +692,31 @@ export default function App() {
 
             <span>Budget (SOL)</span>
             <input
+              id={`bot-table-${b.id}-budget`}
+              name="budget"
               type="number"
               step="0.001"
               value={b.budgetSol}
-              onChange={(e) => s.updateBot(b.id, { budgetSol: +e.target.value })}
+              onChange={(e) => s.updateBot(b.id, { budgetSol: safeParseNumber(e.target.value, 0) })}
               style={{ ...input, width: 90, opacity: s.useRandomSize ? 0.75 : 1 }}
             />
 
             <span>Speed (ms)</span>
             <input
+              id={`bot-table-${b.id}-speed`}
+              name="speed"
               type="number"
               step="100"
               value={b.speedMs}
-              onChange={(e) => s.updateBot(b.id, { speedMs: Math.max(200, +e.target.value || 0) })}
+              onChange={(e) => s.updateBot(b.id, { speedMs: Math.max(200, safeParseNumber(e.target.value, 0)) })}
               style={{ ...input, width: 90 }}
             />
 
             <label style={toggle}>
-              <input type="checkbox" checked={b.aiEnabled} onChange={(e) => s.updateBot(b.id, { aiEnabled: e.target.checked })} /> AI
+              <input id={`bot-table-${b.id}-ai`} name="aiEnabled" type="checkbox" checked={b.aiEnabled} onChange={(e) => s.updateBot(b.id, { aiEnabled: e.target.checked })} /> AI
             </label>
             <label style={toggle}>
-              <input type="checkbox" checked={!!b.manualLock} onChange={(e) => s.updateBot(b.id, { manualLock: e.target.checked })} /> Manual
+              <input id={`bot-table-${b.id}-manual`} name="manualLock" type="checkbox" checked={!!b.manualLock} onChange={(e) => s.updateBot(b.id, { manualLock: e.target.checked })} /> Manual
               lock
             </label>
 
@@ -690,8 +741,8 @@ export default function App() {
             {(() => {
               const fills = b.fills ?? 0;
               const avg = (b.avgSol ?? 0).toFixed(9);
-              const realized = (b.realized ?? 0).toFixed(5);
-              const unrl = (b.unrealized ?? 0).toFixed(5);
+              const realized = toFixedOrZero(b.realized, 5);
+              const unrl = toFixedOrZero(b.unrealized, 5);
               const sol = (b.solBalance ?? 0).toFixed(4);
               const tok = (b.tokenBalance ?? 0).toFixed(3);
               return (
@@ -740,8 +791,10 @@ function TreasurySetter() {
   const [secret, setSecret] = useState("");
   return (
     <>
-      <input placeholder="Treasury name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 160 }} />
+      <input id="treasury-name" name="treasuryName" placeholder="Treasury name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 160 }} />
       <input
+        id="treasury-secret"
+        name="treasurySecret"
         placeholder="Treasury secret (base58/base64)"
         value={secret}
         onChange={(e) => setSecret(e.target.value)}
@@ -767,8 +820,10 @@ function ImportBot() {
   const [secret, setSecret] = useState("");
   return (
     <>
-      <input placeholder="Bot name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 140 }} />
+      <input id="import-bot-name" name="botName" placeholder="Bot name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 140 }} />
       <input
+        id="import-bot-secret"
+        name="botSecret"
         placeholder="Bot secret (base58/base64)"
         value={secret}
         onChange={(e) => setSecret(e.target.value)}

@@ -15,10 +15,28 @@ const hmrHost = gpUrl ? `${port}-${gpUrl.hostname}` : undefined;
 
 export default defineConfig({
   plugins: [react()],
+  define: {
+    // Disable any potential eval in production
+    __DEV__: process.env.NODE_ENV !== 'production',
+  },
   build: {
-    sourcemap: true,
+    sourcemap: false, // Disable sourcemaps for CSP compliance
     minify: 'terser',
-    terserOptions: { keep_classnames: true, keep_fnames: true },
+    terserOptions: { 
+      keep_classnames: true, 
+      keep_fnames: true,
+      // Additional CSP-safe options
+      compress: {
+        drop_console: true,
+        drop_debugger: true,
+      }
+    },
+    // CSP-safe rollup options
+    rollupOptions: {
+      output: {
+        manualChunks: undefined, // Prevent dynamic imports that might use eval
+      }
+    }
   },
   server: {
     host: true,           // слушать 0.0.0.0, чтобы Gitpod мог проксировать

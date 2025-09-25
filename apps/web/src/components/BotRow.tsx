@@ -1,6 +1,7 @@
 // src/components/BotRow.tsx
 import React from 'react';
 import { useStore, LiveBot } from '../store';
+import { parseLocaleNumber, safeParseNumber } from '../utils/number';
 
 const rowStyle: React.CSSProperties = {
   display: 'grid',
@@ -28,6 +29,8 @@ export default function BotRow({ bot }: { bot: LiveBot }) {
       </div>
 
       <select
+        id={`bot-${bot.id}-strategy`}
+        name="strategy"
         value={bot.strategy}
         onChange={e => updateBot(bot.id, { strategy: e.target.value as LiveBot['strategy'] })}
         style={{ padding: 6, borderRadius:6, background:'#111826', color:'#fff', border:'1px solid #334155' }}
@@ -41,29 +44,37 @@ export default function BotRow({ bot }: { bot: LiveBot }) {
       </select>
 
       <input
+        id={`bot-${bot.id}-budget`}
+        name="budget"
         value={bot.budgetSol}
-        onChange={e => updateBot(bot.id, { budgetSol: +e.target.value })}
+        onChange={e => updateBot(bot.id, { budgetSol: safeParseNumber(e.target.value, 0) })}
         style={{ padding:6, borderRadius:6, background:'#0b1220', color:'#fff', border:'1px solid #334155' }}
         placeholder="Budget (SOL)"
       />
 
       <input
+        id={`bot-${bot.id}-speed`}
+        name="speed"
         value={bot.speedMs}
-        onChange={e => updateBot(bot.id, { speedMs: +e.target.value })}
+        onChange={e => updateBot(bot.id, { speedMs: safeParseNumber(e.target.value, 1000) })}
         style={{ padding:6, borderRadius:6, background:'#0b1220', color:'#fff', border:'1px solid #334155' }}
         placeholder="Speed (ms)"
       />
 
-      <label style={{display:'flex', alignItems:'center', gap:6}}>
+      <label htmlFor={`bot-${bot.id}-ai`} style={{display:'flex', alignItems:'center', gap:6}}>
         <input
+          id={`bot-${bot.id}-ai`}
+          name="aiEnabled"
           type="checkbox"
           checked={bot.aiEnabled}
           onChange={e => updateBot(bot.id, { aiEnabled: e.target.checked })}
         /> AI
       </label>
 
-      <label style={{display:'flex', alignItems:'center', gap:6}}>
+      <label htmlFor={`bot-${bot.id}-manual`} style={{display:'flex', alignItems:'center', gap:6}}>
         <input
+          id={`bot-${bot.id}-manual`}
+          name="manualLock"
           type="checkbox"
           checked={!!bot.manualLock}
           onChange={e => updateBot(bot.id, { manualLock: e.target.checked })}

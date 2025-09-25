@@ -24,9 +24,10 @@ import { fetchExternalPrice } from "./store-price-feeds";
 import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./utils/keyring";
 import { getMintDecimals, getSPLBalance } from "./utils/solana";
 import { scheduleFetch, getNetMetrics } from "./utils/network";
-import { createLimiter, ensureAtaIx, detectTokenProgram as detectTokenProgramUtil, sendTxWithRetries } from "./utils/tx";
+import { createLimiter, ensureAtaIx, detectTokenProgram as detectTokenProgramUtil, sendTxWithRetries, buildPriorityComputeIxs } from "./utils/tx";
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
 import { fetchMultipleAccountInfos } from "./utils/balances";
+import { safeParseNumber, safeDivide, safeMultiply, safeAdd } from "./utils/number";
 
 export type BotStrategy = "trend" | "revert" | "scalper" | "momentum" | "range" | "maker";
 
@@ -396,14 +397,19 @@ const sanitizeSmartMM = (mm?: Partial<SmartMM>): SmartMM => {
 };
 
 /* ===== Store ===== */
+export type LightRefresh = { ts: number };
+
 export type Store = {
   tokenUrl: string;
   tokenMint: string | null;
   price: number;
   candles: { t: number; open: number; high: number; low: number; close: number; volume: number }[];
 
-  /** метка последнего лёгкого рефреша балансов (ms since epoch) */
-  lastLightRefresh: number | null;
+  /** throttled "light refresh" marker */
+  lightRefresh?: LightRefresh;
+
+  /** Central bot scheduler for stability */
+  scheduler: Map<string, { running: boolean; abort: AbortController; stopFn?: () => void }>;
 
   /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
   ticks: { t: number; p: number }[];
@@ -473,6 +479,9 @@ export type Store = {
   cancelSellAll: () => void;
   sellAllParallel: (connection: Connection, dest: { to: "wallet"; walletPubkey: string } | { to: "treasury" }) => Promise<void>;
 
+  setLightRefresh: () => void;
+  shouldLightRefresh: (ms: number) => boolean;
+
   refreshBalances: (connection: Connection) => Promise<void>;
   tickReal: () => Promise<void>;
 
@@ -539,7 +548,8 @@ export const useStore = create<Store>()(
       tokenMint: null,
       price: 0,
       candles: [],
-      lastLightRefresh: null,
+      lightRefresh: { ts: 0 },
+      scheduler: new Map(),
 
       ticks: [],
       getChangeFast(sec = 15) {
@@ -878,11 +888,18 @@ export const useStore = create<Store>()(
         s.addLog("ok", `Mainnet warm-up завершён: ${txPerBot} tx/бот (≈${estPerBotSol.toFixed(6)} SOL/бот)`);
       },
 
-      // Запуск/остановка
+      // Запуск/остановка with central scheduler
       async startBot(id, connection) {
         const s = get();
         const bot = s.bots.find((b) => b.id === id);
         if (!bot || !s.tokenMint) return;
+
+        // Check if already running via scheduler
+        const existing = s.scheduler.get(id);
+        if (existing?.running) {
+          s.addLog("warn", `Bot ${bot.name} уже запущен`);
+          return;
+        }
 
         if (bot.solBalance < s.minFeeSol) {
           if (s.autoTopUp && s.treasuryKeyId) {
@@ -897,8 +914,16 @@ export const useStore = create<Store>()(
         const kp = getKeypair(bot.keyId);
         if (!kp) return s.addLog("err", "Не найден ключ бота");
 
+        // Create abort controller for this bot
+        const abort = new AbortController();
+        s.scheduler.set(id, { running: true, abort });
+
         bot.running = true;
-        set({ bots: [...s.bots] });
+        set({ bots: [...s.bots], scheduler: new Map(s.scheduler) });
+
+        // Stagger start by 0-400ms to prevent collisions
+        const delay = Math.floor(Math.random() * 400);
+        await new Promise(resolve => setTimeout(resolve, delay));
 
         const runnerLoader =
           get().external.provider === "pumpportal"
@@ -907,7 +932,8 @@ export const useStore = create<Store>()(
 
         const run = await runnerLoader();
 
-        const stop = (run as any)(connection, bot as any, {
+        try {
+          const stop = (run as any)(connection, bot as any, {
           mint: s.tokenMint!,
           slippageBps: () => safeBps(get().getSmartBps(), 50),
           twap: get().getTwapPlan(),
@@ -964,21 +990,59 @@ export const useStore = create<Store>()(
           },
           getAlloc: () => get().getAlloc(),
           getTradeStep: () => get().getTradeStep(),
+          setLightRefresh: () => get().setLightRefresh(),
+          shouldLightRefresh: (ms: number) => get().shouldLightRefresh(ms),
+          abortSignal: abort.signal,
         } as any);
 
-        (bot as any).__stop = stop;
+          // Store the stop function in scheduler
+          const schedEntry = get().scheduler.get(id);
+          if (schedEntry) {
+            schedEntry.stopFn = stop;
+            get().scheduler.set(id, schedEntry);
+          }
+
+        } catch (error: any) {
+          // If startup failed, clean up scheduler
+          const s = get();
+          s.scheduler.delete(id);
+          bot.running = false;
+          set({ bots: [...s.bots], scheduler: new Map(s.scheduler) });
+          s.addLog("err", `Ошибка запуска ${bot.name}: ${error?.message || error}`);
+        }
       },
 
       stopBot: (id) =>
         set((s) => {
           const b = s.bots.find((x) => x.id === id);
-          if (b && (b as any).__stop) { try { (b as any).__stop(); } catch {} delete (b as any).__stop; }
+          const schedEntry = s.scheduler.get(id);
+          
+          if (schedEntry) {
+            // Stop via scheduler - abort and call stop function
+            try {
+              schedEntry.abort.abort();
+              if (schedEntry.stopFn) schedEntry.stopFn();
+            } catch {}
+            
+            schedEntry.running = false;
+            s.scheduler.delete(id);
+          }
+          
+          // Legacy cleanup
+          if (b && (b as any).__stop) { 
+            try { (b as any).__stop(); } catch {} 
+            delete (b as any).__stop; 
+          }
+          
           if (b) b.running = false;
-          return { bots: [...s.bots] };
+          return { bots: [...s.bots], scheduler: new Map(s.scheduler) };
         }),
 
       startAll: (connection) => { get().bots.forEach((b) => get().startBot(b.id, connection)); },
       stopAll: () => { get().bots.forEach((b) => get().stopBot(b.id)); },
+
+      setLightRefresh: () => set(s => ({ lightRefresh: { ts: Date.now() } })),
+      shouldLightRefresh: (ms: number) => Date.now() - (get().lightRefresh?.ts ?? 0) > ms,
 
       // ===== Sell ALL state =====
       sellAllState: {
@@ -1016,7 +1080,7 @@ export const useStore = create<Store>()(
           decimals = (decimals ?? 9);
 
           const bots = get().bots.slice();
-          const maxPar = Math.max(1, Number(((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS) ?? 8));
+          const maxPar = Math.max(1, Number(((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS) ?? 10));
           const limit = createLimiter(maxPar);
           const dstOwner = dest.to === 'wallet'
             ? new PublicKey((dest as any).walletPubkey)
@@ -1093,6 +1157,10 @@ export const useStore = create<Store>()(
           }
           const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
 
+          const priorityFeeSol = Math.max(
+            Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MIN) ?? 1500) / 1_000_000_000,
+            0.00001
+          );
           const payload = {
             publicKey: dstOwner.toBase58(),
             action: 'sell',
@@ -1100,7 +1168,7 @@ export const useStore = create<Store>()(
             denominatedInSol: 'false',
             amount: amountRounded,
             slippage: safeBps(get().getSmartBps(), 50) / 100,
-            priorityFee: 0.00001,
+            priorityFee: priorityFeeSol,
             pool: 'auto',
           } as any;
 
@@ -1232,7 +1300,7 @@ export const useStore = create<Store>()(
                 tok = rawSum / Math.pow(10, decimals);
               }
             }
-            const unreal = b.posToken * (priceNow - (b.avgSol || priceNow));
+            const unreal = safeMultiply(b.posToken || 0, (priceNow || 0) - (b.avgSol || priceNow || 0));
             return { ...b, solBalance: sol, tokenBalance: tok, unrealized: unreal };
           });
 
@@ -1281,9 +1349,8 @@ export const useStore = create<Store>()(
         if (!s.tokenMint) return;
         if (s.external.provider === "pumpportal") {
           // даже при WS‑цене иногда подёргиваем балансы
-          const now = Date.now();
-          if (!s.lastLightRefresh || now - s.lastLightRefresh > 8000) {
-            set({ lastLightRefresh: now });
+          if (get().shouldLightRefresh(8000)) {
+            get().setLightRefresh();
             const wc = (window as any).__conn as Connection | undefined;
             if (wc) { try { await get().refreshBalances(wc); } catch {} }
           }
@@ -1323,7 +1390,7 @@ export const useStore = create<Store>()(
           const ticks = (st.ticks || []).concat({ t: now, p: p! });
           const cut = now - 60_000;
 
-          const bots = st.bots.map((b) => ({ ...b, unrealized: b.posToken * (p! - (b.avgSol || p!)) }));
+          const bots = st.bots.map((b) => ({ ...b, unrealized: safeMultiply(b.posToken || 0, (p! || 0) - (b.avgSol || p! || 0)) }));
           return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
         });
       },

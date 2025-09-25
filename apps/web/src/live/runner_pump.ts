@@ -7,6 +7,7 @@ import {
 import { getSPLBalance } from "../utils/solana";
 import { scheduleFetch } from "../utils/network";
 import { getJupiterQuote, WSOL } from "../utils/jupiter";
+import { safeMultiply, safeAdd } from "../utils/number";
 
 /* ───────────────────────────── Types ───────────────────────────── */
 type BotStrategy = "trend" | "revert" | "scalper";
@@ -48,6 +49,10 @@ type RunCtx = {
   tradeSize: () => number;
 
   isAiPaused?: () => boolean;
+
+  setLightRefresh?: () => void;
+  shouldLightRefresh?: (ms: number) => boolean;
+  abortSignal?: AbortSignal;
 
   onLog: (level: "info" | "ok" | "warn" | "err", msg: string) => void;
   onUpdate: (b: LiveBot) => void;
@@ -615,7 +620,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         if (trailHighPrice <= 0 || priceNow > trailHighPrice) trailHighPrice = priceNow;
       } else {
         const sellQty = executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
-        bot.realized += (priceNow - (bot.avgSol || priceNow)) * sellQty;
+        bot.realized = safeAdd(bot.realized || 0, safeMultiply((priceNow || 0) - (bot.avgSol || priceNow || 0), sellQty || 0));
         bot.posToken = Math.max(0, bot.posToken - sellQty);
         bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
         bot.solBalance = Math.max(0, (bot.solBalance ?? 0) + Math.max(0, sellQty * priceNow - FEE_EST_SOL * executedSlices)); // FIX
@@ -625,7 +630,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         if (bot.posToken <= 0) trailHighPrice = 0;
       }
 
-      bot.unrealized = bot.posToken * (priceNow - (bot.avgSol || priceNow));
+      bot.unrealized = safeMultiply(bot.posToken || 0, (priceNow || 0) - (bot.avgSol || priceNow || 0));
       bot.fills += executedSlices; // FIX: по количеству срезов
       bot.last =
         side === "buy"
@@ -713,20 +718,20 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   setTimeout(loop, 100 + Math.floor(Math.random() * 500));
   return () => { stopped = true; };
 
-  let lastLightRefresh = 0;
+  // lastLightRefresh now handled in store
 
   async function loop() {
-    if (stopped || !bot.running) return;
+    if (stopped || !bot.running || ctx.abortSignal?.aborted) return;
     if (pending) return;
 
     const now = Date.now();
 
     if (now < nextRetryAt) {
-      setTimeout(loop, Math.max(200, nextRetryAt - now));
+      if (!ctx.abortSignal?.aborted) setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
     }
     if (now < cooldownUntil) {
-      setTimeout(loop, Math.max(50, cooldownUntil - now));
+      if (!ctx.abortSignal?.aborted) setTimeout(loop, Math.max(50, cooldownUntil - now));
       return;
     }
     if (lossCooldownUntil && now >= lossCooldownUntil) {
@@ -759,9 +764,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     pending = true;
     try {
       // periodic light on-chain refresh (keeps UI in sync even without trades)
-      if (now - lastLightRefresh > 10000) {
+      if (ctx.shouldLightRefresh?.(10000)) {
         await refreshOnChainBalances();
-        lastLightRefresh = now;
+        ctx.setLightRefresh?.();
       }
 
       if (ctx.isAiPaused && ctx.isAiPaused()) {
@@ -1080,7 +1085,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           }
         }
         bot.last = "hold";
-        bot.unrealized = bot.posToken * (p - (bot.avgSol || p));
+        bot.unrealized = safeMultiply(bot.posToken || 0, (p || 0) - (bot.avgSol || p || 0));
         pushUpdate({ last: bot.last, unrealized: bot.unrealized, fills: bot.fills });
       }
     } catch (e: any) {
@@ -1090,7 +1095,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     } finally {
       pending = false;
       const jitter = 200 + Math.floor(Math.random() * 300);
-      if (!stopped) setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+      if (!stopped && !ctx.abortSignal?.aborted) {
+        setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+      }
     }
   }
 }

@@ -53,8 +53,8 @@ export default function SeedVault({ onClose }: { onClose: () => void }) {
         </div>
 
         <div className="row" style={{gap:8, flexWrap:'wrap'}}>
-          <input className="input" placeholder="Название сид-фразы" value={name} onChange={e=>setName(e.target.value)} />
-          <input className="input" placeholder="Mnemonic (12/24 words)" value={mnemonic} onChange={e=>setMnemonic(e.target.value)} />
+          <input id="seed-name" name="seedName" className="input" placeholder="Название сид-фразы" value={name} onChange={e=>setName(e.target.value)} />
+          <input id="seed-mnemonic" name="seedMnemonic" className="input" placeholder="Mnemonic (12/24 words)" value={mnemonic} onChange={e=>setMnemonic(e.target.value)} />
           <button className="button" onClick={add}>+ Add / Generate</button>
         </div>
 
