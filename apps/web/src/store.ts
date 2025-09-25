@@ -26,6 +26,7 @@ import { getMintDecimals, getSPLBalance } from "./utils/solana";
 import { scheduleFetch, getNetMetrics } from "./utils/network";
 import { createLimiter, ensureAtaIx, detectTokenProgram as detectTokenProgramUtil, sendTxWithRetries } from "./utils/tx";
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
+import { fetchMultipleAccountInfos } from "./utils/balances";
 
 export type BotStrategy = "trend" | "revert" | "scalper" | "momentum" | "range" | "maker";
 
@@ -292,7 +293,7 @@ async function detectTokenProgram(connection: Connection, mint: PublicKey) {
 // Быстрое чтение decimals из raw Mint-аккаунта (offset 44, u8). Без парсинга.
 async function getMintDecimalsFast(connection: Connection, mint: PublicKey): Promise<number | null> {
   try {
-    const infos = await connection.getMultipleAccountsInfo([mint]);
+    const infos = await fetchMultipleAccountInfos(connection, [mint]);
     const acc = infos?.[0] || null;
     const data = (acc?.data as any) as Uint8Array | undefined;
     if (data && data.byteLength >= 45) return data[44];
@@ -401,6 +402,9 @@ export type Store = {
   price: number;
   candles: { t: number; open: number; high: number; low: number; close: number; volume: number }[];
 
+  /** метка последнего лёгкого рефреша балансов (ms since epoch) */
+  lastLightRefresh: number | null;
+
   /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
   ticks: { t: number; p: number }[];
   /** быстрый импульс: изменение цены за последние `sec` секунд */
@@ -469,7 +473,7 @@ export type Store = {
   cancelSellAll: () => void;
   sellAllParallel: (connection: Connection, dest: { to: "wallet"; walletPubkey: string } | { to: "treasury" }) => Promise<void>;
 
-  refreshBalances: (connection: any) => Promise<void>;
+  refreshBalances: (connection: Connection) => Promise<void>;
   tickReal: () => Promise<void>;
 
   createPumpToken: (
@@ -535,6 +539,7 @@ export const useStore = create<Store>()(
       tokenMint: null,
       price: 0,
       candles: [],
+      lastLightRefresh: null,
 
       ticks: [],
       getChangeFast(sec = 15) {
@@ -1027,7 +1032,7 @@ export const useStore = create<Store>()(
               if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
               const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
               const src22 = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
-              const infos = await connection.getMultipleAccountsInfo([srcClassic, src22]);
+              const infos = await fetchMultipleAccountInfos(connection as Connection, [srcClassic, src22]);
               const [srcCInfo, src22Info] = infos;
               const decodeAmount = (acc: any): bigint => {
                 try {
@@ -1174,7 +1179,7 @@ export const useStore = create<Store>()(
           const walletPks = botsList.map(b => new PublicKey(b.pubkey));
           const solInfos: (import("@solana/web3.js").AccountInfo<Buffer> | null)[] = [];
           for (const part of chunk(walletPks, 100)) {
-            const infos = await connection.getMultipleAccountsInfo(part as any);
+            const infos = await fetchMultipleAccountInfos(connection as Connection, part as any);
             solInfos.push(...infos);
           }
 
@@ -1194,7 +1199,7 @@ export const useStore = create<Store>()(
           const allAtas = [...ataClassic, ...ata2022].filter(Boolean) as import("@solana/web3.js").PublicKey[];
           if (allAtas.length) {
             for (const part of chunk(allAtas, 100)) {
-              const infos = await connection.getMultipleAccountsInfo(part as any);
+              const infos = await fetchMultipleAccountInfos(connection as Connection, part as any);
               for (let i=0;i<part.length;i++) ataInfos.set(part[i].toBase58(), infos[i]);
             }
           }
@@ -1277,10 +1282,10 @@ export const useStore = create<Store>()(
         if (s.external.provider === "pumpportal") {
           // даже при WS‑цене иногда подёргиваем балансы
           const now = Date.now();
-          if (!((s as any)._lastLightRefresh)) (s as any)._lastLightRefresh = 0;
-          if (now - (s as any)._lastLightRefresh > 8000) {
-            (s as any)._lastLightRefresh = now;
-            try { await get().refreshBalances((window as any).__conn || ({} as any)); } catch {}
+          if (!s.lastLightRefresh || now - s.lastLightRefresh > 8000) {
+            set({ lastLightRefresh: now });
+            const wc = (window as any).__conn as Connection | undefined;
+            if (wc) { try { await get().refreshBalances(wc); } catch {} }
           }
           return;
         }

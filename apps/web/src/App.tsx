@@ -7,6 +7,7 @@ import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } f
 import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
 import { getTxTelemetry } from "./utils/tx";
+import { getActiveConnection, getActiveRpcUrl, getRpcTelemetry, healthcheckAndMaybeFailover } from "./utils/connection";
 
 declare global {
   interface Window {
@@ -17,12 +18,9 @@ declare global {
 export default function App() {
   const s = useStore();
 
-  // RPC из .env (поддержка двух вариантов имен)
-  const rpcPrimary = (import.meta.env as any).VITE_SOLANA_RPC_PRIMARY ?? (import.meta.env as any).VITE_RPC_PRIMARY;
-  const rpcFallback = (import.meta.env as any).VITE_SOLANA_RPC_FALLBACK_1 ?? (import.meta.env as any).VITE_RPC_FALLBACK;
-
-  const [activeRpcUrl, setActiveRpcUrl] = useState<string>(() => (rpcPrimary || rpcFallback || ""));
-  const connection = useMemo(() => (activeRpcUrl ? new Connection(activeRpcUrl, { commitment: "processed" }) : undefined), [activeRpcUrl]);
+  // Smart RPC: primary + fallbacks with health-based failover
+  const [activeRpcUrl, setActiveRpcUrl] = useState<string>(() => getActiveRpcUrl());
+  const connection = useMemo(() => getActiveConnection(), [activeRpcUrl]);
 
   // RPC status for header
   const [rpcOk, setRpcOk] = useState<boolean | null>(null);
@@ -31,28 +29,24 @@ export default function App() {
   }, [activeRpcUrl]);
   useEffect(() => {
     let stop = false;
-    (async () => {
-      // если активный RPC не создан — попробуем первичный, иначе проверим активный
-      if (!activeRpcUrl) { setRpcOk(null); return; }
-      if (!connection) { setRpcOk(false); return; }
+    // expose connection globally for light refreshes
+    (window as any).__conn = connection;
+    const check = async () => {
       try {
-        await connection.getSlot("processed");
-        if (!stop) setRpcOk(true);
+        await healthcheckAndMaybeFailover();
+        if (!stop) {
+          setRpcOk(true);
+          const url = getActiveRpcUrl();
+          if (url && url !== activeRpcUrl) setActiveRpcUrl(url);
+        }
       } catch {
         if (!stop) setRpcOk(false);
-        // fallback: если первичный отличается от fallback — переключимся
-        if (rpcFallback && activeRpcUrl !== rpcFallback) {
-          setActiveRpcUrl(rpcFallback as string);
-        }
       }
-    })();
-    const id = setInterval(async () => {
-      if (!connection) return;
-      try { await connection.getSlot("processed"); if (!stop) setRpcOk(true); }
-      catch { if (!stop) setRpcOk(false); }
-    }, 20000);
+    };
+    check();
+    const id = setInterval(check, 15000);
     return () => { stop = true; clearInterval(id); };
-  }, [connection, activeRpcUrl, rpcFallback]);
+  }, [connection, activeRpcUrl]);
 
   // авто-тикеры — чаще для цены
   useEffect(() => {
@@ -220,7 +214,11 @@ export default function App() {
           {!activeRpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
           {activeRpcUrl && (
             <span style={{ color: rpcOk ? "#8aff8a" : rpcOk === false ? "#ff6b6b" : "#97a6ba", fontSize: 12 }}>
-              RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"} · p95 {getTxTelemetry().p95_ms} ms · fee≥{Number((import.meta.env as any).VITE_PRIORITY_FEE_MIN ?? 1000)}µ
+              RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"}
+              {" · p95Tx "}{getTxTelemetry().p95_ms}{" ms"}
+              {" · p95Confirm "}{getRpcTelemetry().p95ConfirmMs}{" ms"}
+              {" · failRate "}{(getRpcTelemetry() as any).failRate?.toFixed?.(2)}
+              {" · fee≥"}{Number((import.meta.env as any).VITE_PRIORITY_FEE_MIN ?? 1000)}{"µ"}
             </span>
           )}
         </div>
