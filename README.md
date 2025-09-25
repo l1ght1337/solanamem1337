@@ -8,7 +8,7 @@ See `apps/web/RUNBOOK.md` for operational guidance (Jito, priority fees, paralle
 **Функционал:** создание mint, запись метаданных (Token Metadata), создание ATA, минт поставки, airdrop (devnet).ааа
 
 ## Быстрый старт (Gitpod)
-1. Откройте в Gitpod (или импортируйте ZIP в свой GitHub и откройте репозиторий в Gitpod).
+1. Откройте в Gitpod (или импортируйте ZIP в свой GitHub и откройте репозиторий в Gitpod).тт
 2. Workspace сам запустит `pnpm dev` (порт 5173). Если не запустился — выполните вручную:
    ```bash
    cd apps/web
