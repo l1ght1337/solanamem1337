@@ -5,7 +5,7 @@ See `apps/web/RUNBOOK.md` for operational guidance (Jito, priority fees, paralle
 # Solana Meme Bundler (Gitpod-ready)
 
 Готовый репозиторий для Gitpod: фронтенд (Vite + React + TS), кошелёк через Solana Wallet Adapter.
-**Функционал:** создание mint, запись метаданных (Token Metadata), создание ATA, минт поставки, airdrop (devnet).ааа
+**Функционал:** создание mint, запись метаданных (Token Metadata), создание ATA, минт поставки, airdrop (devnet).аааа
 
 ## Быстрый старт (Gitpod)
 1. Откройте в Gitpod (или импортируйте ZIP в свой GitHub и откройте репозиторий в Gitpod).тт
