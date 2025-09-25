@@ -6,6 +6,7 @@ import { useStore } from "./store";
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
+import { getTxTelemetry } from "./utils/tx";
 
 declare global {
   interface Window {
@@ -171,7 +172,9 @@ export default function App() {
       }
       try {
         const { getKeypair } = await import("./utils/keyring");
-        dest = getKeypair(id).publicKey.toBase58();
+        const kp = getKeypair(id);
+        if (!kp) { alert("Нет ключа Treasury"); return; }
+        dest = kp.publicKey.toBase58();
       } catch {
         alert("Не удалось получить адрес Treasury");
         return;
@@ -217,7 +220,7 @@ export default function App() {
           {!activeRpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
           {activeRpcUrl && (
             <span style={{ color: rpcOk ? "#8aff8a" : rpcOk === false ? "#ff6b6b" : "#97a6ba", fontSize: 12 }}>
-              RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"}
+              RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"} · p95 {getTxTelemetry().p95_ms} ms · fee≥{Number((import.meta.env as any).VITE_PRIORITY_FEE_MIN ?? 1000)}µ
             </span>
           )}
         </div>
@@ -532,6 +535,14 @@ export default function App() {
 
         {/* SELL ALL */}
         <div style={row}>
+          <label style={toggle}>
+            <input type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'wallet'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'wallet' } })} />
+            to Wallet
+          </label>
+          <label style={toggle}>
+            <input type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'treasury'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'treasury' } })} />
+            to Treasury
+          </label>
           <button
             onClick={async () => {
               if (!ensureConnection()) return;
@@ -539,14 +550,53 @@ export default function App() {
                 alert("Подключите Phantom");
                 return;
               }
-              await s.sellAllToWalletOnPump(connection!, walletPubkey);
+              const dest = (useStore.getState().sellAllState.destination || 'wallet');
+              if (dest === 'wallet') {
+                await s.sellAllToWalletOnPump(connection!, walletPubkey);
+              } else {
+                await s.sellAllParallel(connection!, { to: 'treasury' });
+              }
             }}
             style={btn}
           >
-            Sell ALL via my wallet
+            Sell ALL
           </button>
-          <span style={{ opacity: 0.75 }}>Боты переведут токены на твой кошелёк и кошелёк продаст всё разом</span>
+          <span style={{ opacity: 0.75 }}>Боты переведут токены на выбранный адрес и затем продадут всё разом</span>
+          {s.sellAllState.status === 'running' && (
+            <button onClick={() => s.cancelSellAll()} style={btnDanger}>Cancel</button>
+          )}
         </div>
+
+        {s.sellAllState.status !== 'idle' && s.sellAllState.id && (
+          <div style={{ marginTop: 8, padding: 10, border: "1px dashed #2a3350", borderRadius: 10 }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>
+              Sell ALL · {s.sellAllState.destination} · {s.sellAllState.status} · op {s.sellAllState.id}
+            </div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Token | Transfer ✓ | Swap ✓ | Retries | ms | Sig</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px,1fr) 100px 100px 80px 100px 220px', gap: 6, alignItems: 'center' }}>
+              <div style={{ fontWeight: 600 }}>Bot</div>
+              <div style={{ fontWeight: 600 }}>Transfer</div>
+              <div style={{ fontWeight: 600 }}>Swap</div>
+              <div style={{ fontWeight: 600 }}>Retries</div>
+              <div style={{ fontWeight: 600 }}>ms</div>
+              <div style={{ fontWeight: 600 }}>Signature</div>
+              {s.bots.map((b) => {
+                const p = s.sellAllState.progressByBot[b.id] || ({} as any);
+                return (
+                  <React.Fragment key={b.id}>
+                    <div>{b.name}</div>
+                    <div style={{ color: p.transferred ? '#8aff8a' : '#97a6ba' }}>{p.transferred ? '✓' : '…'}</div>
+                    <div style={{ color: p.swapped ? '#8aff8a' : '#97a6ba' }}>{p.swapped ? '✓' : '-'}</div>
+                    <div>{p.retries ?? 0}</div>
+                    <div>{p.ms ?? ''}</div>
+                    <div style={{ fontFamily: 'monospace' }}>{p.signature ? `${String(p.signature).slice(0,8)}…` : (p.error ? 'err' : '')}</div>
+                  </React.Fragment>
+                );
+              })}
+            </div>
+            {s.sellAllState.msg && <div style={{ marginTop: 6, color: s.sellAllState.status === 'error' ? '#ff6b6b' : '#97a6ba' }}>{s.sellAllState.msg}</div>}
+          </div>
+        )}
 
         {/* Глобальные действия — видны всегда */}
         <div style={row}>
@@ -571,7 +621,7 @@ export default function App() {
 
       {/* График */}
       <div style={{ marginTop: 12, border: "1px solid #283042", borderRadius: 10, overflow: "hidden" }}>
-        <CandleTV candles={s.candles} price={s.price} />
+        <CandleTV />
       </div>
 
       {/* Боты */}

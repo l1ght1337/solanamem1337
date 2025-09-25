@@ -1,3 +1,7 @@
+## RUNBOOK
+
+See `apps/web/RUNBOOK.md` for operational guidance (Jito, priority fees, parallelism, monitoring). Configure environment via `.env` using keys from `.env.example`.
+
 # Solana Meme Bundler (Gitpod-ready)
 
 Готовый репозиторий для Gitpod: фронтенд (Vite + React + TS), кошелёк через Solana Wallet Adapter.
