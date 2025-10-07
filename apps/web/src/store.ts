@@ -32,6 +32,10 @@ import { createLimiter, ensureAtaIx, detectTokenProgram as detectTokenProgramUti
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
 import { fetchMultipleAccountInfos } from "./utils/balances";
 import { safeParseNumber, safeDivide, safeMultiply, safeAdd } from "./utils/number";
+const PF_BASE_SOL = Math.max(0.00001, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000015));
+const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00016));
+const calcPriorityFeeSol = (mult = 1) => Math.min(PF_MAX_SOL, +(PF_BASE_SOL * Math.max(1, mult)).toFixed(6));
+
 
 export type BotStrategy = "trend" | "revert" | "scalper" | "momentum" | "range" | "maker";
 
@@ -267,7 +271,7 @@ async function buildCreateViaLightning(args: {
     denominatedInSol: "true",
     amount: Number(args.initialBuySol || 0),
     slippage: Number(args.slippagePct ?? 10),
-    priorityFee: Number(args.priorityFeeSol ?? 0.00001),
+    priorityFee: Number(args.priorityFeeSol ?? calcPriorityFeeSol()),
     pool: "pump",
   };
 
@@ -1492,7 +1496,7 @@ export const useStore = create<Store>()(
               denominatedInSol: "true",
               amount: spend,
               slippage: safeBps(get().getSmartBps(), 50) / 100,
-              priorityFee: 0.00001,
+              priorityFee: calcPriorityFeeSol(),
               pool: "auto",
             });
             vtx.sign([kp]);
@@ -1543,7 +1547,7 @@ export const useStore = create<Store>()(
               denominatedInSol: "true",
               amount: spend,
               slippage: safeBps(get().getSmartBps(), 50) / 100,
-              priorityFee: 0.00001,
+              priorityFee: calcPriorityFeeSol(),
               pool: "auto",
             });
             vtx.sign([kp]);
