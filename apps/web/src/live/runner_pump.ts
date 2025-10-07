@@ -425,8 +425,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     else { lo = 80; hi = 120; }
     const rawBps = Number((ctx as any).slippageBps?.() ?? 50);
     const usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
-
-    const volScore = Math.max(Math.abs(ctx.changeFast?.(12) || 0), Math.abs(ctx.change1m?.() || 0));
     const multByFail = failStreak >= 3 ? 4 : (failStreak >= 2 ? 2 : 1);
     let priorityFeeSol = PF_BASE_SOL * multByFail * (volScore > 0.006 ? 1.5 : (volScore > 0.003 ? 1.2 : 1.0));
     priorityFeeSol = Math.min(PF_MAX_SOL, +priorityFeeSol.toFixed(6));
