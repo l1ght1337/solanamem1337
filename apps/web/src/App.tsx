@@ -3,6 +3,7 @@ import "./polyfills"; // <— важно: полифилл до всего ос�
 
 import React, { useEffect, useMemo, useState } from "react";
 import { useStore } from "./store";
+import { confirmSigHttp } from "./utils/confirm";
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
@@ -125,8 +126,8 @@ export default function App() {
         tx.feePayer = fromPk;
         tx.recentBlockhash = (await connection!.getLatestBlockhash()).blockhash;
         const signed = await window.solana.signTransaction(tx);
-        const sig = await connection!.sendRawTransaction(signed.serialize(), { skipPreflight: true });
-        await connection!.confirmTransaction(sig, "confirmed");
+        const sig = await connection!.sendRawTransaction(signed.serialize(), { skipPreflight: true, maxRetries: 3 });
+        await confirmSigHttp(connection!, sig);
         s.addLog("ok", `Funded ${b.name}: ${perBot.toFixed(6)} SOL (${sig})`);
       } catch (e: any) {
         s.addLog("err", `Funding error ${b.name}: ${e?.message || e}`);
