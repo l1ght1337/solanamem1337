@@ -224,7 +224,8 @@ export default function App() {
               {" · p95Tx "}{getTxTelemetry().p95_ms}{" ms"}
               {" · p95Confirm "}{getRpcTelemetry().p95ConfirmMs}{" ms"}
               {" · failRate "}{(getRpcTelemetry() as any).failRate?.toFixed?.(2)}
-              {" · fee≥"}{Number((import.meta.env as any).VITE_PRIORITY_FEE_MIN ?? 1000)}{"µ"}
+              {" · cu≥"}{Number((import.meta.env as any).VITE_PRIORITY_FEE_MIN ?? 1000)}{"µ/CU"}
+              {" · pf≥"}{Number((import.meta.env as any).VITE_PRIORITY_FEE_BASE ?? 0.000015)}{" SOL"}
             </span>
           )}
         </div>
