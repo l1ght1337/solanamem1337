@@ -8,7 +8,7 @@ import { getSPLBalance } from "../utils/solana";
 import { scheduleFetch } from "../utils/network";
 import { getJupiterQuote, WSOL } from "../utils/jupiter";
 import { safeMultiply, safeAdd } from "../utils/number";
-
+import { confirmSigHttp } from "../utils/confirm";
 /* ───────────────────────────── Types ───────────────────────────── */
 type BotStrategy = "trend" | "revert" | "scalper";
 // расширим внутренний набор архетипов без ломающего изменения типа
@@ -65,7 +65,8 @@ type RunCtx = {
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pumpportal.fun"].filter(Boolean);
-
+const PF_BASE_SOL = Math.max(0.00001, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000015));
+const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00016));
 // === очередь с ограничением конкурентности (глобально на вкладку)
 type Job<T> = () => Promise<T>;
 function makeQueue(concurrency = 3, baseGapMs = 150) {
@@ -425,6 +426,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const rawBps = Number((ctx as any).slippageBps?.() ?? 50);
     const usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
 
+    const volScore = Math.max(Math.abs(ctx.changeFast?.(12) || 0), Math.abs(ctx.change1m?.() || 0));
+    const multByFail = failStreak >= 3 ? 4 : (failStreak >= 2 ? 2 : 1);
+    let priorityFeeSol = PF_BASE_SOL * multByFail * (volScore > 0.006 ? 1.5 : (volScore > 0.003 ? 1.2 : 1.0));
+    priorityFeeSol = Math.min(PF_MAX_SOL, +priorityFeeSol.toFixed(6));
+
     const payload =
       side === "buy"
         ? {
@@ -434,7 +440,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             denominatedInSol: "true",
             amount: sizeSol,
             slippage: usedBps / 100,
-            priorityFee: 0.00001,
+            priorityFee: priorityFeeSol,
             pool: "auto",
           }
         : {
@@ -444,7 +450,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             denominatedInSol: "false",
             amount: amountTok ?? roundTok(bot.posToken, decimals),
             slippage: usedBps / 100,
-            priorityFee: 0.00001,
+            priorityFee: priorityFeeSol,
             pool: "auto",
           };
 
@@ -572,7 +578,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const vtx = await buildTradeTxPumpPortal(pl);
         vtx.sign([kp]);
         const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
-        await connection.confirmTransaction(sig, "confirmed");
+        await confirmSigHttp(connection, sig);
 
         executedSlices++;
         if (side === 'buy') {
