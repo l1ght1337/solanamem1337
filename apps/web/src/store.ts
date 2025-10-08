@@ -1,7 +1,7 @@
 // @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
-import { confirmSigHttp } from "./utils/confirm";
+import { confirmSigHttp, confirmManyHttp } from "./utils/confirm";
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import {
@@ -13,6 +13,7 @@ import {
   TransactionInstruction,
   VersionedTransaction,
   Connection,
+  ComputeBudgetProgram,
 } from "@solana/web3.js";
 import {
   getAssociatedTokenAddress,
@@ -32,8 +33,8 @@ import { createLimiter, ensureAtaIx, detectTokenProgram as detectTokenProgramUti
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
 import { fetchMultipleAccountInfos } from "./utils/balances";
 import { safeParseNumber, safeDivide, safeMultiply, safeAdd } from "./utils/number";
-const PF_BASE_SOL = Math.max(0.00001, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000015));
-const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00016));
+const PF_BASE_SOL = Math.max(0.000006, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000008));
+const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00012));
 const calcPriorityFeeSol = (mult = 1) => Math.min(PF_MAX_SOL, +(PF_BASE_SOL * Math.max(1, mult)).toFixed(6));
 
 
@@ -960,6 +961,7 @@ export const useStore = create<Store>()(
           mint: s.tokenMint!,
           slippageBps: () => safeBps(get().getSmartBps(), 50),
           twap: get().getTwapPlan(),
+          getRisk: () => get().getRisk(),
 
           price: () => get().price,
           changeFast: (secs?: number) => get().getChangeFast(secs ?? 15),
@@ -1139,6 +1141,10 @@ export const useStore = create<Store>()(
 
               const { ata: dstAta, ix: ensureIx } = await ensureAtaIx({ connection, mint: mintPk, owner: dstOwner, payer: kp.publicKey, preferProgramId: programId });
               const tx = new Transaction();
+              // слегка повышаем приоритет включения в блок
+              tx.add(ComputeBudgetProgram.setComputeUnitPrice({
+                microLamports: Math.max(500, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 1500))
+              }));
               if (ensureIx) tx.add(ensureIx);
               if (typeof decimals === 'number') {
                 tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId));
@@ -1147,10 +1153,10 @@ export const useStore = create<Store>()(
                 tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
               }
 
-              const res = await sendTxWithRetries({ connection, tx, signers: [kp], skipPreflight: true, abortSignal: ac.signal });
+              const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
               const elapsed = Date.now() - started;
               const curr = get().sellAllState.progressByBot || {};
-              curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: res.signature, retries: res.attempts-1, ms: elapsed } as any;
+              curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
               set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
               get().addLog('ok', `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0,4)}… (${res.signature.slice(0,8)}…)`);
             } catch (e: any) {
@@ -1158,12 +1164,21 @@ export const useStore = create<Store>()(
               const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
               curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
               set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
-              get().addLog('warn', `Sell ALL transfer ${b.name}: ${msg}`);
+              get().addLog('ok', `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0,4)}… (${sig.slice(0,8)}…)`);
             }
           };
 
           await Promise.allSettled(bots.map((b) => limit(() => transferOne(b))));
 
+          // подтверждаем пачкой — быстро и дёшево (через /rpc getSignatureStatuses)
+          try {
+            const sigs = Object.values(get().sellAllState.progressByBot)
+              .map((p: any) => p?.signature)
+              .filter(Boolean) as string[];
+            if (sigs.length) {
+              await confirmManyHttp(connection, sigs, { pollMs: 250, timeoutMs: 25000, searchTransactionHistory: true });
+            }
+          } catch {}
           if (ac.signal.aborted) { throw new Error('cancelled'); }
 
           // After transfers, perform one aggregated sell from destination
@@ -1666,19 +1681,19 @@ export const useStore = create<Store>()(
 
       // Риск-настройки (пока без UI; при желании вынесем в контролы)
       getRisk: () => ({
-        maxImpact: 0.010,
+        maxImpact: 0.018,          // позволяем больше импакта в воле
         maxDrawdown: 0.12,
-        reserveSol: 0.0060,
-        maxNotionalPerMin: 0.0008,
-        maxBuysPerMin: 1,
-        maxSellsPerMin: 4,
-        lossThrPct: 0.003,
+        reserveSol: 0.0050,
+        maxNotionalPerMin: 0.0035, // ↑ лимит нотационала/мин
+        maxBuysPerMin: 3,          // ↑ ≤3 покупки/мин на бота
+        maxSellsPerMin: 6,
+        lossThrPct: 0.004,
         lossWindowMs: 30000,
-        lossCooldownMs: 180000,
-        maxBuySliceSol: 0.00035,
-        maxSellSliceTokPct: 0.035,
-        minSliceGapMs: 600,
-        maxSliceGapMs: 1800,
+        lossCooldownMs: 120000,
+        maxBuySliceSol: 0.00055,   // ↑ размер одного buy‑среза
+        maxSellSliceTokPct: 0.06,  // ↑ один sell‑срез
+        minSliceGapMs: 500,
+        maxSliceGapMs: 1400,
       }),
     } as Store),
     {
