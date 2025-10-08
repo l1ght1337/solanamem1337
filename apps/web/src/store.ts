@@ -82,21 +82,17 @@ const JUP_BASE = ((import.meta as any).env?.VITE_JUP_BASE || "https://quote-api.
 
 export async function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
   const p = path.startsWith("/") ? path : `/${path}`;
-
-  // 1) если JUP_BASE — абсолютный URL, идём напрямую
+  // если JUP_BASE — абсолютный URL, идём напрямую
   if (/^https?:\/\//i.test(JUP_BASE)) {
     return fetchFirstOk(`${JUP_BASE}${p}`, init, 0);
   }
-
-  // 2) иначе пытаемся через ваши базы (когда у вас реально есть воркер с /jup/*)
+  // иначе пробуем через ваш прокси, при ошибке — прямой Jupiter
   try {
     return await fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
-  } catch (e) {
-    // 3) безопасный фоллбек: напрямую в Jupiter (на случай 404 у прокси)
+  } catch {
     return fetchFirstOk(`https://quote-api.jup.ag${p}`, init, 0);
   }
 }
-
 // финальный список апстримов (прокси → свой бекенд → alt → публичный)
 const PUMP_BASES: string[] = [
   ...PROXIES.map((p) => `${p}/x/pump`),
@@ -117,6 +113,12 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
       ...init, headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
     };
     return scheduleFetch(path, { ...(baseInit as any), timeoutMs: 15_000, tries: 1 }, "pump");
+  }
+  
+  const order = [...PUMP_BASES.keys()];
+  if (stickyBaseIdx >= 0) {
+    const i = order.indexOf(stickyBaseIdx);
+    if (i > -1) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
   }
 
   const baseInit: RequestInit = {
