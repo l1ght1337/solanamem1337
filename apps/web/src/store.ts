@@ -161,10 +161,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
 }
 
 /* ⬇️ helper для Jupiter: уходит на {proxy}/jup/... или {proxy}/x/pump/jup/... */
-export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
-}
+
 
 /* ⛑ ГЛОБАЛЬНЫЙ АНТИ-CORS ПАТЧ ДЛЯ JUPITER
    Любой прямой fetch на https://quote-api.jup.ag/* или https://price.jup.ag/*
