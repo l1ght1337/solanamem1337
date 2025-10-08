@@ -77,6 +77,13 @@ const PROXIES: string[] = RAW_PROXIES
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 
+const rawProxies = ((import.meta.env as any).VITE_PUMP_PROXIES || "")
+  .split(",")
+  .map((url: string) => url.trim())
+  .filter(Boolean);
+const proxyBases = rawProxies.map(base => base.replace(/\/+$/, "") + "/x/pump");
+
+
 // ⬇️ Jupiter base (через твой воркер). По умолчанию — "/jup"
 const JUP_BASE = ((import.meta as any).env?.VITE_JUP_BASE || "https://quote-api.jup.ag").replace(/\/+$/, "");
 
@@ -94,11 +101,11 @@ export async function jupFetch(path: string, init?: RequestInit, retriesPerBase 
   }
 }
 // финальный список апстримов (прокси → свой бекенд → alt → публичный)
-const PUMP_BASES: string[] = [
-  ...PROXIES.map((p) => `${p}/x/pump`),
+const PUMP_BASES = [
   API_BASE ? `${API_BASE}/x/pump` : "",
   ALT_PUMP,
-  "https://pumpportal.fun",
+  ...proxyBases,
+  "https://pumpportal.fun"
 ].filter(Boolean);
 
 // «липкий» индекс базы — успешная база будет приоритетной
