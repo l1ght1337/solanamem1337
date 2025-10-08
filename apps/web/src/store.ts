@@ -1112,61 +1112,86 @@ export const useStore = create<Store>()(
             : (() => { const id = get().treasuryKeyId; if (!id) throw new Error('Treasury не задан'); const k = getKeypair(id); if (!k) throw new Error('Treasury key not found'); return k.publicKey; })();
 
           const transferOne = async (b: LiveBot) => {
-            const started = Date.now();
-            const prog = get().sellAllState.progressByBot || {};
-            prog[b.id] = prog[b.id] || { transferred: false, swapped: false, retries: 0 } as any;
-            set({ sellAllState: { ...get().sellAllState, progressByBot: { ...prog } } });
-            try {
-              const kp = getKeypair(b.keyId);
-              if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
-              const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
-              const src22 = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
-              const infos = await fetchMultipleAccountInfos(connection as Connection, [srcClassic, src22]);
-              const [srcCInfo, src22Info] = infos;
-              const decodeAmount = (acc: any): bigint => {
-                try {
-                  if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
-                  const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
-                  const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
-                  return (BigInt(hi) << 32n) + BigInt(lo);
-                } catch { return 0n; }
-              };
-              const amtC = decodeAmount(srcCInfo);
-              const amt22 = decodeAmount(src22Info);
-              let programId = TOKEN_PROGRAM_ID;
-              let srcAta = srcClassic;
-              let amountRaw = amtC;
-              if (amt22 > 0n || (!srcCInfo && src22Info)) { programId = TOKEN_2022_PROGRAM_ID; srcAta = src22; amountRaw = amt22; }
-              if (amountRaw <= 0n) { return; }
+              const started = Date.now();
+              const prog = get().sellAllState.progressByBot || {};
+              prog[b.id] = prog[b.id] || { transferred: false, swapped: false, retries: 0 } as any;
+              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...prog } } });
 
-              const { ata: dstAta, ix: ensureIx } = await ensureAtaIx({ connection, mint: mintPk, owner: dstOwner, payer: kp.publicKey, preferProgramId: programId });
-              const tx = new Transaction();
-              // слегка повышаем приоритет включения в блок
-              tx.add(ComputeBudgetProgram.setComputeUnitPrice({
-                microLamports: Math.max(500, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 1500))
-              }));
-              if (ensureIx) tx.add(ensureIx);
-              if (typeof decimals === 'number') {
-                tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId));
-              } else {
-                const { createTransferInstruction } = await import('@solana/spl-token');
-                tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
+              try {
+                  const kp = getKeypair(b.keyId);
+                  if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
+
+    // источники (classic / 2022)
+                  const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
+                  const src22     = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
+                  const infos     = await fetchMultipleAccountInfos(connection as Connection, [srcClassic, src22]);
+                  const [srcCInfo, src22Info] = infos;
+
+                  const decodeAmount = (acc: any): bigint => {
+                  try {
+                      if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                      const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                      const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+                      return (BigInt(hi) << 32n) + BigInt(lo);
+                    } catch { return 0n; }
+                  };
+
+                  const amtC  = decodeAmount(srcCInfo);
+                  const amt22 = decodeAmount(src22Info);
+                  let programId = TOKEN_PROGRAM_ID;
+                  let srcAta    = srcClassic;
+                  let amountRaw = amtC;
+                  if (amt22 > 0n || (!srcCInfo && src22Info)) {
+                      programId = TOKEN_2022_PROGRAM_ID;
+                      srcAta    = src22;
+                      amountRaw = amt22;
+                 }
+                if (amountRaw <= 0n) return;
+
+    // гарантируем целевой ATA
+                const { ata: dstAta, ix: ensureIx } = await ensureAtaIx({
+                  connection, mint: mintPk, owner: dstOwner, payer: kp.publicKey, preferProgramId: programId
+                });
+
+                const tx = new Transaction();
+                tx.add(ComputeBudgetProgram.setComputeUnitPrice({
+                    microLamports: Math.max(500, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 1500)),
+                 }));
+                if (ensureIx) tx.add(ensureIx);
+
+                if (typeof decimals === 'number') {
+                    tx.add(createTransferCheckedInstruction(
+                        srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId
+                      ));
+                } else {
+                      const { createTransferInstruction } = await import('@solana/spl-token');
+                      tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
+                }
+
+    // 👇 Этого не хватало: payer, blockhash, подпись
+                const { blockhash } = await connection.getLatestBlockhash("finalized");
+                tx.feePayer = kp.publicKey;
+                tx.recentBlockhash = blockhash;
+                tx.sign(kp);
+
+                const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+
+                const elapsed = Date.now() - started;
+                const curr = get().sellAllState.progressByBot || {};
+                curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
+                set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+
+                get().addLog('ok', `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0,4)}… (${sig.slice(0,8)}…)`);
+              } catch (e: any) {
+                const curr = get().sellAllState.progressByBot || {};
+                const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
+                curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
+                set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+
+                get().addLog('err', `Sell ALL: ${b.name} — ${msg}`);
               }
-
-              const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
-              const elapsed = Date.now() - started;
-              const curr = get().sellAllState.progressByBot || {};
-              curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
-              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
-              get().addLog('ok', `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0,4)}… (${res.signature.slice(0,8)}…)`);
-            } catch (e: any) {
-              const curr = get().sellAllState.progressByBot || {};
-              const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
-              curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
-              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
-              get().addLog('ok', `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0,4)}… (${sig.slice(0,8)}…)`);
-            }
           };
+
 
           await Promise.allSettled(bots.map((b) => limit(() => transferOne(b))));
 
