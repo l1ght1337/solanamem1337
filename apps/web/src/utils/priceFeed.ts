@@ -1,44 +1,55 @@
 // apps/web/src/utils/priceFeed.ts
-import { logger } from './logger';
+// Получение цены токена в SOL без обращения к price.jup.ag:
+// 1) Jupiter QUOTE: price = 1 / (outTokens for 1 SOL)
+// 2) Fallback: Dexscreener priceNative в SOL
+import { scheduleFetch } from "./network";
+import { getJupiterQuote, WSOL } from "./jupiter";
 
-export async function getTokenPriceSOL(mint: string, abort?: AbortSignal): Promise<{ price: number | null; source: string; reason?: string }>{
-  const id = String(mint || '').trim();
-  if (!id) return { price: null, source: 'none', reason: 'no-mint' };
-
-  // a) Jupiter v6 direct
+export async function getTokenPriceSOL(
+  mint: string
+): Promise<{ price: number | null; reason?: string }> {
   try {
-    const u = `https://price.jup.ag/v6/price?ids=${encodeURIComponent(id)}`;
-    const r = await fetch(u, { signal: abort });
-    if (r.ok) {
-      const j = await r.json().catch(() => ({}));
-      const p = Number(j?.data?.[id]?.price);
-      if (Number.isFinite(p) && p > 0) return { price: p, source: 'jupiter' };
-    } else {
-      logger.warn(`Jupiter price HTTP ${r.status}`);
-    }
-  } catch (e: any) {
-    logger.warn(`Jupiter price error: ${e?.message || String(e)}`);
-  }
+    // 1) Jupiter QUOTE: 1 SOL -> TOKEN
+    const oneSolLamports = 1_000_000_000;
+    const q: any = await getJupiterQuote({
+      inputMint: WSOL,
+      outputMint: mint,
+      amount: oneSolLamports,
+    });
 
-  // b) Optional Cloudflare Worker proxy
-  try {
-    const API_BASE = ((import.meta as any).env?.VITE_API_BASE || '').replace(/\/+$/, '');
-    if (API_BASE) {
-      const u = `${API_BASE}/price?mint=${encodeURIComponent(id)}`;
-      const r = await fetch(u, { signal: abort });
-      if (r.ok) {
-        const j = await r.json().catch(() => ({}));
-        const p = Number(j?.price ?? j?.data?.price);
-        if (Number.isFinite(p) && p > 0) return { price: p, source: 'proxy' };
-      } else {
-        logger.warn(`Proxy price HTTP ${r.status}`);
+    const out = Number(q?.outAmount || 0);
+    const dec = Number(q?.outputMintDecimals ?? 9);
+    if (out > 0 && Number.isFinite(dec)) {
+      const tokensFor1Sol = out / Math.pow(10, dec);
+      if (tokensFor1Sol > 0) {
+        const priceInSol = 1 / tokensFor1Sol;
+        return { price: +priceInSol.toFixed(12) };
       }
     }
-  } catch (e: any) {
-    logger.warn(`Proxy price error: ${e?.message || String(e)}`);
+  } catch {
+    // мягкий фолбэк ниже
   }
 
-  logger.error(`Price unavailable for ${id}`);
-  return { price: null, source: 'none', reason: 'unavailable/CORS' };
+  // 2) Dexscreener (берём пару с SOL или первую доступную)
+  try {
+    const r = await scheduleFetch(
+      `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`,
+      { timeoutMs: 12_000, tries: 1 } as any,
+      "price"
+    );
+    if (r?.ok) {
+      const j = await r.json().catch(() => ({}));
+      const pair = Array.isArray(j?.pairs)
+        ? j.pairs.find((p: any) => (p?.quoteToken?.symbol || "").toUpperCase() === "SOL") ||
+          j.pairs[0]
+        : null;
+      const pv = Number(pair?.priceNative || 0); // уже в SOL
+      if (pv > 0) return { price: pv };
+    }
+  } catch {
+    // ignore
+  }
+
+  return { price: null, reason: "unavailable" };
 }
 
