@@ -13,6 +13,7 @@ import { logger } from "./utils/logger";
 import { getTokenPriceSOL } from "./utils/priceFeed";
 import { parseMint as parsePumpMint } from "./utils/pump";
 import { parseLocaleNumber, safeParseNumber, toFixedOrZero } from "./utils/number";
+import { ScenarioPanel } from "./ui/ScenarioPanel";
 
 declare global {
   interface Window {
