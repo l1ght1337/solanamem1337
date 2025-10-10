@@ -5,6 +5,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { useStore } from "./store";
 import { confirmSigHttp } from "./utils/confirm";
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { ScenarioPanel } from "./ui/ScenarioPanel";
 import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
 import { getTxTelemetry } from "./utils/tx";
@@ -13,7 +14,7 @@ import { logger } from "./utils/logger";
 import { getTokenPriceSOL } from "./utils/priceFeed";
 import { parseMint as parsePumpMint } from "./utils/pump";
 import { parseLocaleNumber, safeParseNumber, toFixedOrZero } from "./utils/number";
-import { ScenarioPanel } from "./ui/ScenarioPanel";
+
 
 declare global {
   interface Window {
