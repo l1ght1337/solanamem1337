@@ -1236,8 +1236,7 @@ export const useStore = create<Store>()(
           // wait a tiny bit for balances to settle
           try { await new Promise((r) => setTimeout(r, 200)); } catch {}
 
-          const rawWallet = await getSPLBalance(connection, dstOwner.toBase58(), s.tokenMint);
-          const amountTok = Number(rawWallet as any) / Math.pow(10, decimals);
+          const amountTok = await getParsedTokenBalanceAny(connection, dstOwner.toBase58(), s.tokenMint, decimals);
           if (amountTok <= 0) {
             s.addLog('info', 'Sell ALL: на адресе продажи нет токенов');
             set((st) => ({ sellAllState: { ...st.sellAllState, status: 'done', msg: 'no tokens to sell' } }));
@@ -1424,6 +1423,35 @@ export const useStore = create<Store>()(
                 } catch {}
               }
             }
+          }
+          async function getParsedTokenBalanceAny(
+              connection: Connection,
+              owner58: string,
+              mint58: string,
+              decimals: number
+          ): Promise<number> {
+            try {
+                const owner = new PublicKey(owner58);
+                const [rClassic, r22] = await Promise.allSettled([
+                  connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+                  connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
+            ]);
+
+                const rows: any[] = [];
+                const take = (res: any) => {
+                  for (const it of res?.value ?? []) {
+                      if (it?.account?.data?.parsed?.info?.mint === mint58) rows.push(it);
+                  }
+                };
+                if (rClassic.status === "fulfilled") take(rClassic.value);
+                if (r22.status === "fulfilled")     take(r22.value);
+
+                let sum = 0n;
+                for (const it of rows) {
+                    try { sum += BigInt(it.account.data.parsed.info.tokenAmount.amount); } catch {}
+                }
+                return Number(sum) / Math.pow(10, decimals);
+              } catch { return 0; }
           }
 
           set({ bots: updated });
