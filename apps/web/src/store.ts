@@ -1092,176 +1092,178 @@ export const useStore = create<Store>()(
         set((s) => ({ sellAllState: { ...s.sellAllState, status: s.sellAllState.status === 'running' ? 'cancelling' : s.sellAllState.status } }));
       },
 
-      async sellAllParallel(connection, dest) {
-        const s = get();
-        if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
-        if (get().sellAllState.status === 'running') { s.addLog("warn", "Sell ALL уже выполняется"); return; }
+      // ─── replace whole function sellAllParallel(...) with this one ───
+async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey: string } | { to: 'treasury' }) {
+  const s = get();
+  if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
+  if (get().sellAllState.status === 'running') { s.addLog("warn", "Sell ALL уже выполняется"); return; }
 
-        const opId = `sellall:${Date.now()}:${Math.random().toString(36).slice(2,7)}`;
-        const ac = new AbortController();
-        (get() as any)._sellAllAbort = ac;
-        set({ sellAllState: { id: opId, startedAt: Date.now(), destination: dest.to, status: 'running', progressByBot: {} } });
+  const opId = `sellall:${Date.now()}:${Math.random().toString(36).slice(2,7)}`;
+  const ac = new AbortController();
+  (get() as any)._sellAllAbort = ac;
+  set({ sellAllState: { id: opId, startedAt: Date.now(), destination: dest.to, status: 'running', progressByBot: {} } });
 
-        try {
-          const mintPk = new PublicKey(s.tokenMint);
+  try {
+    const mintPk = new PublicKey(s.tokenMint);
 
-          // выясняем decimals (fast -> нормальный)
-          let decimalsKnown = false;
-          let decimals: number | undefined = get()._mintDecimals;
-          if (decimals == null) {
-            try {
-              const dFast = await getMintDecimalsFast(connection as Connection, mintPk);
-              if (dFast != null) { decimals = dFast; decimalsKnown = true; }
-            } catch {}
-            if (!decimalsKnown) {
-              try {
-                const d = await getMintDecimals(connection, s.tokenMint);
-                if (d != null) { decimals = d; decimalsKnown = true; }
-              } catch {}
-            }
-            if (decimalsKnown && typeof decimals === "number") set({ _mintDecimals: decimals });
-          } else {
-            decimalsKnown = true;
-          }
+    // 1) decimals (fast -> normal), кэшируем
+    let decimals: number | undefined = get()._mintDecimals;
+    if (decimals == null) {
+      try { decimals = await getMintDecimalsFast(connection, mintPk) ?? undefined; } catch {}
+      if (decimals == null) { try { decimals = await getMintDecimals(connection, s.tokenMint) ?? undefined; } catch {} }
+      if (typeof decimals === "number") set({ _mintDecimals: decimals });
+    }
+    const decimalsKnown = typeof decimals === "number";
 
-          const bots = get().bots.slice();
-          const maxPar = Math.max(1, Number(((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS) ?? 10));
-          const limit = createLimiter(maxPar);
-          const dstOwner = dest.to === 'wallet'
-            ? new PublicKey((dest as any).walletPubkey)
-            : (() => { const id = get().treasuryKeyId; if (!id) throw new Error('Treasury не задан'); const k = getKeypair(id); if (!k) throw new Error('Treasury key not found'); return k.publicKey; })();
+    // 2) определим реальный токен-программу по mint
+    const mintProgramId = await detectTokenProgramUtil(connection, mintPk);
 
-          const transferOne = async (b: LiveBot) => {
-            const started = Date.now();
-            const prog = get().sellAllState.progressByBot || {};
-            prog[b.id] = prog[b.id] || { transferred: false, swapped: false, retries: 0 } as any;
-            set({ sellAllState: { ...get().sellAllState, progressByBot: { ...prog } } });
+    // 3) адрес, куда стекаем токен перед продажей
+    const dstOwner = dest.to === 'wallet'
+      ? new PublicKey((dest as any).walletPubkey)
+      : (() => { const id = get().treasuryKeyId; if (!id) throw new Error('Treasury не задан'); const k = getKeypair(id); if (!k) throw new Error('Treasury key not found'); return k.publicKey; })();
 
-            try {
-              const kp = getKeypair(b.keyId);
-              if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
+    // 4) 🧩 ОДНОРАЗОВО создаём ATA назначения (чтобы избежать гонок)
+    const ensureDestAtaOnce = async () => {
+      const payer = getKeypair(get().bots[0]?.keyId || "");
+      if (!payer) throw new Error("Sell ALL: нет payer для создания ATA");
+      const dstAta = await getAssociatedTokenAddress(mintPk, dstOwner, false, mintProgramId);
+      const info = await connection.getAccountInfo(dstAta);
+      if (!info) {
+        const ix = createAssociatedTokenAccountInstruction(payer.publicKey, dstAta, dstOwner, mintPk, mintProgramId);
+        const { blockhash } = await connection.getLatestBlockhash("finalized");
+        const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash }).add(ix);
+        tx.sign(payer);
+        const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+        await confirmSigHttp(connection, sig);
+        get().addLog('ok', `Sell ALL: создан ATA назначения ${dstAta.toBase58().slice(0,6)}…`);
+      }
+      return dstAta;
+    };
+    const dstAta = await ensureDestAtaOnce();
 
-              const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
-              const src22     = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
-              const infos     = await fetchMultipleAccountInfos(connection as Connection, [srcClassic, src22]);
-              const [srcCInfo, src22Info] = infos;
+    const bots = get().bots.slice();
+    const maxPar = Math.max(1, Number(((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS) ?? 8));
+    const limit = createLimiter(maxPar);
 
-              const decodeAmount = (acc: any): bigint => {
-                try {
-                  if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
-                  const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
-                  const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
-                  return (BigInt(hi) << 32n) + BigInt(lo);
-                } catch { return 0n; }
-              };
+    // для разбора сырых сумм из ATA
+    const decodeAmount = (acc: any): bigint => {
+      try {
+        if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+        const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+        const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+        return (BigInt(hi) << 32n) + BigInt(lo);
+      } catch { return 0n; }
+    };
 
-              const amtC  = decodeAmount(srcCInfo);
-              const amt22 = decodeAmount(src22Info);
-              let programId = TOKEN_PROGRAM_ID;
-              let srcAta    = srcClassic;
-              let amountRaw = amtC;
-              if (amt22 > 0n || (!srcCInfo && src22Info)) {
-                programId = TOKEN_2022_PROGRAM_ID;
-                srcAta    = src22;
-                amountRaw = amt22;
-              }
-              if (amountRaw <= 0n) return;
+    const transferOne = async (b: LiveBot) => {
+      const started = Date.now();
+      const prog = get().sellAllState.progressByBot || {};
+      prog[b.id] = prog[b.id] || { transferred: false, swapped: false, retries: 0 } as any;
+      set({ sellAllState: { ...get().sellAllState, progressByBot: { ...prog } } });
 
-              const { ata: dstAta, ix: ensureIx } = await ensureAtaIx({
-                connection, mint: mintPk, owner: dstOwner, payer: kp.publicKey, preferProgramId: programId
-              });
+      try {
+        const kp = getKeypair(b.keyId);
+        if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
 
-              const tx = new Transaction();
-              tx.add(ComputeBudgetProgram.setComputeUnitPrice({
-                microLamports: Math.max(500, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 1500)),
-              }));
-              if (ensureIx) tx.add(ensureIx);
+        // читаем оба возможных источника
+        const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
+        const src22     = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
+        const infos     = await fetchMultipleAccountInfos(connection, [srcClassic, src22]);
+        const [srcCInfo, src22Info] = infos;
 
-              if (decimalsKnown && typeof decimals === 'number') {
-                tx.add(createTransferCheckedInstruction(
-                  srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals, [], programId
-                ));
-              } else {
-                const { createTransferInstruction } = await import('@solana/spl-token');
-                tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
-              }
+        const amtC  = decodeAmount(srcCInfo);
+        const amt22 = decodeAmount(src22Info);
 
-              const { blockhash } = await connection.getLatestBlockhash("finalized");
-              tx.feePayer = kp.publicKey;
-              tx.recentBlockhash = blockhash;
-              tx.sign(kp);
+        // выбираем тот ATA, где реально есть токен
+        let programId = TOKEN_PROGRAM_ID;
+        let srcAta    = srcClassic;
+        let amountRaw = amtC;
+        if (amt22 > 0n || (!srcCInfo && src22Info)) {
+          programId = TOKEN_2022_PROGRAM_ID;
+          srcAta    = src22;
+          amountRaw = amt22;
+        }
+        if (amountRaw <= 0n) return; // у этого бота токена нет
 
-              const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
+        const tx = new Transaction();
+        tx.add(ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: Math.max(1000, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 2000)),
+        }));
 
-              const elapsed = Date.now() - started;
-              const curr = get().sellAllState.progressByBot || {};
-              curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
-              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+        if (decimalsKnown) {
+          tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals!, [], programId));
+        } else {
+          const { createTransferInstruction } = await import('@solana/spl-token');
+          tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
+        }
 
-              get().addLog('ok', `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0,4)}… (${sig.slice(0,8)}…)`);
-            } catch (e: any) {
-              const curr = get().sellAllState.progressByBot || {};
-              const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
-              curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
-              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+        const { blockhash } = await connection.getLatestBlockhash("finalized");
+        tx.feePayer = kp.publicKey;
+        tx.recentBlockhash = blockhash;
+        tx.sign(kp);
 
-              get().addLog('err', `Sell ALL: ${b.name} — ${msg}`);
-            }
-          };
+        // ⚠️ ждём подтверждение и только после этого помечаем transferred
+        const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+        await confirmSigHttp(connection, sig);
 
-          await Promise.allSettled(bots.map((b) => limit(() => transferOne(b))));
+        const elapsed = Date.now() - started;
+        const curr = get().sellAllState.progressByBot || {};
+        curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
+        set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
 
-          try {
-            const sigs = Object.values(get().sellAllState.progressByBot)
-              .map((p: any) => p?.signature)
-              .filter(Boolean) as string[];
-            if (sigs.length) {
-              await confirmManyHttp(connection, sigs, { pollMs: 250, timeoutMs: 25000, searchTransactionHistory: true });
-            }
-          } catch {}
-          if (ac.signal.aborted) { throw new Error('cancelled'); }
+        get().addLog('ok', `Sell ALL: transfer ${b.name} → dst (${sig.slice(0,8)}…)`);
+      } catch (e: any) {
+        const curr = get().sellAllState.progressByBot || {};
+        const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
+        curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
+        set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+        get().addLog('err', `Sell ALL transfer ${b.name}: ${msg}`);
+      }
+    };
 
-          // 📈 Короткий поллинг баланса адреса продажи (RPC может отставать)
-          let amountTok = 0;
-          for (let i = 0; i < 8; i++) {
-            amountTok = await getParsedTokenBalanceAny(
-              connection, dstOwner.toBase58(), s.tokenMint!, decimalsKnown ? decimals : undefined
-            );
-            if (amountTok > 0) break;
-            await new Promise(r => setTimeout(r, 400));
-          }
+    await Promise.allSettled(bots.map((b) => limit(() => transferOne(b))));
+    if (ac.signal.aborted) throw new Error('cancelled');
 
-          if (amountTok <= 0) {
-            s.addLog('info', 'Sell ALL: на адресе продажи нет токенов');
-            set((st) => ({ sellAllState: { ...st.sellAllState, status: 'done', msg: 'no tokens to sell' } }));
-            await get().refreshBalances(connection);
-            return;
-          }
+    // ── короткий поллинг, ждём пока баланс "дойдёт" на RPC
+    let amountTok = 0;
+    for (let i = 0; i < 12; i++) {
+      amountTok = await getParsedTokenBalanceAny(connection, dstOwner.toBase58(), s.tokenMint, decimals);
+      if (amountTok > 0) break;
+      await new Promise((r) => setTimeout(r, 350));
+    }
 
-          const digits = Math.min(6, (typeof decimals === "number" ? decimals : 6));
-          const amountRounded = +amountTok.toFixed(digits);
+    if (amountTok <= 0) {
+      s.addLog('info', 'Sell ALL: на адресе продажи нет токенов');
+      set((st) => ({ sellAllState: { ...st.sellAllState, status: 'done', msg: 'no tokens to sell' } }));
+      await get().refreshBalances(connection);
+      return;
+    }
 
-          const priorityFeeSol = Math.max(
-            Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MIN) ?? 1500) / 1_000_000_000,
-            0.00001
-          );
+    const digits = Math.min(6, (typeof decimals === "number" ? decimals : 6));
+    const amountRounded = +amountTok.toFixed(digits);
 
-          const payload = {
-            publicKey: dstOwner.toBase58(),
-            action: 'sell',
-            mint: s.tokenMint,
-            denominatedInSol: 'false',
-            amount: amountRounded,
-            slippage: safeBps(get().getSmartBps(), 50) / 100,
-            priorityFee: priorityFeeSol,
-            pool: 'auto',
-          } as any;
+    // финальная продажа
+    const priorityFeeSol = Math.max(
+      Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MIN) ?? 1500) / 1_000_000_000,
+      0.00001
+    );
+    const payload = {
+        publicKey: dstOwner.toBase58(),
+        action: 'sell',
+        mint: s.tokenMint,
+        denominatedInSol: 'false',
+        amount: amountRounded,
+        slippage: safeBps(get().getSmartBps(), 50) / 100,
+        priorityFee: priorityFeeSol,
+        pool: 'auto',
+      } as any;
 
-          const trySell = async () => {
-            const vtx = await buildTradeTxPumpLocal(payload);
-            if (dest.to === 'wallet') {
-              const ph = (window as any).solana;
-              if (!ph?.signAndSendTransaction) throw new Error('Phantom не поддерживает signAndSendTransaction');
+      const trySell = async () => {
+      const vtx = await buildTradeTxPumpLocal(payload);
+      if (dest.to === 'wallet') {
+        const ph = (window as any).solana;
+            if (!ph?.signAndSendTransaction) throw new Error('Phantom не поддерживает signAndSendTransaction');
               const { signature } = await ph.signAndSendTransaction(vtx);
               await confirmSigHttp(connection, signature);
               return signature as string;
@@ -1270,7 +1272,7 @@ export const useStore = create<Store>()(
               const kp = getKeypair(id);
               if (!kp) throw new Error('Treasury key not found');
               vtx.sign([kp]);
-              const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
+                    const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
               await confirmSigHttp(connection, sig);
               return sig as string;
             }
@@ -1283,11 +1285,13 @@ export const useStore = create<Store>()(
           }
           if (sellErr) throw sellErr;
 
+    // отметим swapped там, где transfer прошёл
           const prog2 = { ...get().sellAllState.progressByBot };
           for (const k of Object.keys(prog2)) { if (prog2[k]?.transferred) (prog2[k] as any).swapped = true; }
           set({ sellAllState: { ...get().sellAllState, progressByBot: prog2, status: 'done' } });
           get().addLog('ok', `Sell ALL: продано ~${amountRounded} TOK (${sellSig.slice(0,8)}…)`);
           await get().refreshBalances(connection);
+
         } catch (e: any) {
           const msg = e?.message || String(e);
           if (/cancel/.test(msg)) {
@@ -1300,7 +1304,8 @@ export const useStore = create<Store>()(
         } finally {
           try { (get() as any)._sellAllAbort = undefined; } catch {}
         }
-      },
+      }
+
 
       async refreshBalances(connection) {
         try {
