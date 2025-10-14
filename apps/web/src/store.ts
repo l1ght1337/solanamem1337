@@ -61,6 +61,35 @@ export type LiveBot = {
   last?: string;
   lastError?: string;
 };
+async function getParsedTokenBalanceAny(
+        connection: Connection,
+        owner58: string,
+        mint58: string,
+        decimals: number
+      ): Promise<number> {
+      try {
+          const owner = new PublicKey(owner58);
+          const [rClassic, r22] = await Promise.allSettled([
+            connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+            connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
+     ]);
+
+    const rows: any[] = [];
+    const take = (res: any) => {
+    for (const it of res?.value ?? []) {
+            if (it?.account?.data?.parsed?.info?.mint === mint58) rows.push(it);
+        }
+    };
+    if (rClassic.status === "fulfilled") take(rClassic.value);
+    if (r22.status === "fulfilled")     take(r22.value);
+
+    let sum = 0n;
+    for (const it of rows) {
+          try { sum += BigInt(it.account.data.parsed.info.tokenAmount.amount); } catch {}
+    }
+    return Number(sum) / Math.pow(10, decimals);
+    } catch { return 0; }
+}
 
 type Log = { ts: string; level: "info" | "ok" | "warn" | "err"; msg: string };
 const now = () => new Date().toLocaleTimeString();
@@ -1424,36 +1453,7 @@ export const useStore = create<Store>()(
               }
             }
           }
-          async function getParsedTokenBalanceAny(
-              connection: Connection,
-              owner58: string,
-              mint58: string,
-              decimals: number
-          ): Promise<number> {
-            try {
-                const owner = new PublicKey(owner58);
-                const [rClassic, r22] = await Promise.allSettled([
-                  connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
-                  connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
-            ]);
-
-                const rows: any[] = [];
-                const take = (res: any) => {
-                  for (const it of res?.value ?? []) {
-                      if (it?.account?.data?.parsed?.info?.mint === mint58) rows.push(it);
-                  }
-                };
-                if (rClassic.status === "fulfilled") take(rClassic.value);
-                if (r22.status === "fulfilled")     take(r22.value);
-
-                let sum = 0n;
-                for (const it of rows) {
-                    try { sum += BigInt(it.account.data.parsed.info.tokenAmount.amount); } catch {}
-                }
-                return Number(sum) / Math.pow(10, decimals);
-              } catch { return 0; }
-          }
-
+          
           set({ bots: updated });
 
           // авто-донат
