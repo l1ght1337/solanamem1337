@@ -4,7 +4,9 @@ import {
   VersionedTransaction,
   Keypair,
   LAMPORTS_PER_SOL,
+  PublicKey,
 } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { getSPLBalance } from "../utils/solana";
 import { scheduleFetch } from "../utils/network";
 import { getJupiterQuote, WSOL } from "../utils/jupiter";
@@ -246,22 +248,75 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const delay = Math.max(0, minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs)));
     deferredSell = { dueAt: now + delay, amountTok: Math.max(0, amountTok) };
   }
+  async function getParsedTokenBalanceAny(
+    connection: Connection,
+    owner58: string,
+    mint58: string,
+    decimals: number
+  ): Promise<number> {
+    try {
+      const owner = new PublicKey(owner58);
+      const mintStr = mint58;
+
+      const [rClassic, r22] = await Promise.allSettled([
+        connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+        connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
+      ]);
+
+      const collected: any[] = [];
+      const pick = (res: any) => {
+        const arr = (res?.value ?? []) as any[];
+        for (const it of arr) {
+          try {
+            if (it?.account?.data?.parsed?.info?.mint === mintStr) collected.push(it);
+          } catch {}
+        }
+      };
+      if (rClassic.status === "fulfilled") pick(rClassic.value);
+      if (r22.status === "fulfilled") pick(r22.value);
+
+      let sum = 0n;
+      for (const it of collected) {
+        try { sum += BigInt(it.account.data.parsed.info.tokenAmount.amount); } catch {}
+      }
+      return Number(sum) / Math.pow(10, decimals);
+    } catch { return 0; }
+  }
 
   async function refreshOnChainBalances() {
-    try {
-      const owner = ctx.keypair().publicKey;
-      const lam = await connection.getBalance(owner, { commitment: "confirmed" as any });
-      const sol = lam / LAMPORTS_PER_SOL;
+  try {
+     const owner = ctx.keypair().publicKey;
+     const lam = await connection.getBalance(owner, { commitment: "confirmed" as any });
+     const sol = lam / LAMPORTS_PER_SOL;
+
+      const decimals = Math.max(0, Number(ctx.tokenDecimals?.() ?? 9));
       let tok = 0;
+
+    // Быстрый путь (ваш util)
       try {
         const raw = await getSPLBalance(connection, owner.toBase58(), ctx.mint);
-        tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
+        const n = Number(raw as any);
+        if (Number.isFinite(n) && n > 0) tok = n / Math.pow(10, decimals);
       } catch {}
+
+    // ⬇️ Надёжный fallback для Token‑2022 / редких RPC
+      if (!(tok > 0)) {
+        try {
+          tok = await getParsedTokenBalanceAny(
+            connection,
+            owner.toBase58(),
+            ctx.mint,
+            decimals
+          );
+        } catch {}
+      }
+
       bot.solBalance = sol;
       bot.tokenBalance = tok;
       pushUpdate({ solBalance: sol, tokenBalance: tok });
     } catch {}
   }
+
 
   async function trade(side: "buy" | "sell", sizeSol: number, opts?: { sellTokens?: number }) {
     let risk = {
