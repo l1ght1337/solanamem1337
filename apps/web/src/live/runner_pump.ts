@@ -336,7 +336,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const maxBuyVal  = Math.max(0, (Math.max(0, MAX_ALLOC - EPS)) * total - currTokVal);
         const original   = sizeSol;
         const clamped    = Math.min(sizeSol, maxBuyVal);
-        if (clamped <= 0.00012) { log("info", "skip BUY: corridor"); return; }
+        if (clamped <= 0) { log("info", "skip BUY: corridor"); return; }
         sizeSol = +clamped.toFixed(6);
         if (sizeSol < original - 1e-9) log("info", `clamped buy ${original.toFixed(6)}→${sizeSol.toFixed(6)}`);
       } else if (side === "sell") {
