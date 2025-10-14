@@ -391,14 +391,23 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     // минутные лимиты (окно)
     const nowTs = Date.now();
     if (nowTs - minWindowStart >= 60_000) { minWindowStart = nowTs; buysThisMin = 0; sellsThisMin = 0; notionalThisMin = 0; }
-    if (side === "buy") {
-      if (nowTs < lossCooldownUntil) { log("info", "skip BUY: loss cooldown"); return; }
-      if (buysThisMin >= risk.maxBuysPerMin)                  { log("info", "skip: minute limits"); return; }
-      if (notionalThisMin + sizeSol > risk.maxNotionalPerMin) { log("info", "skip: minute limits"); return; }
-    } else {
-      if (sellsThisMin >= risk.maxSellsPerMin) { log("info", "skip: minute limits"); return; }
-    }
+    if (side === 'buy') {
+        if (nowTs < lossCooldownUntil) { log("info", "skip BUY: loss cooldown"); return; }
+        if (buysThisMin >= risk.maxBuysPerMin) { log("info", "skip BUY: minute limits (count)"); return; }
 
+  // 🛠️ НЕ отбрасываем целиком — уменьшаем объём до доступного лимита за минуту
+        const maxPerMin = Number(risk.maxNotionalPerMin);
+        if (isFinite(maxPerMin)) {
+            const headroom = Math.max(0, maxPerMin - notionalThisMin);
+            if (headroom <= 0.000049) { log("info", "skip BUY: minute headroom 0"); return; }
+            if (sizeSol > headroom) {
+                log("info", `clamped by minute notional ${sizeSol.toFixed(6)}→${headroom.toFixed(6)}`);
+                sizeSol = +headroom.toFixed(6);
+            }
+          }    
+        } else {
+          if (sellsThisMin >= risk.maxSellsPerMin) { log("info", "skip SELL: minute limits (count)"); return; }
+        }
     // no‑loss фильтр (для всех SELL, кроме __force)
     if (side === "sell" && !opts?.__force && bot.posToken > 0 && bot.avgSol > 0 && (risk.noLossFloorBps ?? 0) > 0) {
       if (priceNow < bot.avgSol * noLossMul) {
