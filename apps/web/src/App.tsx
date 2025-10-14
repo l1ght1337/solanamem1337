@@ -249,7 +249,7 @@ export default function App() {
           )}
         </div>
       </div>
-      <ScenarioPanel />
+      <ScenarioPanel connection={connection} />
       {/* Панель */}
       <div style={{ marginTop: 12, padding: 12, border: "1px solid #283042", borderRadius: 10, background: "#0f1325" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
