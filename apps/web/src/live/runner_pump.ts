@@ -442,7 +442,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const quoteFn = (ctx as any).getJupiterQuote || getJupiterQuote;
     if (side === "buy") {
       try {
-        const pay = Math.round(Math.max(0.00005, sizeSol || pickStep()) * 1e9);
+        const samplePerSlice = Math.min(
+            (sizeSol || 0.0003),
+             Math.max(0.00008, Number(risk.maxBuySliceSol) || 0.00055)
+        );
+        const pay = Math.round(samplePerSlice * 1e9);
         const q   = await quoteFn({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
         const fairOut = (pay / 1e9) / priceNow;
         const out     = Number(q?.outAmount || 0) / Math.pow(10, decimals);
