@@ -1397,10 +1397,29 @@ export const useStore = create<Store>()(
           if (mint && decimals != null) {
             for (let i = 0; i < updated.length; i++) {
               const b = updated[i];
-              if (b.posToken > 0 && b.tokenBalance <= 0) {
+              if ((b.tokenBalance ?? 0) <= 0) {
                 try {
-                  const raw = await getSPLBalance(connection, b.pubkey, mint);
-                  const tok = Number(raw) / Math.pow(10, decimals);
+                  const owner = new PublicKey(b.pubkey);
+                  const [rClassic, r22] = await Promise.allSettled([
+                    (connection as Connection).getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+                    (connection as Connection).getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
+                  ]);
+
+                  let sum = 0n;
+                  const pick = (res: any) => {
+                    const arr = (res?.value ?? []) as any[];
+                    for (const it of arr) {
+                      try {
+                        if (it?.account?.data?.parsed?.info?.mint === mint) {
+                          sum += BigInt(it.account.data.parsed.info.tokenAmount.amount);
+                        }
+                      } catch {}
+                    }
+                  };
+                  if (rClassic.status === "fulfilled") pick(rClassic.value);
+                  if (r22.status === "fulfilled")    pick(r22.value);
+
+                  const tok = Number(sum) / Math.pow(10, decimals);
                   if (tok > 0) updated[i] = { ...b, tokenBalance: tok };
                 } catch {}
               }
