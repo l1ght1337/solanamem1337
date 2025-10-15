@@ -1,7 +1,7 @@
 // @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
-import { confirmSigHttp, confirmManyHttp } from "./utils/confirm";
+import { confirmSigHttp } from "./utils/confirm";
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import {
@@ -22,17 +22,20 @@ import {
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
-import { fetchExternalPrice } from "./store-price-feeds";
 import { logger } from "./utils/logger";
 import { getTokenPriceSOL } from "./utils/priceFeed";
 import { parseMint as parsePumpMint } from "./utils/pump";
 import { getKeypair, createKey, importKey, exportSecret, removeKey } from "./utils/keyring";
-import { getMintDecimals, getSPLBalance } from "./utils/solana";
-import { scheduleFetch, getNetMetrics } from "./utils/network";
-import { createLimiter, ensureAtaIx, detectTokenProgram as detectTokenProgramUtil, sendTxWithRetries, buildPriorityComputeIxs } from "./utils/tx";
+import { getMintDecimals } from "./utils/solana";
+import { scheduleFetch } from "./utils/network";
+import { createLimiter, detectTokenProgram as detectTokenProgramUtil } from "./utils/tx";
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
 import { fetchMultipleAccountInfos } from "./utils/balances";
-import { safeParseNumber, safeDivide, safeMultiply, safeAdd } from "./utils/number";
+import { safeMultiply } from "./utils/number";
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Константы и утилиты                                                       */
+/* ────────────────────────────────────────────────────────────────────────── */
 
 const PF_BASE_SOL = Math.max(0.000006, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000008));
 const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00012));
@@ -62,59 +65,12 @@ export type LiveBot = {
   lastError?: string;
 };
 
-/* ──────────────────────────────
-   Универсальный счётчик баланса токена (SPL + Token-2022).
-   decimals? — опционально: если не передан, возьмём из parsed.tokenAmount.decimals.
-────────────────────────────── */
-async function getParsedTokenBalanceAny(
-  connection: Connection,
-  owner58: string,
-  mint58: string,
-  decimals?: number
-): Promise<number> {
-  try {
-    const owner = new PublicKey(owner58);
-    const [rClassic, r22] = await Promise.allSettled([
-      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
-      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
-    ]);
-
-    const rows: any[] = [];
-    const take = (res: any) => {
-      for (const it of res?.value ?? []) {
-        try { if (it?.account?.data?.parsed?.info?.mint === mint58) rows.push(it); } catch {}
-      }
-    };
-    if (rClassic.status === "fulfilled") take(rClassic.value);
-    if (r22.status === "fulfilled")     take(r22.value);
-
-    let sumRaw = 0n;
-    let dec = (typeof decimals === "number") ? decimals : undefined;
-
-    for (const it of rows) {
-      try {
-        const info = it.account.data.parsed.info;
-        sumRaw += BigInt(info.tokenAmount.amount);
-        if (dec == null) {
-          const d = Number(info.tokenAmount.decimals);
-          if (Number.isFinite(d)) dec = d;
-        }
-      } catch {}
-    }
-    if (sumRaw === 0n) return 0;
-    const d = Number.isFinite(dec as any) ? (dec as number) : 9;
-    return Number(sumRaw) / Math.pow(10, d);
-  } catch {
-    return 0;
-  }
-}
-
 type Log = { ts: string; level: "info" | "ok" | "warn" | "err"; msg: string };
 const now = () => new Date().toLocaleTimeString();
 const b58 = (s: string) => s.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/)?.[0] || null;
 const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/* ---------------- PumpPortal через твои прокси/бекенд ---------------- */
+/* ---------------- PumpPortal через прокси/бекенд ---------------- */
 const RAW_PROXIES = (import.meta.env as any).VITE_PUMP_PROXIES || "";
 const PROXIES: string[] = RAW_PROXIES
   .split(",")
@@ -130,7 +86,7 @@ const rawProxies = ((import.meta.env as any).VITE_PUMP_PROXIES || "")
   .filter(Boolean);
 const proxyBases = rawProxies.map(base => base.replace(/\/+$/, "") + "/x/pump");
 
-// ⬇️ Jupiter base (через твой воркер). По умолчанию — "/jup"
+/* Jupiter base (по умолчанию — "https://quote-api.jup.ag") */
 const JUP_BASE = ((import.meta as any).env?.VITE_JUP_BASE || "https://quote-api.jup.ag").replace(/\/+$/, "");
 
 export async function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
@@ -198,7 +154,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
   throw lastErr || new Error("All pump endpoints failed");
 }
 
-/* ⛑ ГЛОБАЛЬНЫЙ АНТИ-CORS ПАТЧ ДЛЯ JUPITER */
+/* ⛑ Анти‑CORS патч для Jupiter (опционально) */
 (() => {
   const origFetch = globalThis.fetch?.bind(globalThis);
   if (!origFetch) return;
@@ -285,75 +241,77 @@ async function buildCreateTxPumpLocal(body: any): Promise<{ tx: VersionedTransac
   throw lastErr || new Error("Pump create endpoint failed");
 }
 
-/* ---------- Lightning API ---------- */
-async function uploadIpfsMeta(params: {
-  name: string; symbol: string; image: string; description?: string; website?: string; twitter?: string;
-}) {
-  const r = await fetchFirstOk("/api/ipfs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({
-      name: params.name, symbol: params.symbol, description: params.description || "",
-      image: params.image, website: params.website || "", twitter: params.twitter || "",
-    }),
-  }, 2);
-  const j = await r.json().catch(() => ({}));
-  const uri = j?.uri || j?.ipfsUri || j?.metadataUri;
-  if (!uri) throw new Error("IPFS upload failed (no uri)");
-  return String(uri);
-}
+/* ---------- Вспомогательные функции ---------- */
 
-async function buildCreateViaLightning(args: {
-  name: string; symbol: string; image: string;
-  description?: string; website?: string; twitter?: string;
-  initialBuySol?: number; slippagePct?: number; priorityFeeSol?: number;
-}) {
-  const uri = await uploadIpfsMeta({
-    name: args.name, symbol: args.symbol, image: args.image,
-    description: args.description, website: args.website, twitter: args.twitter,
-  });
-
-  const payload = {
-    action: "create",
-    tokenMetadata: { name: args.name, symbol: args.symbol, uri },
-    denominatedInSol: "true",
-    amount: Number(args.initialBuySol || 0),
-    slippage: Number(args.slippagePct ?? 10),
-    priorityFee: Number(args.priorityFeeSol ?? calcPriorityFeeSol()),
-    pool: "pump",
-  };
-
-  const r = await fetchFirstOk("/api/trade", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify(payload),
-  }, 2);
-
-  const j = await r.json().catch(() => ({}));
-  const mint = j?.mint || j?.token || j?.tokenAddress || j?.address;
-  const signature = j?.signature || j?.txSignature || j?.sig;
-  if (!mint) throw new Error("Lightning create: no mint in response");
-  return { mint: String(mint), signature: signature ? String(signature) : undefined };
-}
-
-/* ---------- helpers ---------- */
-async function detectTokenProgram(connection: Connection, mint: PublicKey) {
+/** Универсальный счётчик баланса токена (SPL + Token-2022). */
+async function getParsedTokenBalanceAny(
+  connection: Connection,
+  owner58: string,
+  mint58: string,
+  decimals?: number
+): Promise<number> {
   try {
-    const info = await connection.getAccountInfo(mint);
-    return info?.owner?.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+    const owner = new PublicKey(owner58);
+    const [rClassic, r22] = await Promise.allSettled([
+      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+      connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, "confirmed"),
+    ]);
+
+    const rows: any[] = [];
+    const take = (res: any) => {
+      for (const it of res?.value ?? []) {
+        try { if (it?.account?.data?.parsed?.info?.mint === mint58) rows.push(it); } catch {}
+      }
+    };
+    if (rClassic.status === "fulfilled") take(rClassic.value);
+    if (r22.status === "fulfilled")     take(r22.value);
+
+    let sumRaw = 0n;
+    let dec = (typeof decimals === "number") ? decimals : undefined;
+
+    for (const it of rows) {
+      try {
+        const info = it.account.data.parsed.info;
+        sumRaw += BigInt(info.tokenAmount.amount);
+        if (dec == null) {
+          const d = Number(info.tokenAmount.decimals);
+          if (Number.isFinite(d)) dec = d;
+        }
+      } catch {}
+    }
+    if (sumRaw === 0n) return 0;
+    const d = Number.isFinite(dec as any) ? (dec as number) : 9;
+    return Number(sumRaw) / Math.pow(10, d);
   } catch {
-    return TOKEN_PROGRAM_ID;
+    return 0;
   }
 }
 
-// Быстрое чтение decimals из raw Mint-аккаунта (offset 44, u8). Без парсинга.
-async function getMintDecimalsFast(connection: Connection, mint: PublicKey): Promise<number | null> {
+/** Безопасный батч‑ридер аккаунтов: возвращает (AccountInfo|null)[] и не падает на null. */
+async function getMultipleInfosSafe(
+  connection: Connection,
+  keys: PublicKey[]
+): Promise<(import("@solana/web3.js").AccountInfo<Buffer> | null)[]> {
+  // 1) предпочитаем web3.js без сторонних декодеров
   try {
-    const infos = await fetchMultipleAccountInfos(connection, [mint]);
-    const acc = infos?.[0] || null;
-    const data = (acc?.data as any) as Uint8Array | undefined;
-    if (data && data.byteLength >= 45) return data[44];
+    const out = await (connection as Connection).getMultipleAccountsInfo(keys);
+    if (Array.isArray(out)) return out;
   } catch {}
+  // 2) если вдруг нужно — пробуем ваш батч‑хелпер
+  try {
+    return await fetchMultipleAccountInfos(connection as Connection, keys as any);
+  } catch {}
+  // 3) последний мягкий fallback — поштучно
+  const out: (import("@solana/web3.js").AccountInfo<Buffer> | null)[] = [];
+  for (const k of keys) {
+    try { out.push(await (connection as Connection).getAccountInfo(k)); }
+    catch { out.push(null); }
+  }
+  return out;
+}
+
+/** Быстрое чтение decimals из raw Mint‑аккаунта (offset 44, u8). Без строгих батчей. */
+async function getMintDecimalsFast(connection: Connection, mint: PublicKey): Promise<number | null> {
   try {
     const info = await connection.getAccountInfo(mint);
     const data = (info?.data as any) as Uint8Array | undefined;
@@ -367,7 +325,7 @@ async function ensureWalletAta(connection: Connection, walletPubkey: string, min
   const mintPk = new PublicKey(mint);
   const walletPk = new PublicKey(walletPubkey);
 
-  const programGuess = await detectTokenProgram(connection, mintPk);
+  const programGuess = await detectTokenProgramUtil(connection, mintPk);
   const candidates = [programGuess, programGuess === TOKEN_2022_PROGRAM_ID ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID];
 
   for (const programId of candidates) {
@@ -480,7 +438,7 @@ export type Store = {
 
   smartMM: SmartMM;
   getSmartBps: () => number;
-  getTwapPlan: () => { slices: number; gapMs: number } | null;
+  getTwapPlan: () => ({ slices: number; gapMs: number } | null);
 
   treasuryKeyId?: string;
   autoTopUp: boolean;
@@ -647,7 +605,7 @@ export const useStore = create<Store>()(
 
         const last = cs.slice(-5);
         const p0 = last[0].close;
-        const p1 = last[last.length - 1].close;
+               const p1 = last[last.length - 1].close;
         const slope = (p1 - p0) / Math.max(1e-9, p0);
         const mean = last.reduce((a, c) => a + c.close, 0) / last.length;
         const sd = Math.sqrt(last.reduce((a, c) => a + (c.close - mean) ** 2, 0) / last.length) / Math.max(1e-9, mean);
@@ -914,9 +872,9 @@ export const useStore = create<Store>()(
           const kp = getKeypair(sender.keyId);
           if (!kp) { s.addLog("err", `Нет ключа для ${sender.name}`); continue; }
 
-        const idx = bots.findIndex((x) => x.id === sender.id);
-        const receiver = bots[(idx + 1) % bots.length];
-        const toPk = new PublicKey(receiver.pubkey);
+          const idx = bots.findIndex((x) => x.id === sender.id);
+          const receiver = bots[(idx + 1) % bots.length];
+          const toPk = new PublicKey(receiver.pubkey);
 
           for (let i = 0; i < txPerBot; i++) {
             try {
@@ -1092,178 +1050,182 @@ export const useStore = create<Store>()(
         set((s) => ({ sellAllState: { ...s.sellAllState, status: s.sellAllState.status === 'running' ? 'cancelling' : s.sellAllState.status } }));
       },
 
-      // ─── replace whole function sellAllParallel(...) with this one ───
-async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey: string } | { to: 'treasury' }) {
-  const s = get();
-  if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
-  if (get().sellAllState.status === 'running') { s.addLog("warn", "Sell ALL уже выполняется"); return; }
+      /* ───────────────────────────────────────────────────────────────
+         SELL ALL (параллельный, устойчивый к отсутствующим аккаунтам)
+         ─────────────────────────────────────────────────────────────── */
+      sellAllParallel: async (connection: Connection, dest: { to: 'wallet'; walletPubkey: string } | { to: 'treasury' }) => {
+        const s = get();
+        if (!s.tokenMint) { s.addLog("warn", "Sell ALL: mint не задан"); return; }
+        if (get().sellAllState.status === 'running') { s.addLog("warn", "Sell ALL уже выполняется"); return; }
 
-  const opId = `sellall:${Date.now()}:${Math.random().toString(36).slice(2,7)}`;
-  const ac = new AbortController();
-  (get() as any)._sellAllAbort = ac;
-  set({ sellAllState: { id: opId, startedAt: Date.now(), destination: dest.to, status: 'running', progressByBot: {} } });
+        const opId = `sellall:${Date.now()}:${Math.random().toString(36).slice(2,7)}`;
+        const ac = new AbortController();
+        (get() as any)._sellAllAbort = ac;
+        set({ sellAllState: { id: opId, startedAt: Date.now(), destination: dest.to, status: 'running', progressByBot: {} } });
 
-  try {
-    const mintPk = new PublicKey(s.tokenMint);
+        try {
+          const mintPk = new PublicKey(s.tokenMint);
 
-    // 1) decimals (fast -> normal), кэшируем
-    let decimals: number | undefined = get()._mintDecimals;
-    if (decimals == null) {
-      try { decimals = await getMintDecimalsFast(connection, mintPk) ?? undefined; } catch {}
-      if (decimals == null) { try { decimals = await getMintDecimals(connection, s.tokenMint) ?? undefined; } catch {} }
-      if (typeof decimals === "number") set({ _mintDecimals: decimals });
-    }
-    const decimalsKnown = typeof decimals === "number";
+          // decimals (fast -> normal), кэш
+          let decimals: number | undefined = get()._mintDecimals;
+          if (decimals == null) {
+            try { decimals = await getMintDecimalsFast(connection, mintPk) ?? undefined; } catch {}
+            if (decimals == null) { try { decimals = await getMintDecimals(connection, s.tokenMint) ?? undefined; } catch {} }
+            if (typeof decimals === "number") set({ _mintDecimals: decimals });
+          }
+          const decimalsKnown = typeof decimals === "number";
 
-    // 2) определим реальный токен-программу по mint
-    const mintProgramId = await detectTokenProgramUtil(connection, mintPk);
+          // фактическая программа токена
+          const mintProgramId = await detectTokenProgramUtil(connection, mintPk);
 
-    // 3) адрес, куда стекаем токен перед продажей
-    const dstOwner = dest.to === 'wallet'
-      ? new PublicKey((dest as any).walletPubkey)
-      : (() => { const id = get().treasuryKeyId; if (!id) throw new Error('Treasury не задан'); const k = getKeypair(id); if (!k) throw new Error('Treasury key not found'); return k.publicKey; })();
+          // куда стекаем токены
+          const dstOwner = dest.to === 'wallet'
+            ? new PublicKey((dest as any).walletPubkey)
+            : (() => { const id = get().treasuryKeyId; if (!id) throw new Error('Treasury не задан'); const k = getKeypair(id); if (!k) throw new Error('Treasury key not found'); return k.publicKey; })();
 
-    // 4) 🧩 ОДНОРАЗОВО создаём ATA назначения (чтобы избежать гонок)
-    const ensureDestAtaOnce = async () => {
-      const payer = getKeypair(get().bots[0]?.keyId || "");
-      if (!payer) throw new Error("Sell ALL: нет payer для создания ATA");
-      const dstAta = await getAssociatedTokenAddress(mintPk, dstOwner, false, mintProgramId);
-      const info = await connection.getAccountInfo(dstAta);
-      if (!info) {
-        const ix = createAssociatedTokenAccountInstruction(payer.publicKey, dstAta, dstOwner, mintPk, mintProgramId);
-        const { blockhash } = await connection.getLatestBlockhash("finalized");
-        const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash }).add(ix);
-        tx.sign(payer);
-        const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-        await confirmSigHttp(connection, sig);
-        get().addLog('ok', `Sell ALL: создан ATA назначения ${dstAta.toBase58().slice(0,6)}…`);
-      }
-      return dstAta;
-    };
-    const dstAta = await ensureDestAtaOnce();
+          // Разово создаём ATA назначения
+          const ensureDestAtaOnce = async () => {
+            const firstBot = get().bots[0];
+            if (!firstBot) throw new Error("Sell ALL: нет ни одного бота");
+            const payer = getKeypair(firstBot.keyId);
+            if (!payer) throw new Error("Sell ALL: нет payer для создания ATA");
+            const dstAta = await getAssociatedTokenAddress(mintPk, dstOwner, false, mintProgramId);
+            const info = await connection.getAccountInfo(dstAta);
+            if (!info) {
+              const ix = createAssociatedTokenAccountInstruction(payer.publicKey, dstAta, dstOwner, mintPk, mintProgramId);
+              const { blockhash } = await connection.getLatestBlockhash("finalized");
+              const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash }).add(ix);
+              tx.sign(payer);
+              const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+              await confirmSigHttp(connection, sig);
+              get().addLog('ok', `Sell ALL: создан ATA назначения ${dstAta.toBase58().slice(0,6)}…`);
+            }
+            return dstAta;
+          };
+          const dstAta = await ensureDestAtaOnce();
 
-    const bots = get().bots.slice();
-    const maxPar = Math.max(1, Number(((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS) ?? 8));
-    const limit = createLimiter(maxPar);
+          const bots = get().bots.slice();
+          const maxPar = Math.max(1, Number(((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS) ?? 8));
+          const limit = createLimiter(maxPar);
 
-    // для разбора сырых сумм из ATA
-    const decodeAmount = (acc: any): bigint => {
-      try {
-        if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
-        const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
-        const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
-        return (BigInt(hi) << 32n) + BigInt(lo);
-      } catch { return 0n; }
-    };
+          const decodeAmount = (acc: any): bigint => {
+            try {
+              if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+              const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+              const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+              return (BigInt(hi) << 32n) + BigInt(lo);
+            } catch { return 0n; }
+          };
 
-    const transferOne = async (b: LiveBot) => {
-      const started = Date.now();
-      const prog = get().sellAllState.progressByBot || {};
-      prog[b.id] = prog[b.id] || { transferred: false, swapped: false, retries: 0 } as any;
-      set({ sellAllState: { ...get().sellAllState, progressByBot: { ...prog } } });
+          const transferOne = async (b: LiveBot) => {
+            const started = Date.now();
+            const prog = get().sellAllState.progressByBot || {};
+            prog[b.id] = prog[b.id] || { transferred: false, swapped: false, retries: 0 } as any;
+            set({ sellAllState: { ...get().sellAllState, progressByBot: { ...prog } } });
 
-      try {
-        const kp = getKeypair(b.keyId);
-        if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
+            try {
+              const kp = getKeypair(b.keyId);
+              if (!kp) { get().addLog('err', `Sell ALL: нет ключа для ${b.name}`); return; }
 
-        // читаем оба возможных источника
-        const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
-        const src22     = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
-        const infos     = await fetchMultipleAccountInfos(connection, [srcClassic, src22]);
-        const [srcCInfo, src22Info] = infos;
+              const srcClassic = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_PROGRAM_ID);
+              const src22     = await getAssociatedTokenAddress(mintPk, kp.publicKey, false, TOKEN_2022_PROGRAM_ID);
 
-        const amtC  = decodeAmount(srcCInfo);
-        const amt22 = decodeAmount(src22Info);
+              // безопасно читаем обе ATA
+              const [srcCInfo, src22Info] = await Promise.all([
+                connection.getAccountInfo(srcClassic).catch(() => null),
+                connection.getAccountInfo(src22).catch(() => null),
+              ]);
 
-        // выбираем тот ATA, где реально есть токен
-        let programId = TOKEN_PROGRAM_ID;
-        let srcAta    = srcClassic;
-        let amountRaw = amtC;
-        if (amt22 > 0n || (!srcCInfo && src22Info)) {
-          programId = TOKEN_2022_PROGRAM_ID;
-          srcAta    = src22;
-          amountRaw = amt22;
-        }
-        if (amountRaw <= 0n) return; // у этого бота токена нет
+              const amtC  = decodeAmount(srcCInfo);
+              const amt22 = decodeAmount(src22Info);
 
-        const tx = new Transaction();
-        tx.add(ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: Math.max(1000, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 2000)),
-        }));
+              let programId = TOKEN_PROGRAM_ID;
+              let srcAta    = srcClassic;
+              let amountRaw = amtC;
+              if (amt22 > 0n || (!srcCInfo && src22Info)) {
+                programId = TOKEN_2022_PROGRAM_ID;
+                srcAta    = src22;
+                amountRaw = amt22;
+              }
+              if (amountRaw <= 0n) return; // у этого бота токена нет
 
-        if (decimalsKnown) {
-          tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals!, [], programId));
-        } else {
-          const { createTransferInstruction } = await import('@solana/spl-token');
-          tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
-        }
+              const tx = new Transaction();
+              tx.add(ComputeBudgetProgram.setComputeUnitPrice({
+                microLamports: Math.max(1000, Number(((import.meta as any).env?.VITE_SELLALL_CU_PRICE) ?? 2000)),
+              }));
 
-        const { blockhash } = await connection.getLatestBlockhash("finalized");
-        tx.feePayer = kp.publicKey;
-        tx.recentBlockhash = blockhash;
-        tx.sign(kp);
+              if (decimalsKnown) {
+                tx.add(createTransferCheckedInstruction(srcAta, mintPk, dstAta, kp.publicKey, amountRaw, decimals!, [], programId));
+              } else {
+                const { createTransferInstruction } = await import('@solana/spl-token');
+                tx.add(createTransferInstruction(srcAta, dstAta, kp.publicKey, amountRaw, [], programId));
+              }
 
-        // ⚠️ ждём подтверждение и только после этого помечаем transferred
-        const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-        await confirmSigHttp(connection, sig);
+              const { blockhash } = await connection.getLatestBlockhash("finalized");
+              tx.feePayer = kp.publicKey;
+              tx.recentBlockhash = blockhash;
+              tx.sign(kp);
 
-        const elapsed = Date.now() - started;
-        const curr = get().sellAllState.progressByBot || {};
-        curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
-        set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+              const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+              await confirmSigHttp(connection, sig);
 
-        get().addLog('ok', `Sell ALL: transfer ${b.name} → dst (${sig.slice(0,8)}…)`);
-      } catch (e: any) {
-        const curr = get().sellAllState.progressByBot || {};
-        const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
-        curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
-        set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
-        get().addLog('err', `Sell ALL transfer ${b.name}: ${msg}`);
-      }
-    };
+              const elapsed = Date.now() - started;
+              const curr = get().sellAllState.progressByBot || {};
+              curr[b.id] = { ...(curr[b.id]||{}), transferred: true, signature: sig, retries: 0, ms: elapsed } as any;
+              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
 
-    await Promise.allSettled(bots.map((b) => limit(() => transferOne(b))));
-    if (ac.signal.aborted) throw new Error('cancelled');
+              get().addLog('ok', `Sell ALL: transfer ${b.name} → dst (${sig.slice(0,8)}…)`);
+            } catch (e: any) {
+              const curr = get().sellAllState.progressByBot || {};
+              const msg = (e && (e as any).message) ? String((e as any).message) : String(e);
+              curr[b.id] = { ...(curr[b.id]||{}), error: msg } as any;
+              set({ sellAllState: { ...get().sellAllState, progressByBot: { ...curr } } });
+              get().addLog('err', `Sell ALL transfer ${b.name}: ${msg}`);
+            }
+          };
 
-    // ── короткий поллинг, ждём пока баланс "дойдёт" на RPC
-    let amountTok = 0;
-    for (let i = 0; i < 12; i++) {
-      amountTok = await getParsedTokenBalanceAny(connection, dstOwner.toBase58(), s.tokenMint, decimals);
-      if (amountTok > 0) break;
-      await new Promise((r) => setTimeout(r, 350));
-    }
+          await Promise.allSettled(bots.map((b) => limit(() => transferOne(b))));
+          if (ac.signal.aborted) throw new Error('cancelled');
 
-    if (amountTok <= 0) {
-      s.addLog('info', 'Sell ALL: на адресе продажи нет токенов');
-      set((st) => ({ sellAllState: { ...st.sellAllState, status: 'done', msg: 'no tokens to sell' } }));
-      await get().refreshBalances(connection);
-      return;
-    }
+          // ждём пока баланс "дойдёт" на RPC
+          let amountTok = 0;
+          for (let i = 0; i < 12; i++) {
+            amountTok = await getParsedTokenBalanceAny(connection, dstOwner.toBase58(), s.tokenMint, decimals);
+            if (amountTok > 0) break;
+            await new Promise((r) => setTimeout(r, 350));
+          }
 
-    const digits = Math.min(6, (typeof decimals === "number" ? decimals : 6));
-    const amountRounded = +amountTok.toFixed(digits);
+          if (amountTok <= 0) {
+            s.addLog('info', 'Sell ALL: на адресе продажи нет токенов');
+            set((st) => ({ sellAllState: { ...st.sellAllState, status: 'done', msg: 'no tokens to sell' } }));
+            await get().refreshBalances(connection);
+            return;
+          }
 
-    // финальная продажа
-    const priorityFeeSol = Math.max(
-      Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MIN) ?? 1500) / 1_000_000_000,
-      0.00001
-    );
-    const payload = {
-        publicKey: dstOwner.toBase58(),
-        action: 'sell',
-        mint: s.tokenMint,
-        denominatedInSol: 'false',
-        amount: amountRounded,
-        slippage: safeBps(get().getSmartBps(), 50) / 100,
-        priorityFee: priorityFeeSol,
-        pool: 'auto',
-      } as any;
+          const digits = Math.min(6, (typeof decimals === "number" ? decimals : 6));
+          const amountRounded = +amountTok.toFixed(digits);
 
-      const trySell = async () => {
-      const vtx = await buildTradeTxPumpLocal(payload);
-      if (dest.to === 'wallet') {
-        const ph = (window as any).solana;
-            if (!ph?.signAndSendTransaction) throw new Error('Phantom не поддерживает signAndSendTransaction');
+          // финальная продажа
+          const priorityFeeSol = Math.max(
+            Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MIN) ?? 1500) / 1_000_000_000,
+            0.00001
+          );
+          const payload = {
+            publicKey: dstOwner.toBase58(),
+            action: 'sell',
+            mint: s.tokenMint,
+            denominatedInSol: 'false',
+            amount: amountRounded,
+            slippage: safeBps(get().getSmartBps(), 50) / 100,
+            priorityFee: priorityFeeSol,
+            pool: 'auto',
+          } as any;
+
+          const trySell = async () => {
+            const vtx = await buildTradeTxPumpLocal(payload);
+            if (dest.to === 'wallet') {
+              const ph = (window as any).solana;
+              if (!ph?.signAndSendTransaction) throw new Error('Phantom не поддерживает signAndSendTransaction');
               const { signature } = await ph.signAndSendTransaction(vtx);
               await confirmSigHttp(connection, signature);
               return signature as string;
@@ -1272,7 +1234,7 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
               const kp = getKeypair(id);
               if (!kp) throw new Error('Treasury key not found');
               vtx.sign([kp]);
-                    const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
+              const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 3 });
               await confirmSigHttp(connection, sig);
               return sig as string;
             }
@@ -1281,11 +1243,12 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
           let sellSig = '';
           let sellErr: any;
           for (let i = 0; i < 3; i++) {
-            try { sellSig = await trySell(); sellErr = null; break; } catch (e) { sellErr = e; await new Promise((r) => setTimeout(r, 250 + i*250)); }
+            try { sellSig = await trySell(); sellErr = null; break; }
+            catch (e) { sellErr = e; await new Promise((r) => setTimeout(r, 250 + i*250)); }
           }
           if (sellErr) throw sellErr;
 
-    // отметим swapped там, где transfer прошёл
+          // отметим swapped у тех, кто перевёл
           const prog2 = { ...get().sellAllState.progressByBot };
           for (const k of Object.keys(prog2)) { if (prog2[k]?.transferred) (prog2[k] as any).swapped = true; }
           set({ sellAllState: { ...get().sellAllState, progressByBot: prog2, status: 'done' } });
@@ -1306,7 +1269,9 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
         }
       },
 
-
+      /* ───────────────────────────────────────────────────────────────
+         Балансы (устойчиво к пустым аккаунтам)
+         ─────────────────────────────────────────────────────────────── */
       async refreshBalances(connection) {
         try {
           if ((get() as any)._rbBusy) return;
@@ -1314,7 +1279,7 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
           const s = get();
           const mint = s.tokenMint || null;
 
-          // ✔️ decimals: сначала быстрый способ, потом обычный, кэшируем
+          // decimals fast -> normal (кэш)
           let decimals: number | null = null;
           if (mint) {
             try {
@@ -1335,13 +1300,15 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
           const priceNow = get().price || 0;
           const chunk = (arr: any[], n: number) => { const out:any[]=[]; for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n)); return out; };
 
+          // SOL‑балансы кошельков (безопасный батч)
           const walletPks = botsList.map(b => new PublicKey(b.pubkey));
           const solInfos: (import("@solana/web3.js").AccountInfo<Buffer> | null)[] = [];
           for (const part of chunk(walletPks, 100)) {
-            const infos = await fetchMultipleAccountInfos(connection as Connection, part as any);
+            const infos = await getMultipleInfosSafe(connection as Connection, part as any);
             solInfos.push(...infos);
           }
 
+          // Адреса ATA (classic + 2022)
           let ataClassic: import("@solana/web3.js").PublicKey[] = [];
           let ata2022: import("@solana/web3.js").PublicKey[] = [];
           if (mint && decimals != null) {
@@ -1353,23 +1320,26 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
             }
           }
 
+          // Инфо по ATA (безопасный батч)
           const ataInfos = new Map<string, import("@solana/web3.js").AccountInfo<Buffer> | null>();
           const allAtas = [...ataClassic, ...ata2022].filter(Boolean) as import("@solana/web3.js").PublicKey[];
           if (allAtas.length) {
             for (const part of chunk(allAtas, 100)) {
-              const infos = await fetchMultipleAccountInfos(connection as Connection, part as any);
+              const infos = await getMultipleInfosSafe(connection as Connection, part as any);
               for (let i=0;i<part.length;i++) ataInfos.set(part[i].toBase58(), infos[i]);
             }
           }
 
           const decodeAmount = (acc: import("@solana/web3.js").AccountInfo<Buffer> | null): number => {
-            if (!acc) return 0;
-            const data = acc.data as unknown as Uint8Array;
-            if (!data || data.byteLength < 72) return 0;
-            const view = new DataView(data.buffer, data.byteOffset + 64, 8);
-            const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
-            const full = (BigInt(hi) << 32n) + BigInt(lo);
-            return Number(full);
+            try {
+              if (!acc) return 0;
+              const data = acc.data as unknown as Uint8Array;
+              if (!data || data.byteLength < 72) return 0;
+              const view = new DataView(data.buffer, data.byteOffset + 64, 8);
+              const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
+              const full = (BigInt(hi) << 32n) + BigInt(lo);
+              return Number(full);
+            } catch { return 0; }
           };
 
           const updated = botsList.map((b, idx) => {
@@ -1392,7 +1362,7 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
             return { ...b, solBalance: sol, tokenBalance: tok, unrealized: unreal };
           });
 
-          // Доп. fallback (если токенBalance 0, а posToken > 0)
+          // Fallback (если токенBalance 0, а posToken > 0) — мягкое чтение parsed
           if (mint && decimals != null) {
             for (let i = 0; i < updated.length; i++) {
               const b = updated[i];
@@ -1470,12 +1440,45 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
       async createPumpToken(connection, creatorPubkey, params) {
         try {
           const slippagePct = safeBps(get().getSmartBps(), 50) / 100;
-          const { mint, signature } = await buildCreateViaLightning({
-            name: params.name, symbol: params.symbol, image: params.image,
-            description: params.description, website: params.website, twitter: params.twitter,
-            initialBuySol: params.initialBuySol || 0,
-            slippagePct, priorityFeeSol: 0.00001,
-          });
+          const { mint, signature } = await (async () => {
+            // Lightning (через /api/trade → action:create)
+            const uri = await (async () => {
+              const r = await fetchFirstOk("/api/ipfs", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Accept: "application/json" },
+                body: JSON.stringify({
+                  name: params.name, symbol: params.symbol, description: params.description || "",
+                  image: params.image, website: params.website || "", twitter: params.twitter || "",
+                }),
+              }, 2);
+              const j = await r.json().catch(() => ({}));
+              const u = j?.uri || j?.ipfsUri || j?.metadataUri;
+              if (!u) throw new Error("IPFS upload failed (no uri)");
+              return String(u);
+            })();
+
+            const payload = {
+              action: "create",
+              tokenMetadata: { name: params.name, symbol: params.symbol, uri },
+              denominatedInSol: "true",
+              amount: Number(params.initialBuySol || 0),
+              slippage: Number(slippagePct ?? 10),
+              priorityFee: Number(0.00001),
+              pool: "pump",
+            };
+
+            const r = await fetchFirstOk("/api/trade", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json" },
+              body: JSON.stringify(payload),
+            }, 2);
+
+            const j = await r.json().catch(() => ({}));
+            const mint = j?.mint || j?.token || j?.tokenAddress || j?.address;
+            const signature = j?.signature || j?.txSignature || j?.sig;
+            if (!mint) throw new Error("Lightning create: no mint in response");
+            return { mint: String(mint), signature: signature ? String(signature) : undefined };
+          })();
 
           get().addLog("ok", `Token created (Lightning): ${mint}${signature ? ` (${signature.slice(0, 8)}…)` : ""}`);
           set((s) => ({ ...s, tokenUrl: mint, tokenMint: mint, external: { ...s.external, provider: "pumpportal" } }));
