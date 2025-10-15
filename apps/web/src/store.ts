@@ -1304,7 +1304,7 @@ async sellAllParallel(connection: Connection, dest: { to: 'wallet'; walletPubkey
         } finally {
           try { (get() as any)._sellAllAbort = undefined; } catch {}
         }
-      }
+      },
 
 
       async refreshBalances(connection) {
