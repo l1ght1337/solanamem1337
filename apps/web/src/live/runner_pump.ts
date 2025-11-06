@@ -1,3 +1,4 @@
+
 // apps/web/src/live/runner_pump.ts
 import {
   Connection,
@@ -87,6 +88,10 @@ const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pum
 
 const PF_BASE_SOL = Math.max(0.000006, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000008));
 const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00012));
+
+// Разрешить микроселл ниже minAlloc (по умолчанию выключено).
+// Пример: VITE_SOFT_SELL_BPS=20 → разрешим ~0.20% портфеля (в токен-экв.) как "мягкий" срез.
+const SOFT_SELL_BPS = Math.max(0, Number(((import.meta as any).env?.VITE_SOFT_SELL_BPS) ?? 0));
 
 type Job<T> = () => Promise<T>;
 function makeQueue(concurrency = 8, baseGapMs = 60) {
@@ -347,37 +352,35 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         };
 
         if (opts?.sellTokens) {
-            const originalTok = opts.sellTokens;
-            let newAmt = applyClamp(originalTok);
+          const originalTok = opts.sellTokens;
+          let newAmt = applyClamp(originalTok);
 
-    // опционально: крошечный «мягкий» sell ниже коридора, если clamp дал 0
-            if (newAmt <= 0 && SOFT_SELL_BPS > 0) {
-                const softTok = roundTok((SOFT_SELL_BPS / 10_000) * total / Math.max(1e-12, priceNow), decimals);
-                if (softTok > 0) newAmt = Math.min(softTok, roundTok(bot.posToken, decimals));
-            }
+          // мягкий sell при полном зажиме
+          if (newAmt <= 0 && SOFT_SELL_BPS > 0) {
+            const softTok = roundTok((SOFT_SELL_BPS / 10_000) * total / Math.max(1e-12, priceNow), decimals);
+            if (softTok > 0) newAmt = Math.min(softTok, roundTok(bot.posToken, decimals));
+          }
 
-            if (newAmt <= 0) return; // тихо выходим без спама
-            (opts as any).sellTokens = newAmt;
-            amountTok = newAmt;
-            if (newAmt < originalTok - 1e-12) log("info", `clamped sell ${roundTok(originalTok,decimals)}→${roundTok(newAmt,decimals)}`);
-          } else {
-            const base = amountTok ?? bot.posToken;
-            let capped = applyClamp(base);
+          if (newAmt <= 0) return; // тихо выходим
+          (opts as any).sellTokens = newAmt;
+          amountTok = newAmt;
+        } else {
+          const base = amountTok ?? bot.posToken;
+          let capped = applyClamp(base);
 
-    // опционально: мягкий sell, если строгое clamp=0
-            if (capped <= 0 && SOFT_SELL_BPS > 0) {
-                const softTok = roundTok((SOFT_SELL_BPS / 10_000) * total / Math.max(1e-12, priceNow), decimals);
-                if (softTok > 0) capped = Math.min(softTok, roundTok(bot.posToken, decimals));
-            }
+          if (capped <= 0 && SOFT_SELL_BPS > 0) {
+            const softTok = roundTok((SOFT_SELL_BPS / 10_000) * total / Math.max(1e-12, priceNow), decimals);
+            if (softTok > 0) capped = Math.min(softTok, roundTok(bot.posToken, decimals));
+          }
 
-            if (capped <= 0) return; // тихо (раньше был "skip SELL: corridor")
-            amountTok = capped;
-            }
+          if (capped <= 0) return; // тихо выходим
+          amountTok = capped;
         }
+      }
     } catch {}
 
-    if (side === "buy"  && sizeSol <= 0) { log("info", "skip BUY: corridor"); return; }
-    if (side === "sell" && (amountTok ?? bot.posToken) <= 0) { log("info", "skip SELL: corridor"); return; }
+      if (side === "buy" && sizeSol <= 0) { log("info", "skip BUY: corridor"); return; }
+      if (side === "sell" && (amountTok ?? bot.posToken) <= 0) { return; }
 
     // резерв SOL перед покупкой
     if (side === "buy") {
@@ -510,13 +513,31 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         if (now2 - minWindowStart >= 60_000) { minWindowStart = now2; buysThisMin = 0; sellsThisMin = 0; notionalThisMin = 0; }
         if (buysThisMin >= risk.maxBuysPerMin) { log("info", "skip: minute limits"); break; }
         if (notionalThisMin + pl.amount > (Number(risk.maxNotionalPerMin) || 0)) { log("info", "skip: minute limits"); break; }
-      } else {
-        const pnow = Math.max(1e-12, ctx.price());
-        const currTokVal   = localPosToken * pnow;
-        const totalLocal   = Math.max(1e-9, currTokVal + localSol);
-        const minTokValAf  = Math.max(0, (Math.min(0.98, MIN_ALLOC + EPS)) * totalLocal);
-        const maxSellTokLoc= Math.max(0, (currTokVal - minTokValAf) / Math.max(1e-12, pnow));
-        if (maxSellTokLoc <= 0) { log("info", `stop SELL slicing: would breach minAlloc ${(MIN_ALLOC*100).toFixed(1)}%`); break; }
+        } else {
+          const pnow = Math.max(1e-12, ctx.price());
+          const currTokVal   = localPosToken * pnow;
+          const totalLocal   = Math.max(1e-9, currTokVal + localSol);
+          const minTokValAf  = Math.max(0, (Math.min(0.98, MIN_ALLOC + EPS)) * totalLocal);
+          const maxSellTokLoc= Math.max(0, (currTokVal - minTokValAf) / Math.max(1e-12, pnow));
+          if (maxSellTokLoc <= 0) {
+            // попытаемся один мягкий срез, если включено
+            if (!opts?.sellTokens && SOFT_SELL_BPS > 0) {
+              const softTok = roundTok((SOFT_SELL_BPS / 10_000) * totalLocal / Math.max(1e-12, pnow), decimals);
+              if (softTok > 0) {
+                const plSoft = { ...payloadBase, action: "sell", denominatedInSol: "false", amount: softTok } as any;
+                const vtxSoft = await buildTradeTxPump(plSoft);
+                vtxSoft.sign([kp]);
+                const sigSoft = await connection.sendRawTransaction(vtxSoft.serialize(), { skipPreflight: true, maxRetries: 4 });
+                await confirmSigHttp(connection, sigSoft);
+
+                executedSlices++;
+                executedTok += softTok;
+                localPosToken = Math.max(0, localPosToken - softTok);
+                localSol     += Math.max(0, softTok * pnow - FEE_EST_SOL);
+              }
+            }
+            break; // без логов
+          }
 
         let qty = (() => {
           const cap = maxSellPerSlice > 0
@@ -604,9 +625,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const gap  = gmin + Math.floor(Math.random() * (gmax - gmin));
         await sleep(gap);
       }
-    }
+      }
 
-    if (executedSlices === 0) throw new Error("no slices executed");
+      if (executedSlices === 0) {
+        // Нормально: лимиты/коридор/квоты — это не сетевой фейл
+        bot.last = "hold";
+        pushUpdate({ last: bot.last });
+        return;
+      }
 
     // успех — сбрасываем backoff
     failStreak = 0;
