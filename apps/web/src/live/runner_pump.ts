@@ -1,4 +1,5 @@
 
+
 // apps/web/src/live/runner_pump.ts
 import {
   Connection,
@@ -89,9 +90,14 @@ const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pum
 const PF_BASE_SOL = Math.max(0.000006, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000008));
 const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00012));
 
-// Разрешить микроселл ниже minAlloc (по умолчанию выключено).
-// Пример: VITE_SOFT_SELL_BPS=20 → разрешим ~0.20% портфеля (в токен-экв.) как "мягкий" срез.
-const SOFT_SELL_BPS = Math.max(0, Number(((import.meta as any).env?.VITE_SOFT_SELL_BPS) ?? 0));
+// Allow small "soft" sell (bps of total notional) to rebuild fee reserves even when clamped by minAlloc.
+// Env: VITE_SOFT_SELL_BPS=20 → allow up to 0.20% of total portfolio value.
+const SOFT_SELL_BPS = Math.max(
+  0,
+  Number(
+    ((import.meta as any).env?.VITE_SOFt_SELL_BPS ?? (import.meta as any).env?.VITE_SOFT_SELL_BPS) ?? 0,
+  ),
+);
 
 type Job<T> = () => Promise<T>;
 function makeQueue(concurrency = 8, baseGapMs = 60) {
@@ -174,6 +180,7 @@ async function buildTradeTxPump(payload: Record<string, any>): Promise<Versioned
 /* ─────────────────── Helpers / risk / math ─────────────────── */
 const FEE_EST_SOL  = 0.00002; // ~20k lamports
 const MIN_KEEP_SOL = 0.0006;
+const MIN_EXEC_SOL = 0.00012;
 
 let TARGET_ALLOC = 0.70;
 let MAX_ALLOC    = 0.85;
@@ -207,14 +214,16 @@ function capsForStrategy(s: InternalStrategy) {
 
 /* ───────────────────────────── Runner ───────────────────────────── */
 export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
-  let stopped = false;
-  let pending = false;
-  let cooldownUntil = 0;
+    let stopped = false;
+    let pending = false;
+    let cooldownUntil = 0;
 
-  // пер‑ботовый backoff при сетевых проблемах
-  let failStreak = 0;
-  let nextRetryAt = 0;
-  let lastWarnTs = 0;
+    // пер‑ботовый backoff при сетевых проблемах
+    let failStreak = 0;
+    let nextRetryAt = 0;
+    let lastWarnTs = 0;
+    const LIGHT_REFRESH_MS = Number(((import.meta as any).env?.VITE_LIGHT_REFRESH_MS) ?? 12000);
+    let lastLightRefreshAt = 0;
 
   // защита портфеля
   let baselineValue = 0;
@@ -272,7 +281,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     } catch {}
   }
 
-  async function trade(side: "buy" | "sell", sizeSol: number, opts?: { sellTokens?: number }) {
+    async function trade(
+      side: "buy" | "sell",
+      sizeSol: number,
+      opts?: { sellTokens?: number; noInnerSlice?: boolean },
+    ): Promise<boolean> {
     // риски из стора
     let risk = {
       maxImpact: 0.010,
@@ -291,6 +304,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       noLossFloorBps: 0, // по умолчанию не запрещаем продавать ниже avg — сценарий может поднять
     } as any;
     try { const r = ctx.getRisk?.(); if (r) risk = { ...risk, ...r }; } catch {}
+
+      let anyExecuted = false;
 
     // подхватываем аллокации и форму шага
     try {
@@ -323,22 +338,22 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const { a, total } = alloc(priceNow);
       const EPS = 0.002;
 
-      if (side === "buy" && a >= MAX_ALLOC - EPS) {
-        log("info", "skip BUY: at/above maxAlloc");
-        return;
-      }
+        if (side === "buy" && a >= MAX_ALLOC - EPS) {
+          log("info", "skip BUY: at/above maxAlloc");
+          return false;
+        }
 
-      if (side === "sell" && a <= MIN_ALLOC + EPS) {
-        // обычные продажи ниже коридора запрещаем (кроме принудительных sellTokens для комиссий)
-        if (!opts?.sellTokens) { log("info", "skip SELL: at/below minAlloc"); return; }
-      }
+        if (side === "sell" && a <= MIN_ALLOC + EPS) {
+          // обычные продажи ниже коридора запрещаем (кроме принудительных sellTokens для комиссий)
+          if (!opts?.sellTokens) { return false; }
+        }
 
       if (side === "buy" && sizeSol > 0) {
         const currTokVal = bot.posToken * priceNow;
         const maxBuyVal  = Math.max(0, (Math.max(0, MAX_ALLOC - EPS)) * total - currTokVal);
         const original   = sizeSol;
         const clamped    = Math.min(sizeSol, maxBuyVal);
-        if (clamped <= 0.00012) { log("info", "skip BUY: corridor"); return; }
+          if (clamped <= MIN_EXEC_SOL) { log("info", "skip BUY: corridor"); return false; }
         sizeSol = +clamped.toFixed(6);
         if (sizeSol < original - 1e-9) log("info", `clamped buy ${original.toFixed(6)}→${sizeSol.toFixed(6)}`);
       } else if (side === "sell") {
@@ -361,7 +376,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             if (softTok > 0) newAmt = Math.min(softTok, roundTok(bot.posToken, decimals));
           }
 
-          if (newAmt <= 0) return; // тихо выходим
+            if (newAmt <= 0) return false; // тихо выходим
           (opts as any).sellTokens = newAmt;
           amountTok = newAmt;
         } else {
@@ -373,20 +388,23 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             if (softTok > 0) capped = Math.min(softTok, roundTok(bot.posToken, decimals));
           }
 
-          if (capped <= 0) return; // тихо выходим
+            if (capped <= 0) return false; // тихо выходим
           amountTok = capped;
         }
       }
     } catch {}
 
-      if (side === "buy" && sizeSol <= 0) { log("info", "skip BUY: corridor"); return; }
-      if (side === "sell" && (amountTok ?? bot.posToken) <= 0) { return; }
+        if (side === "buy" && sizeSol <= 0) { log("info", "skip BUY: corridor"); return false; }
+        if (side === "sell" && (amountTok ?? bot.posToken) <= 0) {
+          // no tradable qty – just bail quietly; let caller set `did`
+          return false;
+        }
 
     // резерв SOL перед покупкой
     if (side === "buy") {
       const reserve = Math.max(MIN_KEEP_SOL, Number(risk.reserveSol) || 0);
       const stepCfg = (ctx as any).getTradeStep?.() ?? { minSol: 0.0002 };
-      const need    = reserve + Math.max(0.00005, Number(stepCfg.minSol) || 0.0002);
+        const need    = reserve + Math.max(0.00005, Number(stepCfg.minSol) || 0.0002);
       if ((bot.solBalance ?? 0) < need) {
         log("info", "skip BUY: low SOL; scheduling tiny SELL for fees");
         if (bot.posToken > 0) {
@@ -398,7 +416,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             scheduleSell(sellTok, gmin, gmax);
           }
         }
-        return;
+          return false;
       }
     }
 
@@ -406,11 +424,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const nowTs = Date.now();
     if (nowTs - minWindowStart >= 60_000) { minWindowStart = nowTs; buysThisMin = 0; sellsThisMin = 0; notionalThisMin = 0; }
     if (side === "buy") {
-      if (nowTs < lossCooldownUntil) { log("info", "skip BUY: loss cooldown"); return; }
-      if (buysThisMin >= risk.maxBuysPerMin)            { log("info", "skip: minute limits"); return; }
-      if (notionalThisMin + sizeSol > risk.maxNotionalPerMin) { log("info", "skip: minute limits"); return; }
+        if (nowTs < lossCooldownUntil) { log("info", "skip BUY: loss cooldown"); return false; }
+        if (buysThisMin >= risk.maxBuysPerMin)            { log("info", "skip: minute limits"); return false; }
+        if (notionalThisMin + sizeSol > risk.maxNotionalPerMin) { log("info", "skip: minute limits"); return false; }
     } else {
-      if (sellsThisMin >= risk.maxSellsPerMin) { log("info", "skip: minute limits"); return; }
+        if (sellsThisMin >= risk.maxSellsPerMin) { log("info", "skip: minute limits"); return false; }
     }
 
     // адаптивный слиппедж и приоритет
@@ -444,10 +462,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const q   = await quoteFn({ inputMint: WSOL, outputMint: ctx.mint, amount: pay });
         const fairOut = (pay / 1e9) / priceNow;
         const out     = Number(q?.outAmount || 0) / Math.pow(10, decimals);
-        if (!isFinite(out) || out <= 0) { warn("skip BUY: illiquid route"); return; }
+        if (!isFinite(out) || out <= 0) { warn("skip BUY: illiquid route"); return false; }
         const maxImpact = Math.max(0, Math.min(0.2, Number(risk.maxImpact ?? MAX_SINGLE_TRADE_IMPACT)));
         const impact = fairOut > 0 ? Math.max(0, 1 - out / fairOut) : 1;
-        if (fairOut > 0 && impact > maxImpact) { warn(`skip BUY: impact ${(impact*100).toFixed(1)}% > ${(maxImpact*100).toFixed(1)}%`); return; }
+          if (fairOut > 0 && impact > maxImpact) { warn(`skip BUY: impact ${(impact*100).toFixed(1)}% > ${(maxImpact*100).toFixed(1)}%`); return false; }
 
         const RT_SAMPLE = Math.min(1, Math.max(0, Number(((import.meta as any).env?.VITE_RT_SAMPLE) ?? 0.33)));
         if (out > 0 && Math.random() < RT_SAMPLE) {
@@ -457,7 +475,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const backSol = Number(qb?.outAmount || 0) / 1e9;
             const lossPct = Math.max(0, 1 - backSol / Math.max(1e-12, (pay / 1e9)));
             const maxRt   = Math.max(0, Number((risk as any).maxRoundtripLoss ?? MAX_ROUNDTRIP_LOSS));
-            if (isFinite(lossPct) && lossPct > maxRt) { warn(`skip BUY: roundtrip ${(lossPct*100).toFixed(1)}% > ${(maxRt*100).toFixed(1)}%`); return; }
+              if (isFinite(lossPct) && lossPct > maxRt) { warn(`skip BUY: roundtrip ${(lossPct*100).toFixed(1)}% > ${(maxRt*100).toFixed(1)}%`); return false; }
           } catch {}
         }
       } catch {}
@@ -515,12 +533,19 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         if (notionalThisMin + pl.amount > (Number(risk.maxNotionalPerMin) || 0)) { log("info", "skip: minute limits"); break; }
         } else {
           const pnow = Math.max(1e-12, ctx.price());
-          const currTokVal   = localPosToken * pnow;
-          const totalLocal   = Math.max(1e-9, currTokVal + localSol);
-          const minTokValAf  = Math.max(0, (Math.min(0.98, MIN_ALLOC + EPS)) * totalLocal);
-          const maxSellTokLoc= Math.max(0, (currTokVal - minTokValAf) / Math.max(1e-12, pnow));
-          if (maxSellTokLoc <= 0) {
-            // попытаемся один мягкий срез, если включено
+          const currTokVal = localPosToken * pnow;
+          const totalLocal = Math.max(1e-9, currTokVal + localSol);
+          const minTokValAfter = Math.max(0, (Math.min(0.98, MIN_ALLOC + EPS)) * totalLocal);
+          const headroomTok = Math.max(0, (currTokVal - minTokValAfter) / Math.max(1e-12, pnow));
+
+          const perTok = maxSellPerSlice > 0
+            ? Math.min(maxSellPerSlice, remainingTok, headroomTok)
+            : Math.min(remainingTok / Math.max(1, (slices - si)), headroomTok);
+
+          let qty = roundTok(Math.max(0, perTok), decimals);
+
+          if (qty <= 0) {
+            // no room for normal slice; optionally try a soft sell based on total notional to free fee lamports
             if (!opts?.sellTokens && SOFT_SELL_BPS > 0) {
               const softTok = roundTok((SOFT_SELL_BPS / 10_000) * totalLocal / Math.max(1e-12, pnow), decimals);
               if (softTok > 0) {
@@ -534,19 +559,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                 executedTok += softTok;
                 localPosToken = Math.max(0, localPosToken - softTok);
                 localSol     += Math.max(0, softTok * pnow - FEE_EST_SOL);
+                remainingTok = Math.max(0, remainingTok - softTok);
+                sellsThisMin++;
+                anyExecuted = true;
               }
             }
-            break; // без логов
+            break; // silent skip when minAlloc would be breached
           }
-
-        let qty = (() => {
-          const cap = maxSellPerSlice > 0
-            ? Math.min(maxSellPerSlice, remainingTok, maxSellTokLoc)
-            : Math.min(remainingTok / Math.max(1, (slices - si)), maxSellTokLoc);
-          return roundTok(Math.max(0, cap), decimals);
-        })();
-
-        if (qty <= 0) break;
 
         // no‑loss фильтр: обычные продажи ниже avg запрещаем (кроме маленьких служебных)
         if (!opts?.sellTokens && bot.avgSol > 0 && risk.noLossFloorBps && risk.noLossFloorBps > 0) {
@@ -605,8 +624,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const sig = await connection.sendRawTransaction(vtx.serialize(), { skipPreflight: true, maxRetries: 4 });
       await confirmSigHttp(connection, sig);
 
-      executedSlices++;
-      if (pl.action === "buy") {
+        executedSlices++;
+        anyExecuted = true;
+        if (pl.action === "buy") {
         executedSol += pl.amount;
         localPosToken += pl.amount / Math.max(1e-12, ctx.price());
         localSol      = Math.max(0, localSol - pl.amount - FEE_EST_SOL);
@@ -627,12 +647,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
       }
 
-      if (executedSlices === 0) {
-        // Нормально: лимиты/коридор/квоты — это не сетевой фейл
-        bot.last = "hold";
-        pushUpdate({ last: bot.last });
-        return;
-      }
+        if (executedSlices === 0) {
+          // nothing executed because of corridor/limits – not a network failure; tell caller no trade was done
+          return false;
+        }
 
     // успех — сбрасываем backoff
     failStreak = 0;
@@ -669,16 +687,20 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       ? `buy ${executedSol.toFixed(6)} SOL @ slp=${(usedBps).toFixed(0)}bps`
       : `sell ${roundTok(executedTok, decimals)} TOK @ slp=${(usedBps).toFixed(0)}bps`;
 
-    pushUpdate({
-      last: bot.last, fills: bot.fills, posToken: bot.posToken, avgSol: bot.avgSol,
-      realized: bot.realized, unrealized: bot.unrealized, solBalance: bot.solBalance, tokenBalance: bot.tokenBalance,
-      lastError: undefined,
-    });
-    log("ok", `${side.toUpperCase()} executed (slices ${executedSlices})`);
+      pushUpdate({
+        last: bot.last, fills: bot.fills, posToken: bot.posToken, avgSol: bot.avgSol,
+        realized: bot.realized, unrealized: bot.unrealized, solBalance: bot.solBalance, tokenBalance: bot.tokenBalance,
+        lastError: undefined,
+      });
 
-    // on-chain refresh + мягкий refresh всего стора
-    await refreshOnChainBalances();
-    try { ctx.afterTrade?.(); } catch {}
+      const didExecute = anyExecuted || executedSlices > 0;
+      if (didExecute) {
+        log("ok", `${side.toUpperCase()} executed (slices ${executedSlices})`);
+
+        // on-chain refresh + мягкий refresh всего стора
+        await refreshOnChainBalances();
+        try { ctx.afterTrade?.(); } catch {}
+      }
 
     // пост‑коррекция к коридору/цели
     try {
@@ -699,7 +721,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const needSol   = Math.max(0, targetVal - tokVal);
         const headroom  = Math.max(0, (bot.solBalance ?? 0) - (reserve + 0.0001));
         let buySol      = Math.max(0, Math.min(needSol, headroom, Math.max(0.00005, Number(risk.maxBuySliceSol) || 0.0018)));
-        if (buySol > 0.00012) {
+          if (buySol > MIN_EXEC_SOL) {
           const delay = gmin + Math.floor(Math.random() * Math.max(1, gmax - gmin));
           setTimeout(() => { twapBuy(+buySol.toFixed(6)).catch(() => {}); }, delay);
         } else if (needSol > 0 && headroom <= 0) {
@@ -710,18 +732,31 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
     } catch {}
 
-    cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
-  }
-
-  async function twapBuy(totalSol: number) {
-    const plan = ctx.twap;
-    if (!plan || plan.slices < 2 || totalSol <= 0) { await trade("buy", totalSol); return; }
-    const per = Math.max(0, totalSol / plan.slices);
-    for (let i = 0; i < plan.slices; i++) {
-      await trade("buy", per);
-      if (i < plan.slices - 1) await sleep(Math.max(300, plan.gapMs));
+      cooldownUntil = Date.now() + Math.max(1200, bot.speedMs);
+      return didExecute;
     }
-  }
+
+    async function twapBuy(totalSol: number): Promise<boolean> {
+      const plan = ctx.twap;
+      if (!plan || plan.slices < 2 || totalSol <= 0) {
+        return await trade("buy", totalSol);
+      }
+
+      let slices = Math.max(1, plan.slices);
+      let per = totalSol / slices;
+      if (per < MIN_EXEC_SOL) {
+        slices = Math.max(1, Math.floor(totalSol / MIN_EXEC_SOL));
+        per = totalSol / Math.max(1, slices);
+      }
+
+      let any = false;
+      for (let i = 0; i < slices; i++) {
+        const ok = await trade("buy", +per.toFixed(6), { noInnerSlice: true });
+        any = any || ok;
+        if (i < slices - 1) await sleep(Math.max(300, plan.gapMs));
+      }
+      return any;
+    }
 
   // старт основной петли с дезинхронизирующей задержкой
   setTimeout(loop, 100 + Math.floor(Math.random() * 500));
@@ -749,7 +784,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const capPct = Math.min(0.5, Math.max(0.005, 0.035));
         const capTok = roundTok(bot.posToken * capPct, ctx.tokenDecimals());
         const qty    = Math.min(capTok, Math.min(bot.posToken * 0.2, Math.max(0, deferredSell.amountTok)));
-        if (qty > 0) await trade("sell", 0, { sellTokens: qty });
+          if (qty > 0) await trade("sell", 0, { sellTokens: qty });
       } catch {}
       deferredSell = null;
       pending = false;
@@ -759,8 +794,16 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     pending = true;
     try {
-      // легкий рефреш
-      if (ctx.shouldLightRefresh?.(10000)) { await refreshOnChainBalances(); ctx.setLightRefresh?.(); }
+        // легкий рефреш
+        const needLight =
+          (typeof ctx.shouldLightRefresh === "function" ? !!ctx.shouldLightRefresh(10_000) : false)
+          || (Date.now() - lastLightRefreshAt > LIGHT_REFRESH_MS);
+
+        if (needLight) {
+          await refreshOnChainBalances().catch(() => {});
+          ctx.setLightRefresh?.();
+          lastLightRefreshAt = Date.now();
+        }
 
       if (ctx.isAiPaused && ctx.isAiPaused()) {
         bot.last = "ai:off"; pushUpdate({ last: bot.last });
@@ -823,55 +866,63 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const eps = 0.005;
 
       // экстренная продажа на комиссии, если SOL мало
-      if (bot.posToken > 0 && bot.solBalance < reserve) {
-        const needSol  = Math.max(0, (reserve + 0.0015) - bot.solBalance);
-        const tokToSell= roundTok(Math.min(bot.posToken * 0.22, needSol / Math.max(1e-12, p)), ctx.tokenDecimals());
-        if (tokToSell > 0) {
-          await trade("sell", 0, { sellTokens: tokToSell });
-          pending = false;
-          const jitter = 200 + Math.floor(Math.random() * 300);
-          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-        }
-      }
-
-      // пред‑стратегическая авто‑ребалансировка
-      if (bot.posToken > 0 && allocTok > MAX_ALLOC + eps) {
-        const desiredTokVal = TARGET_ALLOC * total;
-        const currentTokVal = bot.posToken * p;
-        const excessVal     = Math.max(0, currentTokVal - desiredTokVal);
-        const over          = allocTok - MAX_ALLOC;
-        const factor        = over > 0.03 ? 1.0 : over > 0.015 ? 0.75 : 0.5;
-        const tokToSell     = Math.min(bot.posToken, roundTok(Math.max(bot.posToken * 0.12, (excessVal * factor) / p), ctx.tokenDecimals()));
-        if (tokToSell > 0) {
-          await trade("sell", 0, { sellTokens: tokToSell });
-          pending = false;
-          const jitter = 200 + Math.floor(Math.random() * 300);
-          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-        }
-      }
-
-      if (!protect && allocTok < MIN_ALLOC - eps) {
-        if (!haveSol) {
-          const targetVal = TARGET_ALLOC * total;
-          const needVal   = Math.max(0, targetVal - bot.posToken * p);
-          const tokToSell = roundTok(Math.max(bot.posToken * 0.08, Math.min(bot.posToken * 0.2, (needVal * 0.25) / p)), ctx.tokenDecimals());
+        if (bot.posToken > 0 && bot.solBalance < reserve) {
+          const needSol  = Math.max(0, (reserve + 0.0015) - bot.solBalance);
+          const tokToSell= roundTok(Math.min(bot.posToken * 0.22, needSol / Math.max(1e-12, p)), ctx.tokenDecimals());
           if (tokToSell > 0) {
-            await trade("sell", 0, { sellTokens: tokToSell });
-            pending = false;
-            const jitter = 200 + Math.floor(Math.random() * 300);
-            return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+            const ok = await trade("sell", 0, { sellTokens: tokToSell });
+            if (ok) {
+              pending = false;
+              const jitter = 200 + Math.floor(Math.random() * 300);
+              return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+            }
           }
         }
-        const targetVal = TARGET_ALLOC * total;
-        const needVal   = Math.max(0, targetVal - bot.posToken * p);
-        const buySol    = Math.max(0, Math.min(Math.min(baseSize, pickStep()), needVal));
-        if (buySol > 0.00012) {
-          await twapBuy(buySol);
-          pending = false;
-          const jitter = 200 + Math.floor(Math.random() * 300);
-          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+
+      // пред‑стратегическая авто‑ребалансировка
+        if (bot.posToken > 0 && allocTok > MAX_ALLOC + eps) {
+          const desiredTokVal = TARGET_ALLOC * total;
+          const currentTokVal = bot.posToken * p;
+          const excessVal     = Math.max(0, currentTokVal - desiredTokVal);
+          const over          = allocTok - MAX_ALLOC;
+          const factor        = over > 0.03 ? 1.0 : over > 0.015 ? 0.75 : 0.5;
+          const tokToSell     = Math.min(bot.posToken, roundTok(Math.max(bot.posToken * 0.12, (excessVal * factor) / p), ctx.tokenDecimals()));
+          if (tokToSell > 0) {
+            const ok = await trade("sell", 0, { sellTokens: tokToSell });
+            if (ok) {
+              pending = false;
+              const jitter = 200 + Math.floor(Math.random() * 300);
+              return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+            }
+          }
         }
-      }
+
+        if (!protect && allocTok < MIN_ALLOC - eps) {
+          if (!haveSol) {
+            const targetVal = TARGET_ALLOC * total;
+            const needVal   = Math.max(0, targetVal - bot.posToken * p);
+            const tokToSell = roundTok(Math.max(bot.posToken * 0.08, Math.min(bot.posToken * 0.2, (needVal * 0.25) / p)), ctx.tokenDecimals());
+            if (tokToSell > 0) {
+              const ok = await trade("sell", 0, { sellTokens: tokToSell });
+              if (ok) {
+                pending = false;
+                const jitter = 200 + Math.floor(Math.random() * 300);
+                return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+              }
+            }
+          }
+          const targetVal = TARGET_ALLOC * total;
+          const needVal   = Math.max(0, targetVal - bot.posToken * p);
+          const buySol    = Math.max(0, Math.min(Math.min(baseSize, pickStep()), needVal));
+          if (buySol > MIN_EXEC_SOL) {
+            const ok = await twapBuy(buySol);
+            if (ok) {
+              pending = false;
+              const jitter = 200 + Math.floor(Math.random() * 300);
+              return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+            }
+          }
+        }
 
       // стратегии pump → pullback → pump
       let did = false;
@@ -888,14 +939,22 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           if (!protect && haveSol && fast > 0 && ch1m > 0.001 && allocTok < MAX_ALLOC) {
             const headroomToMax = Math.max(0, MAX_ALLOC * total - bot.posToken * p);
             const size = Math.min(Math.min(baseSize, pickStep()), headroomToMax);
-            if (size > 0.00012) { await twapBuy(size); did = true; break; }
+              if (size > MIN_EXEC_SOL) {
+                const ok = await twapBuy(size);
+                if (ok) { did = true; }
+                break;
+              }
           }
           if (bot.posToken > 0 && bot.avgSol > 0) {
             const r = (p - bot.avgSol) / Math.max(1e-9, bot.avgSol);
             if (r >= 0.07) {
               const pct = 0.08 + Math.random() * 0.10;
               const part= roundTok(Math.max(0, bot.posToken * pct), ctx.tokenDecimals());
-              if (part > 0) { await trade("sell", 0, { sellTokens: part }); did = true; break; }
+                if (part > 0) {
+                  const ok = await trade("sell", 0, { sellTokens: part });
+                  if (ok) { did = true; }
+                  break;
+                }
             }
           }
           if (!did && bot.posToken > 0 && trailHighPrice > 0) {
@@ -903,14 +962,21 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             if (dd <= -0.009) {
               const pct = 0.06 + Math.random() * 0.06;
               const part= roundTok(Math.max(0, bot.posToken * pct), ctx.tokenDecimals());
-              if (part > 0) { await trade("sell", 0, { sellTokens: part }); did = true; break; }
+                if (part > 0) {
+                  const ok = await trade("sell", 0, { sellTokens: part });
+                  if (ok) { did = true; }
+                  break;
+                }
             }
           }
           if (!did && (allocTok > MAX_ALLOC || protect)) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal     = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(bot.posToken, roundTok(Math.max(bot.posToken * 0.10, (excessVal * 0.5) / p), ctx.tokenDecimals()));
-            if (part > 0) { await trade("sell", 0, { sellTokens: part }); did = true; }
+              if (part > 0) {
+                const ok = await trade("sell", 0, { sellTokens: part });
+                if (ok) { did = true; }
+              }
           }
           break;
         }
@@ -925,19 +991,29 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           if (!protect && haveSol && allocTok < (MAX_ALLOC - 0.001) && fast < 0 && dev <= -0.007 && Date.now() >= lossCooldownUntil) {
             const headroomToMax = Math.max(0, MAX_ALLOC * total - bot.posToken * p);
             const size = Math.min(Math.min(baseSize, pickStep()), headroomToMax);
-            if (size > 0.00012) { await twapBuy(size); did = true; break; }
+              if (size > MIN_EXEC_SOL) {
+                const ok = await twapBuy(size);
+                if (ok) { did = true; }
+                break;
+              }
           }
           const smallProfit = bot.avgSol > 0 ? (p - bot.avgSol) / Math.max(1e-9, bot.avgSol) >= 0.012 : false;
           const nearMean    = Math.abs(dev) <= 0.0015;
           if (!did && bot.posToken > 0 && (smallProfit || nearMean)) {
             const pct  = 0.08 + Math.random() * 0.07;
             const part = roundTok(Math.max(0, bot.posToken * pct), ctx.tokenDecimals());
-            if (part > 0) { await trade("sell", 0, { sellTokens: part }); did = true; }
+              if (part > 0) {
+                const ok = await trade("sell", 0, { sellTokens: part });
+                if (ok) { did = true; }
+              }
           }
           if (!did && bot.posToken > 0 && dev >= 0.008) {
             const pct  = 0.08 + Math.random() * 0.07;
             const part = roundTok(Math.max(0, bot.posToken * pct), ctx.tokenDecimals());
-            if (part > 0) { await trade("sell", 0, { sellTokens: part }); did = true; }
+              if (part > 0) {
+                const ok = await trade("sell", 0, { sellTokens: part });
+                if (ok) { did = true; }
+              }
           }
           if (!did && buysInRow > 0 && bot.posToken > 0 && !deferredSell) {
             const planned = roundTok(Math.max(bot.posToken * 0.04, bot.posToken * 0.03 + Math.random() * bot.posToken * 0.03), ctx.tokenDecimals());
@@ -949,7 +1025,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           if (!protect && haveSol && Math.abs(fast) > 0.0018 && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.12) * total - bot.posToken * p);
             const size = Math.min(Math.max(baseSize, pickStep()), headroomVal);
-            if (size > 0.0001) { await twapBuy(size); did = true; break; }
+              if (size > 0.0001) {
+                const ok = await twapBuy(size);
+                if (ok) { did = true; }
+                break;
+              }
           }
           const wantSell = (() => {
             const avg = bot.avgSol || p;
@@ -960,11 +1040,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal     = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(bot.posToken, roundTok(Math.max(bot.posToken * 0.12, (excessVal * 0.45) / p), ctx.tokenDecimals()));
-            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
-            did = true;
+              const ok = await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+              if (ok) { did = true; }
           } else if (bot.posToken > 0 && buysInRow >= 2) {
             const shave = roundTok(Math.max(bot.posToken * 0.06, bot.posToken * Math.random() * 0.08), ctx.tokenDecimals());
-            if (shave > 0) { await trade("sell", 0, { sellTokens: shave }); did = true; }
+              if (shave > 0) {
+                const ok = await trade("sell", 0, { sellTokens: shave });
+                if (ok) { did = true; }
+              }
           }
           break;
         }
@@ -972,14 +1055,19 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           if (!protect && haveSol && (fast > 0.001 || ch1m > 0.002) && allocTok < MAX_ALLOC) {
             const headroomVal = Math.max(0, (TARGET_ALLOC + 0.15) * total - bot.posToken * p);
             const size = Math.min(Math.max(baseSize, pickStep()*1.2), headroomVal);
-            if (size > 0.00012) { await twapBuy(size); did = true; break; }
+              if (size > MIN_EXEC_SOL) {
+                const ok = await twapBuy(size);
+                if (ok) { did = true; }
+                break;
+              }
           }
           if (bot.posToken > 0 && trailHighPrice > 0) {
             const dd = (p - trailHighPrice) / Math.max(1e-9, trailHighPrice);
             if (dd < -0.009) {
               const part = roundTok(Math.max(bot.posToken * 0.1, bot.posToken * 0.06 + Math.random() * 0.06), ctx.tokenDecimals());
-              await trade("sell", 0, { sellTokens: part });
-              did = true; break;
+                const ok = await trade("sell", 0, { sellTokens: part });
+                if (ok) { did = true; }
+                break;
             }
           }
           const want = (() => {
@@ -991,8 +1079,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const desiredTokVal = TARGET_ALLOC * total;
             const excessVal     = Math.max(0, bot.posToken * p - desiredTokVal);
             const part = Math.min(bot.posToken, roundTok(Math.max(bot.posToken * 0.18, (excessVal * 0.55) / p), ctx.tokenDecimals()));
-            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
-            did = true;
+              const ok = await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+              if (ok) { did = true; }
           }
           break;
         }
@@ -1001,24 +1089,32 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           const dev = (p - mid) / Math.max(1e-9, mid);
           if (!protect && haveSol && dev < -0.01 && allocTok < MAX_ALLOC) {
             const size = Math.min(Math.max(baseSize, pickStep()), (TARGET_ALLOC + 0.1) * total);
-            if (size > 0.00012) { await twapBuy(size); did = true; break; }
+              if (size > MIN_EXEC_SOL) {
+                const ok = await twapBuy(size);
+                if (ok) { did = true; }
+                break;
+              }
           }
           if (dev > 0.012 || allocTok > MAX_ALLOC || protect) {
             const part = roundTok(Math.max(bot.posToken * 0.12, (bot.posToken * dev) / 2), ctx.tokenDecimals());
-            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
-            did = true;
+              const ok = await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+              if (ok) { did = true; }
           }
           break;
         }
         case "maker": {
           if (!protect && allocTok < MAX_ALLOC && haveSol) {
             const size = Math.min(pickStep() * 0.6, baseSize);
-            if (Math.random() < 0.6) { await twapBuy(size); did = true; break; }
+              if (Math.random() < 0.6) {
+                const ok = await twapBuy(size);
+                if (ok) { did = true; }
+                break;
+              }
           }
           if (bot.posToken > 0 && (allocTok > TARGET_ALLOC || protect || Math.random() < 0.35)) {
             const part = roundTok(Math.max(bot.posToken * 0.07, (bot.posToken * Math.random() * 0.1)), ctx.tokenDecimals());
-            await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
-            did = true;
+              const ok = await trade("sell", 0, { sellTokens: part > 0 ? part : undefined });
+              if (ok) { did = true; }
           } else if (!did && bot.posToken > 0 && !deferredSell) {
             const planned = roundTok(Math.max(bot.posToken * 0.03, bot.posToken * 0.02 + Math.random() * bot.posToken * 0.03), ctx.tokenDecimals());
             scheduleSell(planned, 1200, 2600);
@@ -1034,10 +1130,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
             const shave = roundTok(Math.max(bot.posToken * 0.05, bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04), ctx.tokenDecimals());
             if (shave > 0) {
-              await trade("sell", 0, { sellTokens: shave });
-              pending = false;
-              const jitter = 200 + Math.floor(Math.random() * 300);
-              return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+                const ok = await trade("sell", 0, { sellTokens: shave });
+                if (ok) {
+                  pending = false;
+                  const jitter = 200 + Math.floor(Math.random() * 300);
+                  return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+                }
             }
           }
         }
