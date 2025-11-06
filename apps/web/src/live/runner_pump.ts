@@ -347,19 +347,33 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         };
 
         if (opts?.sellTokens) {
-          const originalTok = opts.sellTokens;
-          const newAmt = applyClamp(originalTok);
-          if (newAmt <= 0) { log("info", "skip SELL: corridor"); return; }
-          (opts as any).sellTokens = newAmt;
-          amountTok = newAmt;
-          if (newAmt < originalTok - 1e-12) log("info", `clamped sell ${roundTok(originalTok,decimals)}→${roundTok(newAmt,decimals)}`);
-        } else {
-          const base = amountTok ?? bot.posToken;
-          const capped = applyClamp(base);
-          if (capped <= 0) { log("info", "skip SELL: corridor"); return; }
-          amountTok = capped;
+            const originalTok = opts.sellTokens;
+            let newAmt = applyClamp(originalTok);
+
+    // опционально: крошечный «мягкий» sell ниже коридора, если clamp дал 0
+            if (newAmt <= 0 && SOFT_SELL_BPS > 0) {
+                const softTok = roundTok((SOFT_SELL_BPS / 10_000) * total / Math.max(1e-12, priceNow), decimals);
+                if (softTok > 0) newAmt = Math.min(softTok, roundTok(bot.posToken, decimals));
+            }
+
+            if (newAmt <= 0) return; // тихо выходим без спама
+            (opts as any).sellTokens = newAmt;
+            amountTok = newAmt;
+            if (newAmt < originalTok - 1e-12) log("info", `clamped sell ${roundTok(originalTok,decimals)}→${roundTok(newAmt,decimals)}`);
+          } else {
+            const base = amountTok ?? bot.posToken;
+            let capped = applyClamp(base);
+
+    // опционально: мягкий sell, если строгое clamp=0
+            if (capped <= 0 && SOFT_SELL_BPS > 0) {
+                const softTok = roundTok((SOFT_SELL_BPS / 10_000) * total / Math.max(1e-12, priceNow), decimals);
+                if (softTok > 0) capped = Math.min(softTok, roundTok(bot.posToken, decimals));
+            }
+
+            if (capped <= 0) return; // тихо (раньше был "skip SELL: corridor")
+            amountTok = capped;
+            }
         }
-      }
     } catch {}
 
     if (side === "buy"  && sizeSol <= 0) { log("info", "skip BUY: corridor"); return; }
