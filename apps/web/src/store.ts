@@ -61,6 +61,8 @@ const PF_MAX_SOL = Math.max(
 );
 const calcPriorityFeeSol = (mult = 1) =>
   Math.min(PF_MAX_SOL, +(PF_BASE_SOL * Math.max(1, mult)).toFixed(6));
+const REFRESH_WATCHDOG_MS = 12_000;
+const AUTOSTART_DEBOUNCE_MS = 1_200;
 
 export type BotStrategy =
   | "trend"
@@ -705,9 +707,14 @@ export type Store = {
   removeBot: (id: string) => void;
   exportBotKey: (id: string) => string | null;
 
-  startBot: (id: string, connection: any) => Promise<void>;
+  ensureEligible: (bot: LiveBot) => boolean;
+  ensureAllRunning: (
+    connection: Connection,
+    opts?: { staggerMs?: number },
+  ) => Promise<void>;
+  startBot: (id: string, connection: Connection) => Promise<void>;
   stopBot: (id: string) => void;
-  startAll: (connection: any) => void;
+  startAll: (connection: Connection) => Promise<void>;
   stopAll: () => void;
 
   // Sell ALL (parallel, idempotent)
@@ -1403,11 +1410,103 @@ export const useStore = create<Store>()(
           );
         },
 
-        // Запуск/остановка with central scheduler
-        async startBot(id, connection) {
-          const s = get();
-          const bot = s.bots.find((b) => b.id === id);
-          if (!bot || !s.tokenMint) return;
+          // Запуск/остановка with central scheduler
+          ensureEligible(bot) {
+            if (!bot) return false;
+            const state = get();
+            const entry = state.scheduler.get(bot.id);
+            const isActive =
+              !!entry &&
+              !!entry.abort &&
+              entry.running === true &&
+              !entry.abort.signal.aborted;
+            if (isActive) {
+              if (!bot.running) {
+                set((s) => ({
+                  bots: s.bots.map((b) =>
+                    b.id === bot.id ? { ...b, running: true } : b,
+                  ),
+                }));
+              }
+              return true;
+            }
+            if (!entry) {
+              if (!bot.running) return false;
+              set((s) => {
+                const idx = s.bots.findIndex((b) => b.id === bot.id);
+                if (idx < 0 || !s.bots[idx].running) return {};
+                const bots = s.bots.slice();
+                bots[idx] = { ...bots[idx], running: false };
+                return { bots };
+              });
+              return false;
+            }
+            try {
+              entry.abort.abort();
+            } catch {}
+            try {
+              entry.stopFn?.();
+            } catch {}
+            set((s) => {
+              const next: any = {};
+              const idx = s.bots.findIndex((b) => b.id === bot.id);
+              if (idx >= 0 && s.bots[idx].running) {
+                const bots = s.bots.slice();
+                bots[idx] = { ...bots[idx], running: false };
+                next.bots = bots;
+              }
+              const sched = new Map(s.scheduler);
+              sched.delete(bot.id);
+              next.scheduler = sched;
+              return next;
+            });
+            return false;
+          },
+
+          async ensureAllRunning(connection, opts = {}) {
+            const stagger =
+              typeof opts?.staggerMs === "number" && opts.staggerMs >= 0
+                ? opts.staggerMs
+                : 160;
+            if (!connection) {
+              get().addLog("warn", "ensureAllRunning: missing connection");
+              return;
+            }
+            const snapshot = get().bots.slice();
+            for (let i = 0; i < snapshot.length; i++) {
+              const latest = get().bots.find((b) => b.id === snapshot[i].id);
+              if (!latest) continue;
+              if (get().ensureEligible(latest)) continue;
+              await get().startBot(latest.id, connection);
+              if (stagger > 0 && i < snapshot.length - 1) {
+                const jitter = Math.floor(
+                  Math.random() * Math.max(40, Math.min(140, stagger)),
+                );
+                await new Promise((res) =>
+                  setTimeout(res, stagger + jitter),
+                );
+              }
+            }
+          },
+
+          async startBot(id, connection) {
+            if (!connection) {
+              get().addLog("warn", `startBot ${id}: missing connection`);
+              return;
+            }
+            let s = get();
+            let bot = s.bots.find((b) => b.id === id);
+            if (!bot) return;
+            if (!s.tokenMint) {
+              s.addLog("warn", `Бот ${bot.name}: mint не задан`);
+              return;
+            }
+
+            if (get().ensureEligible(bot)) return;
+
+            s = get();
+            bot = s.bots.find((b) => b.id === id);
+            if (!bot) return;
 
           // Validate inputs
           if (!Number.isFinite(bot.speedMs) || bot.speedMs <= 0) {
@@ -1419,12 +1518,16 @@ export const useStore = create<Store>()(
             return;
           }
 
-          // Check if already running via scheduler
-          const existing = s.scheduler.get(id);
-          if (existing?.running) {
-            s.addLog("warn", `Bot ${bot.name} уже запущен`);
-            return;
-          }
+            const existing = s.scheduler.get(id);
+            if (existing) {
+              try {
+                existing.abort.abort();
+              } catch {}
+              try {
+                existing.stopFn?.();
+              } catch {}
+              s.scheduler.delete(id);
+            }
 
           if (bot.solBalance < s.minFeeSol) {
             if (s.autoTopUp && s.treasuryKeyId) {
@@ -1599,9 +1702,55 @@ export const useStore = create<Store>()(
             return { bots: [...s.bots], scheduler: new Map(s.scheduler) };
           }),
 
-        startAll: (connection) => {
-          get().bots.forEach((b) => get().startBot(b.id, connection));
-        },
+          startAll: async (connection) => {
+            if (!connection) {
+              get().addLog("warn", "Start ALL: missing connection");
+              return;
+            }
+            let state = get();
+            let tokenMint = state.tokenMint;
+            if (!tokenMint && state.tokenUrl) {
+              const parsed = parsePumpMint(state.tokenUrl) || b58(state.tokenUrl);
+              if (parsed) {
+                tokenMint = parsed;
+                set({ tokenMint: parsed });
+              }
+            }
+            if (!tokenMint) {
+              state.addLog("warn", "Start ALL: mint не задан");
+              return;
+            }
+
+            get()
+              .bots.slice()
+              .forEach((b) => {
+                const latest = get().bots.find((x) => x.id === b.id);
+                if (latest) get().ensureEligible(latest);
+              });
+
+            try {
+              await get().refreshBalances(connection);
+            } catch {}
+
+            const waitForPrice = async (timeoutMs = 2000) => {
+              const started = Date.now();
+              while (Date.now() - started < timeoutMs) {
+                const curr = get();
+                const priceReady =
+                  Number(curr.price || 0) > 0 ||
+                  curr.ticks.some?.((t: any) => Number(t?.p || 0) > 0);
+                if (priceReady) return true;
+                await new Promise((res) => setTimeout(res, 120));
+              }
+              return false;
+            };
+            const ready = await waitForPrice(2000);
+            if (!ready) {
+              get().addLog("info", "Start ALL: price feed not ready (timeout)");
+            }
+
+            await get().ensureAllRunning(connection, { staggerMs: 180 });
+          },
         stopAll: () => {
           get().bots.forEach((b) => get().stopBot(b.id));
         },
@@ -2196,14 +2345,64 @@ export const useStore = create<Store>()(
           } finally {
             const stateAny = get() as any;
             stateAny._rbBusy = false;
+            if (connection) stateAny._lastRefreshConn = connection;
+            stateAny._lastRefreshTs = Date.now();
             const queuedConn = stateAny._rbQueuedConn as Connection | undefined;
             stateAny._rbQueuedConn = undefined;
+
+            function scheduleWatchdog(delayMs: number) {
+              const currState = useStore.getState() as any;
+              if (currState._refreshWatchTimer) {
+                clearTimeout(currState._refreshWatchTimer);
+              }
+              currState._refreshWatchTimer = setTimeout(() => {
+                const latestState = useStore.getState() as any;
+                const stillRunning = Array.isArray(latestState.bots)
+                  ? latestState.bots.some((b: any) => b?.running)
+                  : false;
+                if (!stillRunning) {
+                  if (latestState._refreshWatchTimer) {
+                    clearTimeout(latestState._refreshWatchTimer);
+                  }
+                  latestState._refreshWatchTimer = undefined;
+                  return;
+                }
+                const last = latestState._lastRefreshTs || 0;
+                const elapsed = Date.now() - last;
+                const conn = latestState._lastRefreshConn;
+                if (!conn) {
+                  latestState._refreshWatchTimer = undefined;
+                  return;
+                }
+                if (elapsed >= REFRESH_WATCHDOG_MS - 120) {
+                  latestState._refreshWatchTimer = undefined;
+                  latestState.refreshBalances(conn).catch(() => {});
+                } else {
+                  const remaining = Math.max(
+                    REFRESH_WATCHDOG_MS - elapsed,
+                    1500,
+                  );
+                  scheduleWatchdog(remaining);
+                }
+              }, Math.max(1500, delayMs));
+            }
+
             if (queuedConn) {
               setTimeout(() => {
                 get()
                   .refreshBalances(queuedConn)
                   .catch(() => {});
               }, 200);
+            }
+
+            const hasRunning =
+              Array.isArray(stateAny.bots) &&
+              stateAny.bots.some((b: any) => b?.running);
+            if (hasRunning && stateAny._lastRefreshConn) {
+              scheduleWatchdog(REFRESH_WATCHDOG_MS);
+            } else if (stateAny._refreshWatchTimer) {
+              clearTimeout(stateAny._refreshWatchTimer);
+              stateAny._refreshWatchTimer = undefined;
             }
           }
         },
@@ -2805,34 +3004,91 @@ export const useStore = create<Store>()(
         drainDelayMs: s.drainDelayMs,
         treasuryKeyId: s.treasuryKeyId,
       }),
-      onRehydrateStorage: () => (state: any) => {
-        try {
-          const u = state?.tokenUrl;
-          if (u)
-            setTimeout(() => {
-              try {
-                (useStore.getState() as any).setTokenUrl(u);
-              } catch {}
-            }, 0);
-          // Hook logger → store so UI sees logs in realtime
+        onRehydrateStorage: () => (state: any) => {
           try {
-            const unsub = logger.subscribe((entry) => {
-              try {
-                (globalThis as any).__fromLoggerBridge = true;
-                useStore
-                  .getState()
-                  .addLog(
-                    entry.level === "error" ? "err" : (entry.level as any),
-                    entry.msg,
+            const u = state?.tokenUrl;
+            if (u)
+              setTimeout(() => {
+                try {
+                  (useStore.getState() as any).setTokenUrl(u);
+                } catch {}
+              }, 0);
+
+            try {
+              useStore.setState((prev: any) => ({
+                bots: Array.isArray(prev?.bots)
+                  ? prev.bots.map((b: any) => ({ ...b, running: false }))
+                  : [],
+                scheduler: new Map(),
+              }));
+            } catch {}
+
+            // Hook logger → store so UI sees logs in realtime
+            try {
+              const unsub = logger.subscribe((entry) => {
+                try {
+                  (globalThis as any).__fromLoggerBridge = true;
+                  useStore
+                    .getState()
+                    .addLog(
+                      entry.level === "error" ? "err" : (entry.level as any),
+                      entry.msg,
+                    );
+                } finally {
+                  (globalThis as any).__fromLoggerBridge = false;
+                }
+              });
+              (window as any).__logger_unsub = unsub;
+            } catch {}
+
+            try {
+              if (!(window as any).__mb_disable_autostart) {
+                const planAutoStart = () => {
+                  const attempt = (retries: number) => {
+                    const st = useStore.getState() as any;
+                    const mint =
+                      st.tokenMint ||
+                      parsePumpMint(st.tokenUrl || "") ||
+                      b58(st.tokenUrl || "");
+                    const hasBots =
+                      Array.isArray(st.bots) && st.bots.length > 0;
+                    if (!mint || !hasBots) return;
+                    if (!st.tokenMint) {
+                      useStore.setState({ tokenMint: mint });
+                    }
+                    const conn =
+                      (window as any).__conn ||
+                      (window as any).__solanaConnection ||
+                      (window as any).__connection ||
+                      null;
+                    if (!conn) {
+                      if (retries > 0) {
+                        setTimeout(
+                          () => attempt(retries - 1),
+                          AUTOSTART_DEBOUNCE_MS,
+                        );
+                      }
+                      return;
+                    }
+                    if ((window as any).__mb_autoStartDone) return;
+                    (window as any).__mb_autoStartDone = true;
+                    if (typeof st.startAll === "function") {
+                      void st.startAll(conn);
+                    }
+                  };
+                  if ((window as any).__mb_autoStartTimer) {
+                    clearTimeout((window as any).__mb_autoStartTimer);
+                  }
+                  (window as any).__mb_autoStartTimer = setTimeout(
+                    () => attempt(3),
+                    AUTOSTART_DEBOUNCE_MS,
                   );
-              } finally {
-                (globalThis as any).__fromLoggerBridge = false;
+                };
+                planAutoStart();
               }
-            });
-            (window as any).__logger_unsub = unsub;
+            } catch {}
           } catch {}
-        } catch {}
-      },
+        },
     },
   ),
 );
