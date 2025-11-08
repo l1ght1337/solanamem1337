@@ -1,4 +1,3 @@
-
 // @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
@@ -1434,11 +1433,24 @@ export const useStore = create<Store>()(
       },
 
       // Прайс/свечи + тики
-      async tickReal() {
-        const s = get();
-        if (!s.tokenMint) return;
-        // Primary path: robust price feed (Jupiter -> optional proxy)
-        try {
+        async tickReal() {
+          const s = get();
+          if (!s.tokenMint) return;
+
+          const ensureIdleRefresh = async () => {
+            const now = Date.now();
+            const last = get().lightRefresh?.ts ?? 0;
+            if (now - last > 15000) {
+              get().setLightRefresh();
+              const wc = (window as any).__conn as Connection | undefined;
+              if (wc) {
+                try { await get().refreshBalances(wc); } catch {}
+              }
+            }
+          };
+
+          // Primary path: robust price feed (Jupiter -> optional proxy)
+          try {
           const res = await getTokenPriceSOL(s.tokenMint);
           if (res && res.price && isFinite(res.price)) {
             const p = res.price;
@@ -1456,6 +1468,7 @@ export const useStore = create<Store>()(
               const bots = st.bots.map((b) => ({ ...b, unrealized: safeMultiply(b.posToken || 0, (p! || 0) - (b.avgSol || p! || 0)) }));
               return { price: p!, candles: c, bots, ticks: ticks.filter((x) => x.t > cut) };
             });
+              await ensureIdleRefresh();
             return;
           } else if (res && res.price == null) {
             get().addLog('warn', `Price: N/A (${res.reason || 'unknown'})`);
@@ -1463,6 +1476,7 @@ export const useStore = create<Store>()(
         } catch (e: any) {
           get().addLog('warn', `Price fetch error: ${e?.message || String(e)}`);
         }
+          await ensureIdleRefresh();
         if (s.external.provider === "pumpportal") {
           // даже при WS‑цене иногда подёргиваем балансы
           if (get().shouldLightRefresh(8000)) {
