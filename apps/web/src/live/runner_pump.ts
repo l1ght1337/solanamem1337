@@ -58,6 +58,7 @@ type RunCtx = {
   onLog: (l: "info" | "ok" | "warn" | "err", msg: string) => void;
   onUpdate: (b: LiveBot) => void;
   afterTrade?: (reason?: "trade" | "idle") => void;
+  shouldLogStop?: () => boolean;
 
   // из store.startBot мы пробрасываем:
   getRisk?: () => {
@@ -341,7 +342,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     if (reportedStop) return;
     reportedStop = true;
     try {
-      log("info", "runner: stopped");
+      const allow =
+        typeof ctx.shouldLogStop === "function"
+          ? ctx.shouldLogStop() !== false
+          : true;
+      if (allow) {
+        log("info", "runner: stopped");
+      }
     } catch {}
   };
 
