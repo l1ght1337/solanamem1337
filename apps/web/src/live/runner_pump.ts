@@ -307,6 +307,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let stopped = false;
   let pending = false;
   let cooldownUntil = 0;
+  let reportedStop = false;
 
   // пер‑ботовый backoff при сетевых проблемах
   let failStreak = 0;
@@ -335,6 +336,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       lastWarnTs = n;
       log("warn", s);
     }
+  };
+  const reportStop = () => {
+    if (reportedStop) return;
+    reportedStop = true;
+    try {
+      log("info", "runner: stopped");
+    } catch {}
   };
 
   function pushUpdate(p: Partial<LiveBot>) {
@@ -1149,10 +1157,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   setTimeout(loop, 100 + Math.floor(Math.random() * 500));
   return () => {
     stopped = true;
+    reportStop();
   };
 
   async function loop() {
-    if (stopped || !bot.running || ctx.abortSignal?.aborted) return;
+    if (stopped || !bot.running || ctx.abortSignal?.aborted) {
+      reportStop();
+      return;
+    }
     if (pending) return;
 
     const now = Date.now();
@@ -1793,6 +1805,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const jitter = 200 + Math.floor(Math.random() * 300);
       if (!stopped && !ctx.abortSignal?.aborted)
         setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+      else reportStop();
     }
   }
 }
