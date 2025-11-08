@@ -62,7 +62,6 @@ const PF_MAX_SOL = Math.max(
 const calcPriorityFeeSol = (mult = 1) =>
   Math.min(PF_MAX_SOL, +(PF_BASE_SOL * Math.max(1, mult)).toFixed(6));
 const REFRESH_WATCHDOG_MS = 12_000;
-const AUTOSTART_DEBOUNCE_MS = 1_200;
 
 export type BotStrategy =
   | "trend"
@@ -636,7 +635,13 @@ export type Store = {
   /** Central bot scheduler for stability */
   scheduler: Map<
     string,
-    { running: boolean; abort: AbortController; stopFn?: () => void }
+    {
+      running: boolean;
+      abort: AbortController;
+      stopFn?: () => void;
+      setLogStop?: (log: boolean) => void;
+      shouldLogStop?: () => boolean;
+    }
   >;
 
   /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
@@ -713,9 +718,12 @@ export type Store = {
     opts?: { staggerMs?: number },
   ) => Promise<void>;
   startBot: (id: string, connection: Connection) => Promise<void>;
-  stopBot: (id: string) => void;
+  stopBot: (id: string, opts?: { silent?: boolean }) => void;
   startAll: (connection: Connection) => Promise<void>;
-  stopAll: () => void;
+  stopAll: (opts?: { silent?: boolean }) => Promise<void>;
+  resumeRunningBots: (connection: Connection) => Promise<void>;
+  startWatchdog: (connection?: Connection | null) => void;
+  stopWatchdog: () => void;
 
   // Sell ALL (parallel, idempotent)
   sellAllState: {
@@ -795,6 +803,10 @@ export type Store = {
   _mintDecimals?: number;
   _lastTopUp?: Record<string, number>;
   _ppSub?: any;
+  _watchdogTimer?: any;
+  _resumeTimer?: any;
+  _pendingResumeBotIds?: string[];
+  _lastConnection?: Connection | null;
 
   // Аллокация токен/SOL (цель и коридор), управляется из UI
   allocTarget: number; // 0..1
@@ -849,6 +861,10 @@ export const useStore = create<Store>()(
         candles: [],
         lightRefresh: { ts: 0 },
         scheduler: new Map(),
+        _watchdogTimer: undefined,
+        _resumeTimer: undefined,
+        _pendingResumeBotIds: [],
+        _lastConnection: null,
 
         ticks: [],
         getChangeFast(sec = 15) {
@@ -1010,6 +1026,11 @@ export const useStore = create<Store>()(
                 external: { ...s2.external, provider: "pumpportal" },
                 _ppSub: sub,
               }));
+              setTimeout(() => {
+                try {
+                  get().startWatchdog();
+                } catch {}
+              }, 0);
             });
           } else {
             try {
@@ -1494,31 +1515,35 @@ export const useStore = create<Store>()(
               get().addLog("warn", `startBot ${id}: missing connection`);
               return;
             }
-            let s = get();
-            let bot = s.bots.find((b) => b.id === id);
+
+            set(() => ({ _lastConnection: connection }));
+            let state = get();
+            let bot = state.bots.find((b) => b.id === id);
             if (!bot) return;
-            if (!s.tokenMint) {
-              s.addLog("warn", `Бот ${bot.name}: mint не задан`);
+
+            if (!state.tokenMint) {
+              state.addLog("warn", `Бот ${bot.name}: mint не задан`);
               return;
             }
 
-            if (get().ensureEligible(bot)) return;
+            const existing = state.scheduler.get(id);
+            const existingActive =
+              existing &&
+              existing.running === true &&
+              !existing.abort.signal.aborted;
 
-            s = get();
-            bot = s.bots.find((b) => b.id === id);
-            if (!bot) return;
+            if (existingActive) {
+              state.addLog("info", `[${bot.name}] runner уже активен`);
+              if (!bot.running) {
+                set((s) => ({
+                  bots: s.bots.map((x) =>
+                    x.id === id ? { ...x, running: true } : x,
+                  ),
+                }));
+              }
+              return;
+            }
 
-          // Validate inputs
-          if (!Number.isFinite(bot.speedMs) || bot.speedMs <= 0) {
-            s.addLog("warn", `Бот ${bot.name}: неверная скорость`);
-            return;
-          }
-          if (!Number.isFinite(bot.budgetSol) || bot.budgetSol <= 0) {
-            s.addLog("warn", `Бот ${bot.name}: неверный бюджет`);
-            return;
-          }
-
-            const existing = s.scheduler.get(id);
             if (existing) {
               try {
                 existing.abort.abort();
@@ -1526,187 +1551,250 @@ export const useStore = create<Store>()(
               try {
                 existing.stopFn?.();
               } catch {}
-              s.scheduler.delete(id);
+              state.scheduler.delete(id);
             }
 
-          if (bot.solBalance < s.minFeeSol) {
-            if (s.autoTopUp && s.treasuryKeyId) {
-              await get().topUpBot(connection, bot.id);
-              await get().refreshBalances(connection);
-            } else {
-              s.addLog(
-                "warn",
-                `Бот ${bot.name} НЕ запущен: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${s.minFeeSol})`,
-              );
+            if (bot.running) {
+              set((s) => ({
+                bots: s.bots.map((x) =>
+                  x.id === id ? { ...x, running: false } : x,
+                ),
+              }));
+              state = get();
+              bot = state.bots.find((b) => b.id === id);
+              if (!bot) return;
+            }
+
+            if (!Number.isFinite(bot.speedMs) || bot.speedMs <= 0) {
+              state.addLog("warn", `Бот ${bot.name}: неверная скорость`);
               return;
             }
-          }
-
-          const kp = getKeypair(bot.keyId);
-          if (!kp) return s.addLog("err", "Не найден ключ бота");
-
-          let refreshKickTimer: ReturnType<typeof setTimeout> | null = null;
-          let refreshKickDue = 0;
-          const scheduleRefresh = (delayMs: number) => {
-            const nowMs = Date.now();
-            const dueAt = nowMs + delayMs;
-            if (refreshKickTimer !== null) {
-              if (dueAt >= refreshKickDue - 50) return;
-              clearTimeout(refreshKickTimer);
+            if (!Number.isFinite(bot.budgetSol) || bot.budgetSol <= 0) {
+              state.addLog("warn", `Бот ${bot.name}: неверный бюджет`);
+              return;
             }
-            refreshKickDue = dueAt;
-            refreshKickTimer = setTimeout(
-              () => {
-                refreshKickTimer = null;
-                refreshKickDue = 0;
-                get()
-                  .refreshBalances(connection)
-                  .catch(() => {});
+
+            if (bot.solBalance < state.minFeeSol) {
+              if (state.autoTopUp && state.treasuryKeyId) {
+                await get().topUpBot(connection, bot.id);
+                await get().refreshBalances(connection);
+              } else {
+                state.addLog(
+                  "warn",
+                  `Бот ${bot.name} НЕ запущен: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${state.minFeeSol})`,
+                );
+                return;
+              }
+              state = get();
+              bot = state.bots.find((b) => b.id === id);
+              if (!bot) return;
+            }
+
+            const kp = getKeypair(bot.keyId);
+            if (!kp) {
+              state.addLog("err", "Не найден ключ бота");
+              return;
+            }
+
+            let refreshKickTimer: ReturnType<typeof setTimeout> | null = null;
+            let refreshKickDue = 0;
+            const scheduleRefresh = (delayMs: number) => {
+              const nowMs = Date.now();
+              const dueAt = nowMs + delayMs;
+              if (refreshKickTimer !== null) {
+                if (dueAt >= refreshKickDue - 50) return;
+                clearTimeout(refreshKickTimer);
+              }
+              refreshKickDue = dueAt;
+              refreshKickTimer = setTimeout(
+                () => {
+                  refreshKickTimer = null;
+                  refreshKickDue = 0;
+                  get()
+                    .refreshBalances(connection)
+                    .catch(() => {});
+                },
+                Math.max(0, dueAt - nowMs),
+              );
+            };
+
+            const stopMeta = { log: true };
+            const abort = new AbortController();
+            state.scheduler.set(id, {
+              running: true,
+              abort,
+              stopFn: undefined,
+              setLogStop(log: boolean) {
+                stopMeta.log = log;
               },
-              Math.max(0, dueAt - nowMs),
+              shouldLogStop() {
+                return stopMeta.log;
+              },
+            } as any);
+
+            const botsNext = state.bots.map((b) =>
+              b.id === id ? { ...b, running: true } : b,
             );
-          };
+            set({
+              bots: botsNext,
+              scheduler: new Map(state.scheduler),
+              _lastConnection: connection,
+            });
 
-          // Create abort controller for this bot
-          const abort = new AbortController();
-          s.scheduler.set(id, { running: true, abort });
+            bot = botsNext.find((b) => b.id === id)!;
 
-          bot.running = true;
-          set({ bots: [...s.bots], scheduler: new Map(s.scheduler) });
+            const delay = Math.floor(Math.random() * 400);
+            await new Promise((resolve) => setTimeout(resolve, delay));
 
-          // Stagger start by 0-400ms to prevent collisions
-          const delay = Math.floor(Math.random() * 400);
-          await new Promise((resolve) => setTimeout(resolve, delay));
+            const runnerLoader =
+              get().external.provider === "pumpportal"
+                ? () => import("./live/runner_pump").then((m) => m.runBot)
+                : () => import("./live/runner").then((m) => m.runBot);
 
-          const runnerLoader =
-            get().external.provider === "pumpportal"
-              ? () => import("./live/runner_pump").then((m) => m.runBot)
-              : () => import("./live/runner").then((m) => m.runBot);
+            const run = await runnerLoader();
 
-          const run = await runnerLoader();
+            try {
+              const stop = (run as any)(
+                connection,
+                bot as any,
+                {
+                  mint: get().tokenMint!,
+                  slippageBps: () => safeBps(get().getSmartBps(), 50),
+                  twap: get().getTwapPlan(),
+                  getRisk: () => get().getRisk(),
 
-          try {
-            const stop = (run as any)(
-              connection,
-              bot as any,
-              {
-                mint: s.tokenMint!,
-                slippageBps: () => safeBps(get().getSmartBps(), 50),
-                twap: get().getTwapPlan(),
-                getRisk: () => get().getRisk(),
+                  price: () => get().price,
+                  changeFast: (secs?: number) => get().getChangeFast(secs ?? 15),
+                  change1m: () => {
+                    const cs = get().candles;
+                    if (cs.length < 2) return 0;
+                    const a = cs[cs.length - 2].close;
+                    const b = cs[cs.length - 1].close;
+                    return (b - a) / Math.max(1e-9, a);
+                  },
 
-                price: () => get().price,
-                changeFast: (secs?: number) => get().getChangeFast(secs ?? 15),
-                change1m: () => {
-                  const cs = get().candles;
-                  if (cs.length < 2) return 0;
-                  const a = cs[cs.length - 2].close;
-                  const b = cs[cs.length - 1].close;
-                  return (b - a) / Math.max(1e-9, a);
-                },
+                  keypair: () => kp as Keypair,
+                  tokenDecimals: () => get()._mintDecimals ?? 9,
+                  tradeSize: () => {
+                    const r = get().getTradeSize();
+                    return r > 0 ? r : bot.budgetSol;
+                  },
 
-                keypair: () => kp as Keypair,
-                tokenDecimals: () => get()._mintDecimals ?? 9,
-                tradeSize: () => {
-                  const r = get().getTradeSize();
-                  return r > 0 ? r : bot.budgetSol;
-                },
+                  isAiPaused: () => {
+                    const curr = get().bots.find((x) => x.id === bot.id);
+                    return !curr?.aiEnabled;
+                  },
 
-                // читаем флажок AI «на лету»
-                isAiPaused: () => {
-                  const curr = get().bots.find((x) => x.id === bot.id);
-                  return !curr?.aiEnabled;
-                },
+                  onLog: (lvl: any, msg: any) =>
+                    get().addLog(lvl as any, String(msg)),
 
-                onLog: (lvl: any, msg: any) =>
-                  get().addLog(lvl as any, String(msg)),
+                  onUpdate: (patch: any) =>
+                    set((st) => ({
+                      bots: st.bots.map((x) => {
+                        if (x.id !== patch.id) return x;
+                        return {
+                          ...x,
+                          last: patch.last,
+                          lastError: patch.lastError,
+                          fills: patch.fills,
+                          posToken: patch.posToken,
+                          avgSol: patch.avgSol,
+                          realized: patch.realized,
+                          unrealized: patch.unrealized,
+                          solBalance: patch.solBalance ?? x.solBalance,
+                          tokenBalance: patch.tokenBalance ?? x.tokenBalance,
+                        };
+                      }),
+                    })),
 
-                // Обновляем только рантайм-поля
-                onUpdate: (patch: any) =>
-                  set((st) => ({
-                    bots: st.bots.map((x) => {
-                      if (x.id !== patch.id) return x;
-                      return {
-                        ...x,
-                        last: patch.last,
-                        lastError: patch.lastError,
-                        fills: patch.fills,
-                        posToken: patch.posToken,
-                        avgSol: patch.avgSol,
-                        realized: patch.realized,
-                        unrealized: patch.unrealized,
-                        solBalance: patch.solBalance ?? x.solBalance,
-                        tokenBalance: patch.tokenBalance ?? x.tokenBalance,
-                      };
-                    }),
-                  })),
+                  afterTrade: (reason?: "trade" | "idle") => {
+                    const d = reason === "idle" ? 2200 : 800;
+                    scheduleRefresh(d);
+                  },
+                  getAlloc: () => get().getAlloc(),
+                  getTradeStep: () => get().getTradeStep(),
+                  setLightRefresh: () => get().setLightRefresh(),
+                  shouldLightRefresh: (ms: number) =>
+                    get().shouldLightRefresh(ms),
+                  abortSignal: abort.signal,
+                  shouldLogStop: () => stopMeta.log,
+                } as any,
+              );
 
-                // после сделки или периодического пинга — мягкий refresh (SOL + токен) для всех ботов
-                afterTrade: (reason?: "trade" | "idle") => {
-                  const delay = reason === "idle" ? 2200 : 800;
-                  scheduleRefresh(delay);
-                },
-                getAlloc: () => get().getAlloc(),
-                getTradeStep: () => get().getTradeStep(),
-                setLightRefresh: () => get().setLightRefresh(),
-                shouldLightRefresh: (ms: number) =>
-                  get().shouldLightRefresh(ms),
-                abortSignal: abort.signal,
-              } as any,
-            );
-
-            // Store the stop function in scheduler
-            const schedEntry = get().scheduler.get(id);
-            if (schedEntry) {
-              schedEntry.stopFn = stop;
-              get().scheduler.set(id, schedEntry);
+              const schedEntry = get().scheduler.get(id);
+              if (schedEntry) {
+                schedEntry.stopFn = stop;
+                get().scheduler.set(id, schedEntry);
+              }
+            } catch (error: any) {
+              const failState = get();
+              stopMeta.log = false;
+              failState.scheduler.delete(id);
+              const botsFail = failState.bots.map((b) =>
+                b.id === id ? { ...b, running: false } : b,
+              );
+              set({
+                bots: botsFail,
+                scheduler: new Map(failState.scheduler),
+              });
+              failState.addLog(
+                "err",
+                `Ошибка запуска ${bot.name}: ${error?.message || error}`,
+              );
             }
-          } catch (error: any) {
-            // If startup failed, clean up scheduler
-            const s = get();
-            s.scheduler.delete(id);
-            bot.running = false;
-            set({ bots: [...s.bots], scheduler: new Map(s.scheduler) });
-            s.addLog(
-              "err",
-              `Ошибка запуска ${bot.name}: ${error?.message || error}`,
-            );
-          }
-        },
+          },
 
-        stopBot: (id) =>
-          set((s) => {
-            const b = s.bots.find((x) => x.id === id);
-            const schedEntry = s.scheduler.get(id);
+          stopBot: (id, opts = {}) =>
+            set((s) => {
+              const schedEntry = s.scheduler.get(id);
+              const legacy = s.bots.find((x) => x.id === id);
 
-            if (schedEntry) {
-              // Stop via scheduler - abort and call stop function
-              try {
-                schedEntry.abort.abort();
-                if (schedEntry.stopFn) schedEntry.stopFn();
-              } catch {}
+              if (schedEntry) {
+                try {
+                  if (opts?.silent) {
+                    (schedEntry as any).setLogStop?.(false);
+                  } else {
+                    (schedEntry as any).setLogStop?.(true);
+                  }
+                } catch {}
+                try {
+                  schedEntry.abort.abort();
+                } catch {}
+                try {
+                  schedEntry.stopFn?.();
+                } catch {}
 
-              schedEntry.running = false;
-              s.scheduler.delete(id);
-            }
+                schedEntry.running = false;
+                s.scheduler.delete(id);
+              }
 
-            // Legacy cleanup
-            if (b && (b as any).__stop) {
-              try {
-                (b as any).__stop();
-              } catch {}
-              delete (b as any).__stop;
-            }
+              if (legacy && (legacy as any).__stop) {
+                try {
+                  (legacy as any).__stop();
+                } catch {}
+                delete (legacy as any).__stop;
+              }
 
-            if (b) b.running = false;
-            return { bots: [...s.bots], scheduler: new Map(s.scheduler) };
-          }),
+              const bots = s.bots.map((x) =>
+                x.id === id ? { ...x, running: false } : x,
+              );
+              const pending =
+                (s._pendingResumeBotIds || []).filter((botId) => botId !== id);
+
+              return {
+                bots,
+                scheduler: new Map(s.scheduler),
+                _pendingResumeBotIds: pending,
+              };
+            }),
 
           startAll: async (connection) => {
             if (!connection) {
               get().addLog("warn", "Start ALL: missing connection");
               return;
             }
+
+            set(() => ({ _lastConnection: connection }));
             let state = get();
             let tokenMint = state.tokenMint;
             if (!tokenMint && state.tokenUrl) {
@@ -1721,12 +1809,26 @@ export const useStore = create<Store>()(
               return;
             }
 
-            get()
-              .bots.slice()
-              .forEach((b) => {
-                const latest = get().bots.find((x) => x.id === b.id);
-                if (latest) get().ensureEligible(latest);
+            const staleIds = Array.from(state.scheduler.keys());
+            if (staleIds.length) {
+              staleIds.forEach((botId) =>
+                get().stopBot(botId, { silent: true }),
+              );
+              state = get();
+            }
+
+            set((s) => {
+              const active = new Set(s.scheduler.keys());
+              let changed = false;
+              const bots = s.bots.map((bot) => {
+                if (bot.running && !active.has(bot.id)) {
+                  changed = true;
+                  return { ...bot, running: false };
+                }
+                return bot;
               });
+              return changed ? { bots } : {};
+            });
 
             try {
               await get().refreshBalances(connection);
@@ -1749,11 +1851,182 @@ export const useStore = create<Store>()(
               get().addLog("info", "Start ALL: price feed not ready (timeout)");
             }
 
-            await get().ensureAllRunning(connection, { staggerMs: 180 });
+            state = get();
+            const botsToStart = state.bots.filter(
+              (bot) => bot.aiEnabled && !bot.manualLock,
+            );
+            state.addLog("info", `Запуск ${botsToStart.length} ботов…`);
+
+            if (botsToStart.length === 0) {
+              return;
+            }
+
+            const pendingSet = new Set(state._pendingResumeBotIds || []);
+            botsToStart.forEach((bot) => pendingSet.delete(bot.id));
+            set({ _pendingResumeBotIds: Array.from(pendingSet) });
+
+            await Promise.all(
+              botsToStart.map((bot) => get().startBot(bot.id, connection)),
+            );
+
+            try {
+              await get().refreshBalances(connection);
+            } catch {}
+
+            get().startWatchdog(connection);
           },
-        stopAll: () => {
-          get().bots.forEach((b) => get().stopBot(b.id));
-        },
+          stopAll: async (opts = {}) => {
+            const ids = get()
+              .bots.slice()
+              .map((b) => b.id);
+            ids.forEach((id) => get().stopBot(id, opts));
+            set(() => ({ _pendingResumeBotIds: [] }));
+            get().stopWatchdog();
+          },
+
+          resumeRunningBots: async (connection) => {
+            if (!connection) {
+              get().addLog("warn", "resumeRunningBots: missing connection");
+              return;
+            }
+
+            set(() => ({ _lastConnection: connection }));
+            let state = get();
+            const pendingSet = new Set(state._pendingResumeBotIds || []);
+
+            const toResume = state.bots.filter((bot) => {
+              const entry = state.scheduler.get(bot.id);
+              const active =
+                entry &&
+                entry.running === true &&
+                !entry.abort.signal.aborted;
+              if (active) {
+                pendingSet.delete(bot.id);
+                return false;
+              }
+              const shouldResume = bot.running || pendingSet.has(bot.id);
+              if (!shouldResume) return false;
+              if (!bot.aiEnabled) return false;
+              if (bot.manualLock) return false;
+              return true;
+            });
+
+            if (!toResume.length) {
+              set({ _pendingResumeBotIds: Array.from(pendingSet) });
+              return;
+            }
+
+            toResume.forEach((bot) => pendingSet.add(bot.id));
+            const targetIds = new Set(toResume.map((bot) => bot.id));
+
+            set((s) => ({
+              bots: s.bots.map((bot) =>
+                targetIds.has(bot.id) ? { ...bot, running: false } : bot,
+              ),
+              _pendingResumeBotIds: Array.from(pendingSet),
+            }));
+
+            get().addLog(
+              "info",
+              `Автовключение ${toResume.length} ранее запущенных ботов после перезагрузки…`,
+            );
+
+            await Promise.all(
+              toResume.map((bot) => get().startBot(bot.id, connection)),
+            );
+
+            state = get();
+            const stillPending: string[] = [];
+            for (const id of targetIds) {
+              const entry = state.scheduler.get(id);
+              const active =
+                entry &&
+                entry.running === true &&
+                !entry.abort.signal.aborted;
+              if (!active) {
+                stillPending.push(id);
+              }
+            }
+
+            set((s) => {
+              const next = new Set(s._pendingResumeBotIds || []);
+              targetIds.forEach((id) => next.delete(id));
+              stillPending.forEach((id) => next.add(id));
+              return { _pendingResumeBotIds: Array.from(next) };
+            });
+          },
+
+          startWatchdog: (connection) => {
+            const current = get();
+            const resolveConn =
+              connection ??
+              current._lastConnection ??
+              (typeof window !== "undefined" &&
+                ((window as any).__conn ||
+                  (window as any).__solanaConnection ||
+                  (window as any).__connection)) ||
+              null;
+
+            if (current._watchdogTimer) {
+              if (resolveConn) {
+                set({ _lastConnection: resolveConn });
+              }
+              return;
+            }
+            if (!resolveConn) return;
+
+            const timer = setInterval(async () => {
+              const st = get();
+              const conn =
+                connection ??
+                st._lastConnection ??
+                (typeof window !== "undefined" &&
+                  ((window as any).__conn ||
+                    (window as any).__solanaConnection ||
+                    (window as any).__connection)) ||
+                null;
+              if (!conn) return;
+
+              const bots = st.bots.filter(
+                (bot) => bot.aiEnabled && !bot.manualLock,
+              );
+              for (const bot of bots) {
+                const entry = st.scheduler.get(bot.id);
+                const active =
+                  entry &&
+                  entry.running === true &&
+                  !entry.abort.signal.aborted;
+                if (!active) {
+                  st.addLog("warn", `[${bot.name}] неактивен — перезапускаю`);
+                  try {
+                    await st.startBot(bot.id, conn);
+                  } catch (err: any) {
+                    st.addLog(
+                      "warn",
+                      `[${bot.name}] не удалось перезапустить: ${
+                        err?.message || err
+                      }`,
+                    );
+                  }
+                }
+              }
+            }, 5000);
+
+            set({
+              _watchdogTimer: timer,
+              _lastConnection: resolveConn,
+            });
+          },
+
+          stopWatchdog: () => {
+            const timer = get()._watchdogTimer;
+            if (timer) {
+              try {
+                clearInterval(timer);
+              } catch {}
+            }
+            set({ _watchdogTimer: undefined });
+          },
 
         setLightRefresh: () =>
           set((s) => ({ lightRefresh: { ts: Date.now() } })),
@@ -3004,91 +3277,135 @@ export const useStore = create<Store>()(
         drainDelayMs: s.drainDelayMs,
         treasuryKeyId: s.treasuryKeyId,
       }),
-        onRehydrateStorage: () => (state: any) => {
+      onRehydrateStorage: () => (state: any) => {
+        try {
+          const persistedBots = Array.isArray(state?.bots)
+            ? state.bots.map((b: any) => ({ ...b }))
+            : [];
+          const pendingIds = persistedBots
+            .filter((b: any) => b?.running && b?.id)
+            .map((b: any) => b.id);
+
+          const tokenUrl = state?.tokenUrl;
+          if (tokenUrl) {
+            setTimeout(() => {
+              try {
+                (useStore.getState() as any).setTokenUrl(tokenUrl);
+              } catch {}
+            }, 0);
+          }
+
           try {
-            const u = state?.tokenUrl;
-            if (u)
-              setTimeout(() => {
-                try {
-                  (useStore.getState() as any).setTokenUrl(u);
-                } catch {}
-              }, 0);
-
-            try {
-              useStore.setState((prev: any) => ({
-                bots: Array.isArray(prev?.bots)
-                  ? prev.bots.map((b: any) => ({ ...b, running: false }))
-                  : [],
-                scheduler: new Map(),
-              }));
-            } catch {}
-
-            // Hook logger → store so UI sees logs in realtime
-            try {
-              const unsub = logger.subscribe((entry) => {
-                try {
-                  (globalThis as any).__fromLoggerBridge = true;
-                  useStore
-                    .getState()
-                    .addLog(
-                      entry.level === "error" ? "err" : (entry.level as any),
-                      entry.msg,
-                    );
-                } finally {
-                  (globalThis as any).__fromLoggerBridge = false;
-                }
-              });
-              (window as any).__logger_unsub = unsub;
-            } catch {}
-
-            try {
-              if (!(window as any).__mb_disable_autostart) {
-                const planAutoStart = () => {
-                  const attempt = (retries: number) => {
-                    const st = useStore.getState() as any;
-                    const mint =
-                      st.tokenMint ||
-                      parsePumpMint(st.tokenUrl || "") ||
-                      b58(st.tokenUrl || "");
-                    const hasBots =
-                      Array.isArray(st.bots) && st.bots.length > 0;
-                    if (!mint || !hasBots) return;
-                    if (!st.tokenMint) {
-                      useStore.setState({ tokenMint: mint });
-                    }
-                    const conn =
-                      (window as any).__conn ||
-                      (window as any).__solanaConnection ||
-                      (window as any).__connection ||
-                      null;
-                    if (!conn) {
-                      if (retries > 0) {
-                        setTimeout(
-                          () => attempt(retries - 1),
-                          AUTOSTART_DEBOUNCE_MS,
-                        );
-                      }
-                      return;
-                    }
-                    if ((window as any).__mb_autoStartDone) return;
-                    (window as any).__mb_autoStartDone = true;
-                    if (typeof st.startAll === "function") {
-                      void st.startAll(conn);
-                    }
-                  };
-                  if ((window as any).__mb_autoStartTimer) {
-                    clearTimeout((window as any).__mb_autoStartTimer);
-                  }
-                  (window as any).__mb_autoStartTimer = setTimeout(
-                    () => attempt(3),
-                    AUTOSTART_DEBOUNCE_MS,
-                  );
-                };
-                planAutoStart();
-              }
-            } catch {}
+            const prevTimer = (useStore.getState() as any)._resumeTimer;
+            if (prevTimer) {
+              try {
+                clearTimeout(prevTimer);
+              } catch {}
+            }
           } catch {}
-        },
+
+          useStore.setState({
+            bots: persistedBots,
+            scheduler: new Map(),
+            _pendingResumeBotIds: pendingIds,
+            _resumeTimer: undefined,
+          });
+
+          try {
+            const unsub = logger.subscribe((entry) => {
+              try {
+                (globalThis as any).__fromLoggerBridge = true;
+                useStore
+                  .getState()
+                  .addLog(
+                    entry.level === "error" ? "err" : (entry.level as any),
+                    entry.msg,
+                  );
+              } finally {
+                (globalThis as any).__fromLoggerBridge = false;
+              }
+            });
+            if (typeof window !== "undefined") {
+              (window as any).__logger_unsub = unsub;
+            }
+          } catch {}
+
+          if (
+            typeof window !== "undefined" &&
+            !(window as any).__mb_disable_autostart
+          ) {
+            (window as any).__mb_autoResumeDone = false;
+            const scheduleResume = () => {
+              const attempt = async () => {
+                const st = useStore.getState() as any;
+                const pending =
+                  Array.isArray(st._pendingResumeBotIds) &&
+                  st._pendingResumeBotIds.length > 0;
+                if (!pending) {
+                  if (st._resumeTimer) {
+                    try {
+                      clearTimeout(st._resumeTimer);
+                    } catch {}
+                    useStore.setState({ _resumeTimer: undefined });
+                  }
+                  (window as any).__mb_autoResumeDone = true;
+                  const lastConn =
+                    st._lastConnection ||
+                    (window as any).__conn ||
+                    (window as any).__solanaConnection ||
+                    (window as any).__connection ||
+                    null;
+                  if (lastConn) {
+                    st.startWatchdog?.(lastConn);
+                  }
+                  return;
+                }
+
+                const conn =
+                  st._lastConnection ||
+                  (window as any).__conn ||
+                  (window as any).__solanaConnection ||
+                  (window as any).__connection ||
+                  null;
+                if (!conn) {
+                  const timer = setTimeout(attempt, 900);
+                  useStore.setState({ _resumeTimer: timer });
+                  return;
+                }
+
+                try {
+                  await st.resumeRunningBots(conn);
+                } catch (err: any) {
+                  st.addLog?.(
+                    "warn",
+                    `auto-resume error: ${err?.message || err}`,
+                  );
+                } finally {
+                  const next = useStore.getState() as any;
+                  const stillPending =
+                    Array.isArray(next._pendingResumeBotIds) &&
+                    next._pendingResumeBotIds.length > 0;
+                  if (stillPending) {
+                    const timer = setTimeout(attempt, 900);
+                    useStore.setState({
+                      _resumeTimer: timer,
+                      _lastConnection: conn,
+                    });
+                  } else {
+                    useStore.setState({ _resumeTimer: undefined });
+                    (window as any).__mb_autoResumeDone = true;
+                    next.startWatchdog?.(conn);
+                  }
+                }
+              };
+
+              attempt();
+            };
+
+            scheduleResume();
+          }
+        } catch {}
+      },
     },
   ),
 );
