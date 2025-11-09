@@ -1958,14 +1958,17 @@ export const useStore = create<Store>()(
 
           startWatchdog: (connection) => {
             const current = get();
+            const pickWindowConn = () => {
+              if (typeof window === "undefined") return null;
+              return (
+                (window as any).__conn ||
+                (window as any).__solanaConnection ||
+                (window as any).__connection ||
+                null
+              );
+            };
             const resolveConn =
-              connection ??
-              current._lastConnection ??
-              (typeof window !== "undefined" &&
-                ((window as any).__conn ||
-                  (window as any).__solanaConnection ||
-                  (window as any).__connection)) ||
-              null;
+              connection ?? current._lastConnection ?? pickWindowConn();
 
             if (current._watchdogTimer) {
               if (resolveConn) {
@@ -1978,13 +1981,7 @@ export const useStore = create<Store>()(
             const timer = setInterval(async () => {
               const st = get();
               const conn =
-                connection ??
-                st._lastConnection ??
-                (typeof window !== "undefined" &&
-                  ((window as any).__conn ||
-                    (window as any).__solanaConnection ||
-                    (window as any).__connection)) ||
-                null;
+                connection ?? st._lastConnection ?? pickWindowConn();
               if (!conn) return;
 
               const bots = st.bots.filter(
