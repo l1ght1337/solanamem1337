@@ -807,6 +807,12 @@ export type Store = {
   _resumeTimer?: any;
   _pendingResumeBotIds?: string[];
   _lastConnection?: Connection | null;
+  resumeBotsOnLoad: boolean;
+  autoStartDelayMs: number;
+  autoStartJitterMs: number;
+  setResumeBotsOnLoad: (value: boolean) => void;
+  setAutoStartConfig: (delayMs: number, jitterMs: number) => void;
+  initAfterReload: (connection?: Connection | null) => Promise<void>;
 
   // Аллокация токен/SOL (цель и коридор), управляется из UI
   allocTarget: number; // 0..1
@@ -865,6 +871,9 @@ export const useStore = create<Store>()(
         _resumeTimer: undefined,
         _pendingResumeBotIds: [],
         _lastConnection: null,
+        resumeBotsOnLoad: true,
+        autoStartDelayMs: 600,
+        autoStartJitterMs: 400,
 
         ticks: [],
         getChangeFast(sec = 15) {
@@ -1038,6 +1047,24 @@ export const useStore = create<Store>()(
             } catch {}
             set({ _ppSub: undefined });
           }
+          },
+
+        setResumeBotsOnLoad: (value) => {
+          set({ resumeBotsOnLoad: !!value });
+        },
+        setAutoStartConfig: (delayMs, jitterMs) => {
+          const delayNum = Number(delayMs);
+          const jitterNum = Number(jitterMs);
+          set({
+            autoStartDelayMs: Math.max(
+              0,
+              Math.floor(Number.isFinite(delayNum) ? delayNum : 0),
+            ),
+            autoStartJitterMs: Math.max(
+              0,
+              Math.floor(Number.isFinite(jitterNum) ? jitterNum : 0),
+            ),
+          });
         },
 
         addBot: (name) => {
@@ -1575,19 +1602,33 @@ export const useStore = create<Store>()(
             }
 
             if (bot.solBalance < state.minFeeSol) {
+              let refreshed = false;
               if (state.autoTopUp && state.treasuryKeyId) {
-                await get().topUpBot(connection, bot.id);
-                await get().refreshBalances(connection);
+                try {
+                  await get().topUpBot(connection, bot.id);
+                  await get().refreshBalances(connection);
+                  refreshed = true;
+                } catch (err: any) {
+                  state.addLog(
+                    "warn",
+                    `Top-up ${bot.name} не удался: ${err?.message || err}; запускаем с текущим балансом`,
+                  );
+                }
               } else {
                 state.addLog(
                   "warn",
-                  `Бот ${bot.name} НЕ запущен: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${state.minFeeSol})`,
+                  `Бот ${bot.name}: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${state.minFeeSol}); продолжаем запуск`,
                 );
-                return;
               }
               state = get();
-              bot = state.bots.find((b) => b.id === id);
+              bot = state.bots.find((b) => b.id === id) || bot;
               if (!bot) return;
+              if (refreshed && bot.solBalance < state.minFeeSol) {
+                state.addLog(
+                  "warn",
+                  `Бот ${bot.name}: после top-up баланс SOL ${bot.solBalance.toFixed(6)} < ${state.minFeeSol}, runner выполнит служебные продажи для комиссий`,
+                );
+              }
             }
 
             const kp = getKeypair(bot.keyId);
@@ -1788,7 +1829,165 @@ export const useStore = create<Store>()(
               };
             }),
 
-          startAll: async (connection) => {
+        initAfterReload: async (connection) => {
+          const resolveConnection = () => {
+            if (connection) return connection;
+            const state = get();
+            if (state._lastConnection) return state._lastConnection;
+            if (typeof window !== "undefined") {
+              return (
+                (window as any).__conn ||
+                (window as any).__solanaConnection ||
+                (window as any).__connection ||
+                null
+              );
+            }
+            return null;
+          };
+
+          const conn = resolveConnection();
+          const stateBefore = get();
+          const tokenUrl = stateBefore.tokenUrl;
+          if (tokenUrl) {
+            try {
+              stateBefore.setTokenUrl(tokenUrl);
+            } catch (err: any) {
+              stateBefore.addLog?.(
+                "warn",
+                `initAfterReload:setTokenUrl: ${err?.message || err}`,
+              );
+            }
+          }
+
+          try {
+            await get().tickReal();
+          } catch (err: any) {
+            stateBefore.addLog?.(
+              "warn",
+              `initAfterReload:tickReal: ${err?.message || err}`,
+            );
+          }
+
+          if (conn) {
+            try {
+              await get().refreshBalances(conn);
+            } catch (err: any) {
+              stateBefore.addLog?.(
+                "warn",
+                `initAfterReload:refreshBalances: ${err?.message || err}`,
+              );
+            }
+            set({ _lastConnection: conn });
+          }
+
+          const current = get();
+          const autoStartDisabled =
+            typeof window !== "undefined" &&
+            (window as any).__mb_disable_autostart;
+          if (!current.resumeBotsOnLoad || autoStartDisabled) {
+            if (autoStartDisabled) {
+              current.addLog?.(
+                "info",
+                "initAfterReload: auto-start disabled by flag",
+              );
+            }
+            return;
+          }
+
+          if (!conn) {
+            current.addLog?.(
+              "info",
+              "initAfterReload: RPC connection not ready, postponing auto-resume",
+            );
+            return;
+          }
+
+          const pendingSet = new Set(current._pendingResumeBotIds || []);
+          const candidates = current.bots.filter((bot) => {
+            if (!bot) return false;
+            if (!bot.aiEnabled) return false;
+            if (bot.manualLock) return false;
+            if (pendingSet.has(bot.id)) return true;
+            return bot.running === true;
+          });
+
+          if (!candidates.length) {
+            return;
+          }
+
+          const startIds = new Set(candidates.map((bot) => bot.id));
+
+          set((s) => ({
+            bots: s.bots.map((bot) =>
+              startIds.has(bot.id) ? { ...bot, running: false } : bot,
+            ),
+            _pendingResumeBotIds: Array.from(startIds),
+          }));
+
+          const baseDelay = Math.max(
+            0,
+            Math.floor(
+              Number.isFinite(current.autoStartDelayMs)
+                ? current.autoStartDelayMs
+                : 0,
+            ),
+          );
+          const jitter = Math.max(
+            0,
+            Math.floor(
+              Number.isFinite(current.autoStartJitterMs)
+                ? current.autoStartJitterMs
+                : 0,
+            ),
+          );
+
+          const decimals =
+            current._mintDecimals != null ? current._mintDecimals : "?";
+          const priceNow = Number(get().price || 0);
+          const priceDisplay =
+            Number.isFinite(priceNow) && priceNow > 0
+              ? priceNow >= 1
+                ? priceNow.toFixed(3)
+                : priceNow.toFixed(6)
+              : "n/a";
+          const wsProvider = current.external?.provider || "n/a";
+          current.addLog(
+            "info",
+            `Auto-resume: scheduling ${candidates.length} bots (delay=${baseDelay}ms±${jitter}ms, decimals=${decimals}, price=${priceDisplay}, ws=${wsProvider})`,
+          );
+
+          const tasks = candidates.map(
+            (bot, index) =>
+              new Promise<void>((resolve) => {
+                const jitterVal =
+                  jitter > 0 ? Math.floor(Math.random() * (jitter + 1)) : 0;
+                const delayMs = Math.max(0, baseDelay + jitterVal + index * 45);
+                setTimeout(() => {
+                  get()
+                    .startBot(bot.id, conn)
+                    .catch((err: any) => {
+                      get().addLog(
+                        "warn",
+                        `[${bot.name}] auto-resume failed: ${err?.message || err}`,
+                      );
+                    })
+                    .finally(() => {
+                      set((st) => {
+                        const next = new Set(st._pendingResumeBotIds || []);
+                        next.delete(bot.id);
+                        return { _pendingResumeBotIds: Array.from(next) };
+                      });
+                      resolve();
+                    });
+                }, delayMs);
+              }),
+          );
+
+          await Promise.all(tasks);
+          get().startWatchdog(conn);
+        },
+
+        startAll: async (connection) => {
             if (!connection) {
               get().addLog("warn", "Start ALL: missing connection");
               return;
@@ -1830,52 +2029,119 @@ export const useStore = create<Store>()(
               return changed ? { bots } : {};
             });
 
-            try {
-              await get().refreshBalances(connection);
-            } catch {}
-
-            const waitForPrice = async (timeoutMs = 2000) => {
-              const started = Date.now();
-              while (Date.now() - started < timeoutMs) {
-                const curr = get();
-                const priceReady =
-                  Number(curr.price || 0) > 0 ||
-                  curr.ticks.some?.((t: any) => Number(t?.p || 0) > 0);
-                if (priceReady) return true;
-                await new Promise((res) => setTimeout(res, 120));
-              }
-              return false;
-            };
-            const ready = await waitForPrice(2000);
-            if (!ready) {
-              get().addLog("info", "Start ALL: price feed not ready (timeout)");
-            }
-
-            state = get();
-            const botsToStart = state.bots.filter(
-              (bot) => bot.aiEnabled && !bot.manualLock,
+          try {
+            await get().tickReal();
+          } catch (err: any) {
+            state.addLog?.(
+              "warn",
+              `Start ALL: tickReal error ${err?.message || err}`,
             );
-            state.addLog("info", `Запуск ${botsToStart.length} ботов…`);
+          }
 
-            if (botsToStart.length === 0) {
-              return;
-            }
-
-            const pendingSet = new Set(state._pendingResumeBotIds || []);
-            botsToStart.forEach((bot) => pendingSet.delete(bot.id));
-            set({ _pendingResumeBotIds: Array.from(pendingSet) });
-
-            await Promise.all(
-              botsToStart.map((bot) => get().startBot(bot.id, connection)),
+          try {
+            await get().refreshBalances(connection);
+          } catch (err: any) {
+            state.addLog?.(
+              "warn",
+              `Start ALL: refreshBalances error ${err?.message || err}`,
             );
+          }
 
-            try {
-              await get().refreshBalances(connection);
-            } catch {}
+          const waitForPrice = async (timeoutMs = 2000) => {
+            const started = Date.now();
+            while (Date.now() - started < timeoutMs) {
+              const curr = get();
+              const priceReady =
+                Number(curr.price || 0) > 0 ||
+                curr.ticks.some?.((t: any) => Number(t?.p || 0) > 0);
+              if (priceReady) return true;
+              await new Promise((res) => setTimeout(res, 120));
+            }
+            return false;
+          };
+          const ready = await waitForPrice(2000);
+          if (!ready) {
+            get().addLog("info", "Start ALL: price feed not ready (timeout)");
+          }
 
-            get().startWatchdog(connection);
-          },
-          stopAll: async (opts = {}) => {
+          state = get();
+          const botsToStart = state.bots.filter(
+            (bot) => bot.aiEnabled && !bot.manualLock,
+          );
+
+          if (botsToStart.length === 0) {
+            return;
+          }
+
+          const pendingSet = new Set(state._pendingResumeBotIds || []);
+          botsToStart.forEach((bot) => pendingSet.delete(bot.id));
+          set({ _pendingResumeBotIds: Array.from(pendingSet) });
+
+          const baseDelay = Math.max(
+            0,
+            Math.floor(
+              Number.isFinite(state.autoStartDelayMs)
+                ? state.autoStartDelayMs
+                : 0,
+            ),
+          );
+          const jitter = Math.max(
+            0,
+            Math.floor(
+              Number.isFinite(state.autoStartJitterMs)
+                ? state.autoStartJitterMs
+                : 0,
+            ),
+          );
+          const decimals =
+            state._mintDecimals != null ? state._mintDecimals : "?";
+          const priceNow = Number(state.price || 0);
+          const priceDisplay =
+            Number.isFinite(priceNow) && priceNow > 0
+              ? priceNow >= 1
+                ? priceNow.toFixed(3)
+                : priceNow.toFixed(6)
+              : "n/a";
+          const wsProvider = state.external?.provider || "n/a";
+          state.addLog(
+            "info",
+            `Start ALL: scheduling ${botsToStart.length} bots (delay=${baseDelay}ms±${jitter}ms, decimals=${decimals}, price=${priceDisplay}, ws=${wsProvider})`,
+          );
+
+          const tasks = botsToStart.map(
+            (bot, index) =>
+              new Promise<void>((resolve) => {
+                const jitterVal =
+                  jitter > 0 ? Math.floor(Math.random() * (jitter + 1)) : 0;
+                const delayMs = Math.max(0, baseDelay + jitterVal + index * 45);
+                setTimeout(() => {
+                  get()
+                    .startBot(bot.id, connection)
+                    .catch((err: any) => {
+                      get().addLog(
+                        "err",
+                        `[${bot.name}] Start ALL failed: ${err?.message || err}`,
+                      );
+                    })
+                    .finally(resolve);
+                }, delayMs);
+              }),
+          );
+
+          await Promise.all(tasks);
+
+          try {
+            await get().refreshBalances(connection);
+          } catch (err: any) {
+            get().addLog(
+              "warn",
+              `Start ALL: post-refresh error ${err?.message || err}`,
+            );
+          }
+
+          get().startWatchdog(connection);
+        },
+        stopAll: async (opts = {}) => {
             const ids = get()
               .bots.slice()
               .map((b) => b.id);
@@ -1926,37 +2192,81 @@ export const useStore = create<Store>()(
               _pendingResumeBotIds: Array.from(pendingSet),
             }));
 
-            get().addLog(
-              "info",
-              `Автовключение ${toResume.length} ранее запущенных ботов после перезагрузки…`,
-            );
+          const baseDelay = Math.max(
+            0,
+            Math.floor(
+              Number.isFinite(state.autoStartDelayMs)
+                ? state.autoStartDelayMs
+                : 0,
+            ),
+          );
+          const jitter = Math.max(
+            0,
+            Math.floor(
+              Number.isFinite(state.autoStartJitterMs)
+                ? state.autoStartJitterMs
+                : 0,
+            ),
+          );
+          const decimals =
+            state._mintDecimals != null ? state._mintDecimals : "?";
+          const priceNow = Number(state.price || 0);
+          const priceDisplay =
+            Number.isFinite(priceNow) && priceNow > 0
+              ? priceNow >= 1
+                ? priceNow.toFixed(3)
+                : priceNow.toFixed(6)
+              : "n/a";
+          const wsProvider = state.external?.provider || "n/a";
+          get().addLog(
+            "info",
+            `Автовключение ${toResume.length} ботов (delay=${baseDelay}ms±${jitter}ms, decimals=${decimals}, price=${priceDisplay}, ws=${wsProvider})`,
+          );
 
-            await Promise.all(
-              toResume.map((bot) => get().startBot(bot.id, connection)),
-            );
+          const tasks = toResume.map(
+            (bot, index) =>
+              new Promise<void>((resolve) => {
+                const jitterVal =
+                  jitter > 0 ? Math.floor(Math.random() * (jitter + 1)) : 0;
+                const delayMs = Math.max(0, baseDelay + jitterVal + index * 45);
+                setTimeout(() => {
+                  get()
+                    .startBot(bot.id, connection)
+                    .catch((err: any) => {
+                      get().addLog(
+                        "warn",
+                        `[${bot.name}] resume failed: ${err?.message || err}`,
+                      );
+                    })
+                    .finally(resolve);
+                }, delayMs);
+              }),
+          );
 
-            state = get();
-            const stillPending: string[] = [];
-            for (const id of targetIds) {
-              const entry = state.scheduler.get(id);
-              const active =
-                entry &&
-                entry.running === true &&
-                !entry.abort.signal.aborted;
-              if (!active) {
-                stillPending.push(id);
-              }
+          await Promise.all(tasks);
+
+          state = get();
+          const stillPending: string[] = [];
+          for (const id of targetIds) {
+            const entry = state.scheduler.get(id);
+            const active =
+              entry &&
+              entry.running === true &&
+              !entry.abort.signal.aborted;
+            if (!active) {
+              stillPending.push(id);
             }
+          }
 
-            set((s) => {
-              const next = new Set(s._pendingResumeBotIds || []);
-              targetIds.forEach((id) => next.delete(id));
-              stillPending.forEach((id) => next.add(id));
-              return { _pendingResumeBotIds: Array.from(next) };
-            });
-          },
+          set((s) => {
+            const next = new Set(s._pendingResumeBotIds || []);
+            targetIds.forEach((id) => next.delete(id));
+            stillPending.forEach((id) => next.add(id));
+            return { _pendingResumeBotIds: Array.from(next) };
+          });
+        },
 
-          startWatchdog: (connection) => {
+        startWatchdog: (connection) => {
             const current = get();
             const pickWindowConn = () => {
               if (typeof window === "undefined") return null;
@@ -3249,6 +3559,9 @@ export const useStore = create<Store>()(
         if (typeof p.allocTarget !== "number") p.allocTarget = 0.7;
         if (typeof p.allocMin !== "number") p.allocMin = 0.6;
         if (typeof p.allocMax !== "number") p.allocMax = 0.85;
+        if (typeof p.resumeBotsOnLoad !== "boolean") p.resumeBotsOnLoad = true;
+        if (typeof p.autoStartDelayMs !== "number") p.autoStartDelayMs = 600;
+        if (typeof p.autoStartJitterMs !== "number") p.autoStartJitterMs = 400;
         return p;
       },
       storage: createJSONStorage(() => localStorage),
@@ -3256,6 +3569,9 @@ export const useStore = create<Store>()(
         tokenUrl: s.tokenUrl,
         tokenMint: s.tokenMint,
         bots: s.bots,
+        resumeBotsOnLoad: s.resumeBotsOnLoad,
+        autoStartDelayMs: s.autoStartDelayMs,
+        autoStartJitterMs: s.autoStartJitterMs,
         slippageBps: s.slippageBps,
         useRandomSize: s.useRandomSize,
         tradeRange: s.tradeRange,
@@ -3276,12 +3592,16 @@ export const useStore = create<Store>()(
       }),
       onRehydrateStorage: () => (state: any) => {
         try {
-          const persistedBots = Array.isArray(state?.bots)
-            ? state.bots.map((b: any) => ({ ...b }))
+          const persistedBotsRaw = Array.isArray(state?.bots)
+            ? state.bots.filter((b: any) => b && b.id)
             : [];
-          const pendingIds = persistedBots
+          const pendingIds = persistedBotsRaw
             .filter((b: any) => b?.running && b?.id)
             .map((b: any) => b.id);
+          const persistedBots = persistedBotsRaw.map((b: any) => ({
+            ...b,
+            running: false,
+          }));
 
           const tokenUrl = state?.tokenUrl;
           if (tokenUrl) {
@@ -3327,79 +3647,58 @@ export const useStore = create<Store>()(
             }
           } catch {}
 
-          if (
-            typeof window !== "undefined" &&
-            !(window as any).__mb_disable_autostart
-          ) {
+          if (typeof window !== "undefined") {
             (window as any).__mb_autoResumeDone = false;
-            const scheduleResume = () => {
-              const attempt = async () => {
-                const st = useStore.getState() as any;
-                const pending =
-                  Array.isArray(st._pendingResumeBotIds) &&
-                  st._pendingResumeBotIds.length > 0;
-                if (!pending) {
-                  if (st._resumeTimer) {
-                    try {
-                      clearTimeout(st._resumeTimer);
-                    } catch {}
-                    useStore.setState({ _resumeTimer: undefined });
-                  }
-                  (window as any).__mb_autoResumeDone = true;
-                  const lastConn =
-                    st._lastConnection ||
-                    (window as any).__conn ||
-                    (window as any).__solanaConnection ||
-                    (window as any).__connection ||
-                    null;
-                  if (lastConn) {
-                    st.startWatchdog?.(lastConn);
-                  }
-                  return;
-                }
 
-                const conn =
-                  st._lastConnection ||
-                  (window as any).__conn ||
-                  (window as any).__solanaConnection ||
-                  (window as any).__connection ||
-                  null;
-                if (!conn) {
-                  const timer = setTimeout(attempt, 900);
-                  useStore.setState({ _resumeTimer: timer });
-                  return;
-                }
+            try {
+              Promise.resolve(
+                useStore.getState().initAfterReload?.(null),
+              ).catch(() => {});
+            } catch {}
 
-                try {
-                  await st.resumeRunningBots(conn);
-                } catch (err: any) {
-                  st.addLog?.(
-                    "warn",
-                    `auto-resume error: ${err?.message || err}`,
-                  );
-                } finally {
-                  const next = useStore.getState() as any;
-                  const stillPending =
-                    Array.isArray(next._pendingResumeBotIds) &&
-                    next._pendingResumeBotIds.length > 0;
-                  if (stillPending) {
-                    const timer = setTimeout(attempt, 900);
-                    useStore.setState({
-                      _resumeTimer: timer,
-                      _lastConnection: conn,
-                    });
-                  } else {
-                    useStore.setState({ _resumeTimer: undefined });
-                    (window as any).__mb_autoResumeDone = true;
-                    next.startWatchdog?.(conn);
-                  }
+            const clearExistingTimer = () => {
+              try {
+                const prev = (useStore.getState() as any)._resumeTimer;
+                if (prev) {
+                  clearTimeout(prev);
+                  useStore.setState({ _resumeTimer: undefined });
                 }
-              };
-
-              attempt();
+              } catch {}
             };
 
-            scheduleResume();
+            const attemptInit = () => {
+              const st = useStore.getState() as any;
+              const conn =
+                st._lastConnection ||
+                (window as any).__conn ||
+                (window as any).__solanaConnection ||
+                (window as any).__connection ||
+                null;
+              if (!conn) return false;
+
+              Promise.resolve(st.initAfterReload?.(conn)).catch((err: any) => {
+                st.addLog?.(
+                  "warn",
+                  `initAfterReload error: ${err?.message || err}`,
+                );
+              });
+              clearExistingTimer();
+              (window as any).__mb_autoResumeDone = true;
+              return true;
+            };
+
+            const startPolling = () => {
+              if (attemptInit()) return;
+              clearExistingTimer();
+              const poll = () => {
+                if (attemptInit()) return;
+                const timer = setTimeout(poll, 700);
+                useStore.setState({ _resumeTimer: timer });
+              };
+              poll();
+            };
+
+            startPolling();
           }
         } catch {}
       },
