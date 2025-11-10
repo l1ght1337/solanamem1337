@@ -1,3 +1,4 @@
+
 // @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
@@ -636,13 +637,6 @@ export type Store = {
     { running: boolean; abort: AbortController; stopFn?: () => void }
   >;
 
-  /** Auto resume configuration */
-  resumeBotsOnLoad: boolean;
-  autoStartDelayMs: number;
-  autoStartJitterMs: number;
-
-  initAfterReload: (connection: Connection) => Promise<void>;
-
   /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
   ticks: { t: number; p: number }[];
   /** быстрый импульс: изменение цены за последние `sec` секунд */
@@ -713,7 +707,7 @@ export type Store = {
 
   startBot: (id: string, connection: any) => Promise<void>;
   stopBot: (id: string) => void;
-  startAll: (connection: any) => Promise<void>;
+  startAll: (connection: any) => void;
   stopAll: () => void;
 
   // Sell ALL (parallel, idempotent)
@@ -791,6 +785,11 @@ export type Store = {
   };
   autoTick: () => void;
 
+  resumeBotsOnLoad: boolean;
+  autoStartDelayMs: number;
+  autoStartJitterMs: number;
+  initAfterReload: (connection: Connection) => Promise<void>;
+
   _mintDecimals?: number;
   _lastTopUp?: Record<string, number>;
   _ppSub?: any;
@@ -848,109 +847,6 @@ export const useStore = create<Store>()(
         candles: [],
         lightRefresh: { ts: 0 },
         scheduler: new Map(),
-
-        resumeBotsOnLoad: true,
-        autoStartDelayMs: 600,
-        autoStartJitterMs: 400,
-
-        initAfterReload: async (connection: Connection) => {
-          if (!connection) return;
-          const runtime = get() as any;
-          if (runtime._initAfterReloadDone || runtime._initAfterReloadRunning)
-            return;
-          runtime._initAfterReloadRunning = true;
-
-          try {
-            const state = get();
-            const currUrl = state.tokenUrl;
-            if (currUrl) {
-              try {
-                state.setTokenUrl(currUrl);
-              } catch (e: any) {
-                state.addLog(
-                  "warn",
-                  `initAfterReload: setTokenUrl failed (${e?.message || e})`,
-                );
-              }
-            }
-
-            try {
-              await get().tickReal();
-            } catch (e: any) {
-              get().addLog(
-                "warn",
-                `initAfterReload: tickReal error (${e?.message || e})`,
-              );
-            }
-
-            try {
-              await get().refreshBalances(connection);
-            } catch (e: any) {
-              get().addLog(
-                "warn",
-                `initAfterReload: refreshBalances error (${e?.message || e})`,
-              );
-            }
-
-            const botsSnapshot = get().bots.slice();
-            if (!get().resumeBotsOnLoad) {
-              if (botsSnapshot.some((b) => b.running)) {
-                set({
-                  bots: botsSnapshot.map((b) =>
-                    b.running ? { ...b, running: false } : b,
-                  ),
-                });
-              }
-              return;
-            }
-
-            const toResume = botsSnapshot.filter((b) => b.running);
-            if (!toResume.length) return;
-
-            set({
-              bots: botsSnapshot.map((b) =>
-                b.running ? { ...b, running: false } : b,
-              ),
-            });
-
-            const baseDelay = Math.max(0, get().autoStartDelayMs);
-            const jitterMax = Math.max(0, get().autoStartJitterMs);
-            const decimals = get()._mintDecimals;
-            const priceNow = get().price;
-            const provider = get().external?.provider || "unknown";
-            const priceStr = Number.isFinite(priceNow)
-              ? (priceNow || 0).toFixed(6)
-              : String(priceNow ?? "na");
-
-            get().addLog(
-              "info",
-              `Auto-resume: ${toResume.length} bots queued (delay ${baseDelay}±${jitterMax}ms, decimals=${decimals ?? "?"}, price=${priceStr}, wsProvider=${provider})`,
-            );
-
-            toResume.forEach((bot, idx) => {
-              const jitter =
-                jitterMax > 0 ? Math.floor(Math.random() * (jitterMax + 1)) : 0;
-              const offset = baseDelay + idx * 120 + jitter;
-              setTimeout(
-                () => {
-                  const store = get();
-                  if (!store.bots.some((b2) => b2.id === bot.id)) return;
-                  if (store.scheduler.get(bot.id)?.running) return;
-                  store.startBot(bot.id, connection).catch((err: any) => {
-                    store.addLog(
-                      "err",
-                      `Auto-resume ${bot.name}: ${err?.message || err}`,
-                    );
-                  });
-                },
-                Math.max(0, offset),
-              );
-            });
-          } finally {
-            runtime._initAfterReloadRunning = false;
-            runtime._initAfterReloadDone = true;
-          }
-        },
 
         ticks: [],
         getChangeFast(sec = 15) {
@@ -1515,7 +1411,7 @@ export const useStore = create<Store>()(
         // Запуск/остановка with central scheduler
         async startBot(id, connection) {
           const s = get();
-          let bot = s.bots.find((b) => b.id === id);
+          const bot = s.bots.find((b) => b.id === id);
           if (!bot || !s.tokenMint) return;
 
           // Validate inputs
@@ -1535,29 +1431,24 @@ export const useStore = create<Store>()(
             return;
           }
 
+          // Не отменяем запуск если price==0 — runner сам bootstrapится
+          if (s.price <= 0) {
+            s.addLog(
+              "info",
+              `Bot ${bot.name}: price=0, runner will bootstrap from Jupiter`,
+            );
+          }
+
           if (bot.solBalance < s.minFeeSol) {
-            const needsTopUp = s.autoTopUp && s.treasuryKeyId;
-            if (needsTopUp) {
-              try {
-                await get().topUpBot(connection, bot.id);
-              } catch (e: any) {
-                s.addLog(
-                  "warn",
-                  `Top-up ${bot.name} failed (${e?.message || e}). Продолжаем запуск`,
-                );
-              }
-              try {
-                await get().refreshBalances(connection);
-              } catch {}
-              bot = get().bots.find((b) => b.id === id) || bot;
-            }
-            if (bot.solBalance < s.minFeeSol) {
+            if (s.autoTopUp && s.treasuryKeyId) {
+              await get().topUpBot(connection, bot.id);
+              await get().refreshBalances(connection);
+            } else {
               s.addLog(
                 "warn",
-                `Бот ${bot.name}: мало SOL (${bot.solBalance.toFixed(6)} < ${s.minFeeSol.toFixed(
-                  6,
-                )}), продолжаем запуск`,
+                `Бот ${bot.name} НЕ запущен: мало SOL (есть ${bot.solBalance.toFixed(6)}, нужно ≥ ${s.minFeeSol})`,
               );
+              return;
             }
           }
 
@@ -1665,12 +1556,15 @@ export const useStore = create<Store>()(
                   const delay = reason === "idle" ? 2200 : 800;
                   scheduleRefresh(delay);
                 },
+                shouldLogStop: () => {
+                  // Не спамим "stopped" в логах при отменах/abort
+                  return false;
+                },
                 getAlloc: () => get().getAlloc(),
                 getTradeStep: () => get().getTradeStep(),
                 setLightRefresh: () => get().setLightRefresh(),
                 shouldLightRefresh: (ms: number) =>
                   get().shouldLightRefresh(ms),
-                shouldLogStop: () => !abort.signal.aborted,
                 abortSignal: abort.signal,
               } as any,
             );
@@ -1724,67 +1618,31 @@ export const useStore = create<Store>()(
 
         startAll: async (connection) => {
           const s = get();
-          const botsSnapshot = s.bots.slice();
-          if (!botsSnapshot.length) {
-            s.addLog("info", "StartAll: нет ботов для запуска");
-            return;
-          }
-
           try {
-            await get().tickReal();
+            s.addLog("info", "startAll: pre-refresh (tickReal + refreshBalances)...");
+            await s.tickReal();
+            await s.refreshBalances(connection);
           } catch (e: any) {
-            s.addLog("warn", `StartAll: tickReal error (${e?.message || e})`);
+            s.addLog("warn", `startAll pre-refresh: ${e?.message || e}`);
           }
-
-          try {
-            await get().refreshBalances(connection);
-          } catch (e: any) {
-            s.addLog(
-              "warn",
-              `StartAll: refreshBalances error (${e?.message || e})`,
-            );
-          }
-
-          const latestBots = get().bots.slice();
-          const readyBots = latestBots.filter(
-            (b) => !get().scheduler.get(b.id)?.running,
-          );
-          if (!readyBots.length) {
-            s.addLog("info", "StartAll: все боты уже в работе");
-            return;
-          }
-
-          const baseDelay = Math.max(0, get().autoStartDelayMs);
-          const jitterMax = Math.max(0, get().autoStartJitterMs);
-          const decimals = get()._mintDecimals;
-          const priceNow = get().price;
-          const provider = get().external?.provider || "unknown";
-          const priceStr = Number.isFinite(priceNow)
-            ? (priceNow || 0).toFixed(6)
-            : String(priceNow ?? "na");
+          const decimals = s._mintDecimals ?? 9;
+          const price = s.price || 0;
+          const wsProvider = s.external.provider || "none";
           s.addLog(
             "info",
-            `StartAll: ${readyBots.length}/${latestBots.length} ботов в очереди (delay ${baseDelay}±${jitterMax}ms, decimals=${decimals ?? "?"}, price=${priceStr}, wsProvider=${provider})`,
+            `startAll: ${s.bots.length} bots scheduled, decimals=${decimals}, price=${price.toFixed(9)}, wsProvider=${wsProvider}`,
           );
-
-          readyBots.forEach((bot, idx) => {
-            const jitter =
-              jitterMax > 0 ? Math.floor(Math.random() * (jitterMax + 1)) : 0;
-            const offset = baseDelay + idx * 120 + jitter;
-            setTimeout(
-              () => {
-                const store = get();
-                if (store.scheduler.get(bot.id)?.running) return;
-                store.startBot(bot.id, connection).catch((err: any) => {
-                  store.addLog(
-                    "err",
-                    `StartAll ${bot.name}: ${err?.message || err}`,
-                  );
-                });
-              },
-              Math.max(0, offset),
-            );
-          });
+          for (let i = 0; i < s.bots.length; i++) {
+            const b = s.bots[i];
+            const jitter = Math.floor(Math.random() * 400);
+            setTimeout(() => {
+              get()
+                .startBot(b.id, connection)
+                .catch((e: any) =>
+                  get().addLog("err", `startBot ${b.name}: ${e?.message || e}`),
+                );
+            }, jitter);
+          }
         },
         stopAll: () => {
           get().bots.forEach((b) => get().stopBot(b.id));
@@ -2767,6 +2625,62 @@ export const useStore = create<Store>()(
           slopeThr: 0.002,
           volThr: 0.004,
         },
+
+        // Стабильность перезапуска
+        resumeBotsOnLoad: false,
+        autoStartDelayMs: 600,
+        autoStartJitterMs: 400,
+        async initAfterReload(connection: Connection) {
+          const s = get();
+          try {
+            // (а) WS feed уже подключается через setTokenUrl в onRehydrateStorage
+            // (б) Получить «живую» цену
+            try {
+              await s.tickReal();
+            } catch (e: any) {
+              s.addLog("warn", `initAfterReload tickReal: ${e?.message || e}`);
+            }
+            // (в) Рефреш балансов
+            try {
+              await s.refreshBalances(connection);
+            } catch (e: any) {
+              s.addLog("warn", `initAfterReload refreshBalances: ${e?.message || e}`);
+            }
+            // (г) Мягкий старт ботов с рассинхронизацией
+            if (s.resumeBotsOnLoad) {
+              const running = s.bots.filter((b) => b.running);
+              if (running.length > 0) {
+                s.addLog(
+                  "info",
+                  `initAfterReload: resume ${running.length} bots (delay ${s.autoStartDelayMs}ms + jitter ${s.autoStartJitterMs}ms)`,
+                );
+                for (let i = 0; i < running.length; i++) {
+                  const b = running[i];
+                  const delay =
+                    s.autoStartDelayMs +
+                    Math.floor(Math.random() * s.autoStartJitterMs);
+                  setTimeout(() => {
+                    const curr = get();
+                    const bot = curr.bots.find((x) => x.id === b.id);
+                    if (bot && bot.running) {
+                      curr
+                        .startBot(b.id, connection)
+                        .catch((e: any) =>
+                          curr.addLog(
+                            "err",
+                            `Resume ${b.name}: ${e?.message || e}`,
+                          ),
+                        );
+                    }
+                  }, delay);
+                }
+              }
+            }
+          } catch (e: any) {
+            s.addLog("err", `initAfterReload error: ${e?.message || e}`);
+          }
+        },
+
         autoTick() {
           const s = get();
           if (!s.autoMode) return;
@@ -2964,7 +2878,8 @@ export const useStore = create<Store>()(
         if (typeof p.allocTarget !== "number") p.allocTarget = 0.7;
         if (typeof p.allocMin !== "number") p.allocMin = 0.6;
         if (typeof p.allocMax !== "number") p.allocMax = 0.85;
-        if (typeof p.resumeBotsOnLoad !== "boolean") p.resumeBotsOnLoad = true;
+        // Стабильность перезапуска
+        if (typeof p.resumeBotsOnLoad !== "boolean") p.resumeBotsOnLoad = false;
         if (typeof p.autoStartDelayMs !== "number") p.autoStartDelayMs = 600;
         if (typeof p.autoStartJitterMs !== "number") p.autoStartJitterMs = 400;
         return p;
@@ -2998,37 +2913,32 @@ export const useStore = create<Store>()(
       onRehydrateStorage: () => (state: any) => {
         try {
           const u = state?.tokenUrl;
-          if (u) {
+          if (u)
             setTimeout(() => {
               try {
-                useStore.getState().setTokenUrl(u);
+                (useStore.getState() as any).setTokenUrl(u);
               } catch {}
             }, 0);
+          // initAfterReload если resumeBotsOnLoad и есть соединение
+          if (state?.resumeBotsOnLoad) {
+            setTimeout(() => {
+              const wc = (window as any).__conn as Connection | undefined;
+              if (wc) {
+                try {
+                  useStore.getState().initAfterReload(wc).catch(() => {});
+                } catch {}
+              } else {
+                // Подождём Connection через глобальный setter позже
+                const original = (window as any).__setConn;
+                (window as any).__setConn = (conn: Connection) => {
+                  if (original) original(conn);
+                  try {
+                    useStore.getState().initAfterReload(conn).catch(() => {});
+                  } catch {}
+                };
+              }
+            }, 100);
           }
-
-          const maybeInit = (conn?: Connection | null) => {
-            if (!conn) return;
-            try {
-              useStore.getState().initAfterReload(conn);
-            } catch (e: any) {
-              useStore
-                .getState()
-                .addLog("warn", `initAfterReload failed (${e?.message || e})`);
-            }
-          };
-          if (state?.resumeBotsOnLoad !== false) {
-            const conn = (window as any).__conn as Connection | undefined;
-            if (conn) {
-              setTimeout(() => maybeInit(conn), 0);
-            } else {
-              const queue =
-                ((window as any).__connReadyCbs as Array<
-                  (c: Connection) => void
-                >) || ((window as any).__connReadyCbs = []);
-              queue.push((c: Connection) => maybeInit(c));
-            }
-          }
-
           // Hook logger → store so UI sees logs in realtime
           try {
             const unsub = logger.subscribe((entry) => {
