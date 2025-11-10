@@ -26,7 +26,7 @@ import {
 import { fetchExternalPrice } from "./store-price-feeds";
 import { logger } from "./utils/logger";
 import { getTokenPriceSOL } from "./utils/priceFeed";
-import { parseMint as parsePumpMint } from "./utils/pump";
+import { parseMint as parsePumpMint, isPumpLikeUrl } from "./utils/pump";
 import {
   getKeypair,
   createKey,
@@ -959,61 +959,85 @@ export const useStore = create<Store>()(
         _ppSub: undefined as any,
         setTokenUrl: (u) => {
           const mint = parsePumpMint(u) || b58(u);
-          const isPump = /pump\.fun/i.test(u);
+          const pumpLike = isPumpLikeUrl(u);
           set({ tokenUrl: u, tokenMint: mint, _mintDecimals: undefined });
-          if (mint && isPump) {
-            import("./external/pumpportal").then(({ attachPumpPortalFeed }) => {
-              const s = get();
-              try {
-                (s as any)._ppSub?.detach?.();
-              } catch {}
-              const sub = attachPumpPortalFeed({
-                mint,
-                onPrice: (p) =>
-                  set((st) => {
-                    const tnow = Date.now();
-                    const ticks = (st.ticks || []).concat({ t: tnow, p });
-                    const cut = tnow - 60_000;
-                    return { price: p, ticks: ticks.filter((x) => x.t > cut) };
-                  }),
-                onCandle: (m, p) =>
-                  set((st) => {
-                    const last = (st.candles as any).at?.(-1);
-                    let c = st.candles.slice();
-                    if (!last || last.t !== m)
-                      c.push({
-                        t: m,
-                        open: p,
-                        high: p,
-                        low: p,
-                        close: p,
-                        volume: 0,
-                      });
-                    else {
-                      last.high = Math.max(last.high, p);
-                      last.low = Math.min(last.low, p);
-                      last.close = p;
-                    }
-                    if (c.length > 1000) c = c.slice(-1000);
-                    return { candles: c };
-                  }),
-                onMigration: () =>
-                  get().addLog(
-                    "info",
-                    "Token migrated from bonding curve → Raydium",
-                  ),
+
+          try {
+            (get() as any)._ppSub?.detach?.();
+          } catch {}
+          set({ _ppSub: undefined });
+
+          if (mint && pumpLike) {
+            import("./external/pumpportal")
+              .then(({ attachPumpPortalFeed }) => {
+                const current = get();
+                if (current.tokenMint !== mint) return;
+                const sub = attachPumpPortalFeed({
+                  mint,
+                  onPrice: (p) =>
+                    set((st) => {
+                      const tnow = Date.now();
+                      const ticks = (st.ticks || []).concat({ t: tnow, p });
+                      const cut = tnow - 60_000;
+                      return { price: p, ticks: ticks.filter((x) => x.t > cut) };
+                    }),
+                  onCandle: (m, p) =>
+                    set((st) => {
+                      const last = (st.candles as any).at?.(-1);
+                      let c = st.candles.slice();
+                      if (!last || last.t !== m)
+                        c.push({
+                          t: m,
+                          open: p,
+                          high: p,
+                          low: p,
+                          close: p,
+                          volume: 0,
+                        });
+                      else {
+                        last.high = Math.max(last.high, p);
+                        last.low = Math.min(last.low, p);
+                        last.close = p;
+                      }
+                      if (c.length > 1000) c = c.slice(-1000);
+                      return { candles: c };
+                    }),
+                  onMigration: () =>
+                    get().addLog(
+                      "info",
+                      "Token migrated from bonding curve → Raydium",
+                    ),
+                });
+                set((s2) => {
+                  if (s2.tokenMint !== mint) {
+                    try {
+                      sub.detach();
+                    } catch {}
+                    return undefined;
+                  }
+                  return {
+                    external: { ...s2.external, provider: "pumpportal" },
+                    _ppSub: sub,
+                  };
+                });
+              })
+              .catch(() => {
+                set((s2) => ({
+                  external:
+                    s2.external.provider === "pumpportal"
+                      ? { ...s2.external, provider: "dexscreener" }
+                      : s2.external,
+                  _ppSub: undefined,
+                }));
               });
-              set((s2) => ({
-                ...s2,
-                external: { ...s2.external, provider: "pumpportal" },
-                _ppSub: sub,
-              }));
-            });
           } else {
-            try {
-              (get() as any)._ppSub?.detach?.();
-            } catch {}
-            set({ _ppSub: undefined });
+            set((s2) => ({
+              external:
+                s2.external.provider === "pumpportal"
+                  ? { ...s2.external, provider: "dexscreener" }
+                  : s2.external,
+              _ppSub: undefined,
+            }));
           }
         },
 

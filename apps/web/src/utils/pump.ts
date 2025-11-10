@@ -31,3 +31,17 @@ export function parseMint(input: string): string | null {
   return null;
 }
 
+const pumpDomains = ["pump.fun", "bonk.fun", "letsbonk.fun"];
+
+export function isPumpLikeUrl(input: string): boolean {
+  if (!input) return false;
+  try {
+    const host = new URL(input).hostname.toLowerCase();
+    return pumpDomains.some(
+      (domain) => host === domain || host.endsWith(`.${domain}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
