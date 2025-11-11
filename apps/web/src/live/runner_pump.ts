@@ -97,11 +97,6 @@ const PUMP_BASES = [
   "https://pumpportal.fun",
 ].filter(Boolean);
 
-const PUMP_BUILD_TIMEOUT_MS = Math.max(
-  3_000,
-  Number((import.meta as any).env?.VITE_PUMP_BUILD_TIMEOUT_MS ?? 12_000),
-);
-
 const PF_BASE_SOL = Math.max(
   0.000006,
   Number((import.meta as any).env?.VITE_PRIORITY_FEE_BASE ?? 0.000008),
@@ -165,7 +160,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
       try {
         const r = await scheduleFetch(
           url,
-            { ...(init as any), timeoutMs: PUMP_BUILD_TIMEOUT_MS, tries: 1 },
+          { ...(init as any), timeoutMs: 20_000, tries: 1 },
           "pump",
         );
         if (r.ok) {
@@ -231,108 +226,10 @@ const MIN_KEEP_SOL = 0.0006;
 const EXEC_MIN_SOL = Math.max(
   0.00002,
   Number((import.meta as any).env?.VITE_TRADE_EXEC_MIN_SOL ?? 0.00005),
-); // cursor: execMin guard
+);
 const IDLE_BAL_REFRESH_MS = Math.max(
   10_000,
-  Number(
-    (import.meta as any).env?.VITE_IDLE_BAL_REFRESH_MS ??
-      (import.meta as any).env?.VITE_BOT_IDLE_REFRESH_MS ??
-      45_000,
-  ),
-);
-
-const PROBE_IDLE_SEC = Math.max(
-  6,
-  Number((import.meta as any).env?.VITE_PROBE_IDLE_SEC ?? 18),
-);
-const PROBE_IDLE_MS = PROBE_IDLE_SEC * 1_000;
-const PROBE_SOL = Math.max(
-  EXEC_MIN_SOL,
-  Number((import.meta as any).env?.VITE_PROBE_SOL ?? 0.00006),
-);
-const PROBE_SOL_FIXED = +PROBE_SOL.toFixed(6);
-const NOTIONAL_IDLE_DECAY_STEP = 0.0002;
-const NOTIONAL_IDLE_DECAY_INTERVAL_MS = 3_000;
-const FAIL_STREAK_DECAY_MS = 10_000;
-const PROBE_LOG_THROTTLE_MS = 6_000;
-
-const MICRO_SLICE_JITTER_MS_MIN = Math.max(
-  0,
-  Number((import.meta as any).env?.VITE_MICRO_SLICE_JITTER_MS_MIN ?? 15),
-);
-const MICRO_SLICE_JITTER_MS_MAX = Math.max(
-  MICRO_SLICE_JITTER_MS_MIN,
-  Number((import.meta as any).env?.VITE_MICRO_SLICE_JITTER_MS_MAX ?? 35),
-);
-const MICRO_SLICE_JITTER_SPAN =
-  MICRO_SLICE_JITTER_MS_MAX - MICRO_SLICE_JITTER_MS_MIN;
-
-const QUOTE_RETRY_MS = Math.max(
-  60,
-  Number((import.meta as any).env?.VITE_QUOTE_RETRY_MS ?? 150),
-);
-const QUOTE_RETRY_MIN_MS = Math.max(60, Math.round(QUOTE_RETRY_MS * 0.8));
-const QUOTE_RETRY_MAX_MS = Math.max(
-  QUOTE_RETRY_MIN_MS,
-  Math.round(QUOTE_RETRY_MS * 1.2),
-);
-
-const PF_HOT_CAP_SOL = Math.max(
-  PF_BASE_SOL,
-  Number((import.meta as any).env?.VITE_PF_HOT_CAP ?? PF_MAX_SOL),
-);
-
-const MAX_NET_BACKOFF_MS = Math.max(
-  1_000,
-  Number((import.meta as any).env?.VITE_MAX_NET_BACKOFF_MS ?? 3_000),
-);
-
-const PROBE_PF_MULT = Math.max(
-  1,
-  Number((import.meta as any).env?.VITE_PROBE_PF_MULT ?? 1.2),
-);
-
-const PROBE_PRIORITY_FLOOR_SOL = Math.min(
-  PF_HOT_CAP_SOL,
-  +(PF_BASE_SOL * PROBE_PF_MULT).toFixed(6),
-);
-
-const TP_JITTER = Math.max(
-  0,
-  Number((import.meta as any).env?.VITE_TP_JITTER ?? 0.002),
-);
-
-const envPct = (raw: any, fallback: number) => {
-  const num = Number(raw);
-  if (!Number.isFinite(num)) return fallback;
-  return Math.max(0, Math.min(0.9, num));
-};
-
-const TP_LEVEL_BASE = [
-  {
-    key: "tp1",
-    pct: envPct((import.meta as any).env?.VITE_TP1_PCT, 0.05),
-    sell: envPct((import.meta as any).env?.VITE_TP1_SELL, 0.03),
-  },
-  {
-    key: "tp2",
-    pct: envPct((import.meta as any).env?.VITE_TP2_PCT, 0.09),
-    sell: envPct((import.meta as any).env?.VITE_TP2_SELL, 0.05),
-  },
-  {
-    key: "tp3",
-    pct: envPct((import.meta as any).env?.VITE_TP3_PCT, 0.14),
-    sell: envPct((import.meta as any).env?.VITE_TP3_SELL, 0.07),
-  },
-]; // NOTE: take-profit defaults
-
-const TRAIL_DD = Math.min(
-  -0.0001,
-  Number((import.meta as any).env?.VITE_TRAIL_DD ?? -0.01),
-);
-const TRAIL_SELL = Math.max(
-  0,
-  Math.min(0.5, envPct((import.meta as any).env?.VITE_TRAIL_SELL, 0.05)),
+  Number((import.meta as any).env?.VITE_BOT_IDLE_REFRESH_MS ?? 45_000),
 );
 
 let TARGET_ALLOC = 0.7;
@@ -414,45 +311,22 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let cooldownUntil = 0;
 
   // пер‑ботовый backoff при сетевых проблемах
-    let failStreak = 0;
-    let nextRetryAt = 0;
-    let lastWarnTs = 0;
-    let lastNetErrAt = 0;
-    let lastFailDecayAt = 0;
+  let failStreak = 0;
+  let nextRetryAt = 0;
+  let lastWarnTs = 0;
 
   // защита портфеля
   let baselineValue = 0;
 
   // поведение
   let buysInRow = 0;
-    let sellsInRow = 0;
-    let lastBuyTs = 0;
-    let lastSellTs = 0;
-    let trailHighPrice = 0;
-    let lastTradeAt = 0;
+  let sellsInRow = 0;
+  let lastBuyTs = 0;
+  let lastSellTs = 0;
+  let trailHighPrice = 0;
 
-    let deferredSell: { dueAt: number; amountTok: number } | null = null;
-    let lastIdleBalanceRefreshAt = Date.now();
-      const tpLevels = TP_LEVEL_BASE.filter(
-        (lvl) => lvl.pct > 0 && lvl.sell > 0,
-      ).map((lvl) => {
-        const jitter =
-          TP_JITTER > 0
-            ? (Math.random() * 2 - 1) * TP_JITTER
-            : 0;
-        return {
-          key: lvl.key,
-          pct: Math.max(0.001, lvl.pct + jitter),
-          sell: Math.max(0.001, Math.min(0.5, lvl.sell)),
-        };
-      }); // NOTE: take-profit profile
-      const tpTriggered = new Set<string>();
-      let lastTpBase = bot.avgSol > 0 ? bot.avgSol : 0;
-      let lastPartialSellAt = 0;
-      let lastTrailSellAt = 0;
-      let lastShaveAt = 0;
-      let refreshBusy = false; // NOTE: idle refresh busy guard
-      let refreshPromise: Promise<void> | null = null;
+  let deferredSell: { dueAt: number; amountTok: number } | null = null;
+  let lastIdleBalanceRefreshAt = Date.now();
     const priceHist: number[] = [];
     const stats = {
       since: Date.now(),
@@ -476,16 +350,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       slp: number;
       size: number;
     } = { side: null, pf: PF_BASE_SOL, slp: MIN_SLP_BPS, size: 0 };
-      let lastSkipDetail = "n/a";
-      let lastSkipLogAt = 0; // NOTE: skip log throttle
-      let lastSkipReasonKey: SkipReasonKey | null = null;
-      let lastSkipMessage = "";
+    let lastSkipDetail = "n/a";
     let lastGoodPrice = 0;
     const quoteFailures: number[] = [];
     let fallbackQuoteUntil = 0;
     let fallbackNotifiedUntil = 0;
-    let lastProbeAttemptAt = 0;
-    let lastProbeLogAt = 0;
 
     type SkipReasonKey = keyof typeof stats.skip;
     const zeroSkipCounters = () => ({
@@ -507,20 +376,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     };
 
     const noteSkip = (reason: SkipReasonKey, msg: string) => {
-    stats.skip[reason] = (stats.skip[reason] || 0) + 1;
-    lastSkipDetail = msg;
-    const now = Date.now();
-    const isSameReason = lastSkipReasonKey === reason && lastSkipMessage === msg;
-    if (!isSameReason || now - lastSkipLogAt >= 5_000) {
-      lastSkipLogAt = now;
-      lastSkipReasonKey = reason;
-      lastSkipMessage = msg;
-      log("info", msg); // NOTE: throttled skip log
-    }
-  };
+      stats.skip[reason] = (stats.skip[reason] || 0) + 1;
+      lastSkipDetail = msg;
+      log("info", msg);
+    };
 
-  const bumpPriority = (pf: number) =>
-    Math.min(PF_HOT_CAP_SOL, +(pf + PF_BASE_SOL * 0.75).toFixed(6)); // NOTE: hot cap guard
+    const bumpPriority = (pf: number) =>
+      Math.min(PF_MAX_SOL, +(pf + PF_BASE_SOL * 0.75).toFixed(6));
 
     const reportStats = (trigger: "idle" | "interval") => {
       const now = Date.now();
@@ -618,38 +480,24 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     deferredSell = { dueAt: now + delay, amountTok: Math.max(0, amountTok) };
   }
 
-      async function refreshOnChainBalances() {
-        if (refreshBusy) {
-          try {
-            await refreshPromise;
-          } catch {}
-          return;
-        }
-        refreshBusy = true;
-        refreshPromise = (async () => {
-          try {
-            const kp = ctx.keypair();
-            const lam = await connection.getBalance(kp.publicKey, "processed");
-            const sol = lam / LAMPORTS_PER_SOL;
-            const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
-            const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
-            bot.solBalance = sol;
-            bot.tokenBalance = tok;
-            pushUpdate({ solBalance: sol, tokenBalance: tok });
-          } catch {}
-        })(); // cursor: idle balance refresh
-        try {
-          await refreshPromise;
-        } catch {}
-        refreshBusy = false;
-        refreshPromise = null;
-      }
+  async function refreshOnChainBalances() {
+    try {
+      const kp = ctx.keypair();
+      const lam = await connection.getBalance(kp.publicKey, "processed");
+      const sol = lam / LAMPORTS_PER_SOL;
+      const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
+      const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
+      bot.solBalance = sol;
+      bot.tokenBalance = tok;
+      pushUpdate({ solBalance: sol, tokenBalance: tok });
+    } catch {}
+  }
 
   async function trade(
-      side: "buy" | "sell",
-      sizeSol: number,
-      opts?: { sellTokens?: number; priorityFeeFloor?: number },
-    ): Promise<boolean> {
+    side: "buy" | "sell",
+    sizeSol: number,
+    opts?: { sellTokens?: number },
+  ): Promise<boolean> {
     const execMin = EXEC_MIN_SOL;
     // риски из стора
     let risk = {
@@ -702,21 +550,16 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       return Math.max(EXEC_MIN_SOL, +(base * jitter).toFixed(6));
     };
 
-      const kp = ctx.keypair();
-      const decimals = ctx.tokenDecimals();
-      sizeSol = Number.isFinite(sizeSol) ? +Math.max(0, sizeSol).toFixed(6) : 0; // cursor: execMin guard
-      if (side === "sell" && opts?.sellTokens != null) {
-        (opts as any).sellTokens = roundTok(
-          Math.max(0, Number(opts.sellTokens) || 0),
-          decimals,
-        );
-      }
+    const kp = ctx.keypair();
+    const decimals = ctx.tokenDecimals();
       const priceNow = priceNowSafe();
     const noLossMul =
       1 + Math.max(0, Number(risk.noLossFloorBps) || 0) / 10_000;
 
-      let amountTok: number | undefined =
-        side === "sell" && opts?.sellTokens != null ? opts.sellTokens : undefined;
+    let amountTok: number | undefined =
+      side === "sell" && opts?.sellTokens
+        ? roundTok(opts.sellTokens, decimals)
+        : undefined;
     let minuteRetry = false;
 
     // жёсткий коридор до сборки сделки
@@ -887,54 +730,33 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const short = Math.abs(ctx.changeFast?.(12) || 0);
     const one = Math.abs((ctx.change1m?.() as any) || 0);
     const volScore = Math.max(short, one);
-      let lo = MIN_SLP_BPS,
-        hi = MAX_SLP_BPS;
-      if (volScore < 0.002) {
-        lo = 30;
-        hi = 60;
-      } else if (volScore < 0.006) {
-        lo = 50;
-        hi = 90;
-      } else {
-        lo = 80;
-        hi = 120;
-      }
-      const rawBps = Number((ctx as any).slippageBps?.() ?? 50);
-      const fallbackActive = Date.now() < fallbackQuoteUntil;
-      let usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
-      const failTier = Math.min(6, Math.max(0, failStreak));
-      const failBoost =
-        failTier >= 6
-          ? 2.8
-          : failTier >= 5
-            ? 2.3
-            : failTier >= 4
-              ? 1.8
-              : failTier >= 2
-                ? 1.2
-                : 1;
-      let priorityFeeSol =
-        PF_BASE_SOL *
-        failBoost *
-        (volScore > 0.006 ? 1.35 : volScore > 0.003 ? 1.15 : 1.0);
-      if (failTier >= 3) {
-        priorityFeeSol = bumpPriority(priorityFeeSol); // NOTE: prefer pf boost on fail streak
-      }
-      if (fallbackActive) {
-        priorityFeeSol = bumpPriority(priorityFeeSol);
-        usedBps = Math.min(MAX_SLP_BPS, Math.max(MIN_SLP_BPS, usedBps + 12));
-      }
-      priorityFeeSol = Math.min(PF_HOT_CAP_SOL, +priorityFeeSol.toFixed(6));
-        if (opts?.priorityFeeFloor != null) {
-          const floor = Math.max(0, Number(opts.priorityFeeFloor) || 0);
-          if (floor > 0) {
-            priorityFeeSol = Math.min(
-              PF_HOT_CAP_SOL,
-              Math.max(priorityFeeSol, +floor.toFixed(6)),
-            );
-          }
-        }
-      usedBps = Math.max(MIN_SLP_BPS, Math.min(MAX_SLP_BPS, usedBps));
+    let lo = MIN_SLP_BPS,
+      hi = MAX_SLP_BPS;
+    if (volScore < 0.002) {
+      lo = 30;
+      hi = 60;
+    } else if (volScore < 0.006) {
+      lo = 50;
+      hi = 90;
+    } else {
+      lo = 80;
+      hi = 120;
+    }
+    const rawBps = Number((ctx as any).slippageBps?.() ?? 50);
+    const fallbackActive = Date.now() < fallbackQuoteUntil;
+    let usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
+    if (fallbackActive) {
+      usedBps = Math.min(MAX_SLP_BPS, usedBps + 25);
+    }
+    const multByFail = failStreak >= 4 ? 4 : failStreak >= 2 ? 2 : 1;
+    let priorityFeeSol =
+      PF_BASE_SOL *
+      multByFail *
+      (volScore > 0.006 ? 1.35 : volScore > 0.003 ? 1.15 : 1.0);
+    if (fallbackActive) {
+      priorityFeeSol = bumpPriority(priorityFeeSol);
+    }
+    priorityFeeSol = Math.min(PF_MAX_SOL, +priorityFeeSol.toFixed(6));
     lastExecMeta = {
       side,
       pf: priorityFeeSol,
@@ -955,93 +777,74 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     };
 
     // sanity‑check Jupiter на покупку
-      const quoteFn = (ctx as any).getJupiterQuote || getJupiterQuote;
-      if (side === "buy") {
-        const payRawLamports = Math.round(
-          Math.max(execMin, sizeSol || pickStep()) * 1e9,
-        );
-        const fetchBuyQuote = async () =>
-          quoteFn({
+    const quoteFn = (ctx as any).getJupiterQuote || getJupiterQuote;
+    if (side === "buy") {
+        try {
+          const pay = Math.round(Math.max(execMin, sizeSol || pickStep()) * 1e9);
+          const q = await quoteFn({
             inputMint: WSOL,
             outputMint: ctx.mint,
-            amount: payRawLamports,
+            amount: pay,
           });
-        let quote: any;
-        let out = 0;
-        try {
-          quote = await fetchBuyQuote();
-          out = Number(quote?.outAmount || 0) / Math.pow(10, decimals);
-          if (!Number.isFinite(out) || out <= 0) {
+          const fairOut = pay / 1e9 / priceNow;
+          const out = Number(q?.outAmount || 0) / Math.pow(10, decimals);
+          if (!isFinite(out) || out <= 0) {
             recordQuoteFailure();
-            const retryDelay =
-              QUOTE_RETRY_MIN_MS +
-              Math.floor(Math.random() * Math.max(1, QUOTE_RETRY_MAX_MS - QUOTE_RETRY_MIN_MS + 1));
-            await sleep(retryDelay); // NOTE: quote retry jitter
-            quote = await fetchBuyQuote();
-            out = Number(quote?.outAmount || 0) / Math.pow(10, decimals);
-            if (!Number.isFinite(out) || out <= 0) {
+            noteSkip("illiquid", "skip BUY: illiquid route");
+            return false;
+          }
+          const maxImpact = Math.max(
+            0,
+            Math.min(0.2, Number(risk.maxImpact ?? MAX_SINGLE_TRADE_IMPACT)),
+          );
+          const impact = fairOut > 0 ? Math.max(0, 1 - out / fairOut) : 1;
+          if (fairOut > 0 && impact > maxImpact) {
+            noteSkip(
+              "impact",
+              `skip BUY: impact ${(impact * 100).toFixed(1)}% > ${(maxImpact * 100).toFixed(1)}%`,
+            );
+            return false;
+          }
+
+          const RT_SAMPLE = Math.min(
+            1,
+            Math.max(0, Number((import.meta as any).env?.VITE_RT_SAMPLE ?? 0.33)),
+          );
+          if (!fallbackActive && out > 0 && Math.random() < RT_SAMPLE) {
+            try {
+              const backRaw = Math.max(
+                1,
+                Math.round(out * Math.pow(10, decimals)),
+              );
+              const qb = await quoteFn({
+                inputMint: ctx.mint,
+                outputMint: WSOL,
+                amount: backRaw,
+              });
+              const backSol = Number(qb?.outAmount || 0) / 1e9;
+              const lossPct = Math.max(
+                0,
+                1 - backSol / Math.max(1e-12, pay / 1e9),
+              );
+              const maxRt = Math.max(
+                0,
+                Number((risk as any).maxRoundtripLoss ?? MAX_ROUNDTRIP_LOSS),
+              );
+              if (isFinite(lossPct) && lossPct > maxRt) {
+                noteSkip(
+                  "roundtrip",
+                  `skip BUY: roundtrip ${(lossPct * 100).toFixed(1)}% > ${(maxRt * 100).toFixed(1)}%`,
+                );
+                return false;
+              }
+            } catch (e) {
               recordQuoteFailure();
-              noteSkip("illiquid", "skip BUY: quote returned 0");
-              return false;
             }
           }
         } catch (e) {
           recordQuoteFailure();
-          noteSkip("illiquid", "skip BUY: quote failed");
-          return false;
         }
-        const fairOut = payRawLamports / 1e9 / priceNow;
-        const maxImpact = Math.max(
-          0,
-          Math.min(0.2, Number(risk.maxImpact ?? MAX_SINGLE_TRADE_IMPACT)),
-        );
-        const impact = fairOut > 0 ? Math.max(0, 1 - out / fairOut) : 1;
-        if (fairOut > 0 && impact > maxImpact) {
-          noteSkip(
-            "impact",
-            `skip BUY: impact ${(impact * 100).toFixed(1)}% > ${(maxImpact * 100).toFixed(
-              1,
-            )}% size=${(payRawLamports / 1e9).toFixed(6)} SOL`,
-          );
-          return false;
-        }
-
-        const RT_SAMPLE = Math.min(
-          1,
-          Math.max(0, Number((import.meta as any).env?.VITE_RT_SAMPLE ?? 0.33)),
-        );
-        if (!fallbackActive && out > 0 && Math.random() < RT_SAMPLE) {
-          try {
-            const backRaw = Math.max(
-              1,
-              Math.round(out * Math.pow(10, decimals)),
-            );
-            const qb = await quoteFn({
-              inputMint: ctx.mint,
-              outputMint: WSOL,
-              amount: backRaw,
-            });
-            const backSol = Number(qb?.outAmount || 0) / 1e9;
-            const lossPct = Math.max(
-              0,
-              1 - backSol / Math.max(1e-12, payRawLamports / 1e9),
-            );
-            const maxRt = Math.max(
-              0,
-              Number((risk as any).maxRoundtripLoss ?? MAX_ROUNDTRIP_LOSS),
-            );
-            if (Number.isFinite(lossPct) && lossPct > maxRt) {
-              noteSkip(
-                "roundtrip",
-                `skip BUY: roundtrip ${(lossPct * 100).toFixed(1)}% > ${(maxRt * 100).toFixed(1)}%`,
-              );
-              return false;
-            }
-          } catch (e) {
-            recordQuoteFailure();
-          }
-        }
-      }
+    }
 
     // разбиение на срезы
     const caps = capsForStrategy(bot.strategy as InternalStrategy);
@@ -1084,9 +887,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     // EPS для коридора
     const EPS = 0.0015;
 
-      for (let si = 0; si < slices; si++) {
-        let plannedRemainingSol = remainingSol;
-        let plannedRemainingTok = remainingTok;
+    for (let si = 0; si < slices; si++) {
       // формируем amount для текущего среза + re-eval коридора
       let pl: any;
       if (side === "buy") {
@@ -1106,18 +907,15 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           break;
         }
 
-          let pay = Math.min(maxBuyPerSlice, remainingSol, maxBuyValLoc);
+        let pay = Math.min(maxBuyPerSlice, remainingSol, maxBuyValLoc);
         if (pay < execMin) break;
-          plannedRemainingSol = Math.max(
-            0,
-            +(remainingSol - pay).toFixed(6),
-          );
         pl = {
           ...payloadBase,
           action: "buy",
           denominatedInSol: "true",
           amount: +pay.toFixed(6),
         };
+        remainingSol = Math.max(0, +(remainingSol - pay).toFixed(6));
 
         // при высокой волатильности ужимаем размер следующего среза
         const volScoreNow = Math.max(
@@ -1203,11 +1001,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           return roundTok(Math.max(0, cap), decimals);
         })();
 
-          if (qty <= 0) break;
-          plannedRemainingTok = Math.max(
-            0,
-            roundTok(remainingTok - qty, decimals),
-          );
+        if (qty <= 0) break;
 
         // no‑loss фильтр: обычные продажи ниже avg запрещаем (кроме маленьких служебных)
         if (
@@ -1233,96 +1027,64 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
 
         // проверка импакта по текущему срезу с попыткой ужать qty
-            try {
-              const rawQ = Math.max(1, Math.round(qty * Math.pow(10, decimals)));
-              const fetchSellQuote = async () =>
-                quoteFn({
+          try {
+            const rawQ = Math.max(1, Math.round(qty * Math.pow(10, decimals)));
+            const q = await quoteFn({
+              inputMint: ctx.mint,
+              outputMint: WSOL,
+              amount: rawQ,
+            });
+            const outSol = Number(q?.outAmount || 0) / 1e9;
+            if (!isFinite(outSol) || outSol <= 0) {
+              recordQuoteFailure();
+              noteSkip("illiquid", "skip SELL: illiquid route");
+              break;
+            }
+            const fair = qty * pnow;
+            const thr = Math.max(
+              0,
+              Math.min(0.2, Number(risk.maxImpact ?? MAX_SINGLE_TRADE_IMPACT)),
+            );
+            let impact = fair > 0 ? Math.max(0, 1 - outSol / fair) : 0;
+
+            if (impact > thr) {
+              // одно «сжатие», затем второе — если всё ещё >thr, выходим
+              const sh1 = roundTok(qty * 0.55, decimals);
+              if (sh1 > 0 && sh1 < qty) {
+                qty = sh1;
+                // перезапрос для новой qty
+                const raw2 = Math.max(
+                  1,
+                  Math.round(qty * Math.pow(10, decimals)),
+                );
+                const q2 = await quoteFn({
                   inputMint: ctx.mint,
                   outputMint: WSOL,
-                  amount: rawQ,
+                  amount: raw2,
                 });
-              let qSell = await fetchSellQuote();
-              let outSol = Number(qSell?.outAmount || 0) / 1e9;
-              if (!Number.isFinite(outSol) || outSol <= 0) {
-                recordQuoteFailure();
-                const retryDelay =
-                  QUOTE_RETRY_MIN_MS +
-                  Math.floor(Math.random() * Math.max(1, QUOTE_RETRY_MAX_MS - QUOTE_RETRY_MIN_MS + 1));
-                await sleep(retryDelay); // NOTE: sell quote retry
-                qSell = await fetchSellQuote();
-                outSol = Number(qSell?.outAmount || 0) / 1e9;
-                if (!Number.isFinite(outSol) || outSol <= 0) {
-                  recordQuoteFailure();
-                  noteSkip("illiquid", "skip SELL slice: quote returned 0");
-                  remainingTok = Math.max(
-                    0,
-                    roundTok(remainingTok - qty, decimals),
-                  );
-                  continue;
-                }
-              }
-              const fair = qty * pnow;
-              const thr = Math.max(
-                0,
-                Math.min(0.2, Number(risk.maxImpact ?? MAX_SINGLE_TRADE_IMPACT)),
-              );
-              let impact = fair > 0 ? Math.max(0, 1 - outSol / fair) : 0;
-
-              if (impact > thr) {
-                const sh1 = roundTok(qty * 0.55, decimals);
-                if (sh1 > 0 && sh1 < qty) {
-                  log(
-                    "info",
-                    `sell impact ${(impact * 100).toFixed(1)}% > ${(thr * 100).toFixed(
-                      1,
-                    )}% → reduce ${roundTok(qty, decimals)}→${sh1}`,
-                  );
-                  qty = sh1;
-                  const raw2 = Math.max(
-                    1,
-                    Math.round(qty * Math.pow(10, decimals)),
-                  );
-                  const q2 = await quoteFn({
-                    inputMint: ctx.mint,
-                    outputMint: WSOL,
-                    amount: raw2,
-                  });
-                  const out2 = Number(q2?.outAmount || 0) / 1e9;
-                  const imp2 =
-                    qty * pnow > 0 ? Math.max(0, 1 - out2 / (qty * pnow)) : 0;
-                  if (imp2 > thr) {
-                    noteSkip(
-                      "impact",
-                      `skip SELL slice: impact ${(imp2 * 100).toFixed(1)}% > ${(thr * 100).toFixed(
-                        1,
-                      )}% qty=${roundTok(qty, decimals)}`,
-                    );
-                    remainingTok = Math.max(
-                      0,
-                      roundTok(remainingTok - qty, decimals),
-                    );
-                    continue;
-                  }
-                } else {
+                const out2 = Number(q2?.outAmount || 0) / 1e9;
+                const imp2 =
+                  qty * pnow > 0 ? Math.max(0, 1 - out2 / (qty * pnow)) : 0;
+                if (imp2 > thr) {
                   noteSkip(
                     "impact",
-                    `skip SELL slice: impact ${(impact * 100).toFixed(1)}% > ${(thr * 100).toFixed(
-                      1,
-                    )}% qty=${roundTok(qty, decimals)}`,
+                    `skip SELL: impact ${(imp2 * 100).toFixed(1)}% > ${(thr * 100).toFixed(1)}%`,
                   );
-                  remainingTok = Math.max(
-                    0,
-                    roundTok(remainingTok - qty, decimals),
-                  );
-                  continue;
+                  break;
                 }
+              } else {
+                noteSkip(
+                  "impact",
+                  `skip SELL: impact ${(impact * 100).toFixed(1)}% > ${(thr * 100).toFixed(1)}%`,
+                );
+                break;
               }
-            } catch {
-              recordQuoteFailure();
-              noteSkip("illiquid", "skip SELL slice: quote failed");
-              remainingTok = Math.max(0, roundTok(remainingTok - qty, decimals));
-              continue;
             }
+          } catch {
+            recordQuoteFailure();
+            noteSkip("illiquid", "skip SELL: quote fetch failed");
+            break;
+          }
 
         const now2 = Date.now();
         if (now2 - minWindowStart >= 60_000) {
@@ -1342,6 +1104,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           denominatedInSol: "false",
           amount: qty,
         };
+        remainingTok = Math.max(0, remainingTok - qty);
       }
 
       // отправка
@@ -1366,14 +1129,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       executedSlices++;
       if (pl.action === "buy") {
         executedSol += pl.amount;
-         remainingSol = plannedRemainingSol;
           localPosToken += pl.amount / Math.max(1e-12, priceNowSafe());
         localSol = Math.max(0, localSol - pl.amount - FEE_EST_SOL);
         buysThisMin++;
         notionalThisMin = +(notionalThisMin + pl.amount).toFixed(6);
       } else {
         executedTok += pl.amount;
-         remainingTok = plannedRemainingTok;
         localPosToken = Math.max(0, localPosToken - pl.amount);
           localSol += Math.max(
             0,
@@ -1382,20 +1143,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         sellsThisMin++;
       }
 
-        if (
-          si < slices - 1 &&
-          (pl.action === "buy" ? remainingSol > 0 : remainingTok > 0)
-        ) {
-          if (volScore > 0.006) {
-            const microDelay =
-              MICRO_SLICE_JITTER_MS_MIN +
-              (MICRO_SLICE_JITTER_SPAN > 0
-                ? Math.floor(
-                    Math.random() * Math.max(1, MICRO_SLICE_JITTER_SPAN + 1),
-                  )
-                : 0);
-            if (microDelay > 0) await sleep(microDelay); // NOTE: micro slice jitter
-          }
+      if (
+        si < slices - 1 &&
+        (pl.action === "buy" ? remainingSol > 0 : remainingTok > 0)
+      ) {
         const gmin = Math.max(120, risk.minSliceGapMs || 600);
         const gmax = Math.max(gmin + 50, risk.maxSliceGapMs || 1800);
         const gap = gmin + Math.floor(Math.random() * (gmax - gmin));
@@ -1421,49 +1172,45 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     // локальная фиксация состояний (только по исполненному!)
     const pnow = priceNowSafe();
-        if (side === "buy") {
-        const qty = executedSol / pnow;
-        const newPos = bot.posToken + qty;
-        bot.avgSol =
-          newPos > 0 ? (bot.avgSol * bot.posToken + executedSol) / newPos : pnow;
-        bot.posToken = newPos;
-        bot.solBalance = Math.max(
-          0,
-          (bot.solBalance ?? 0) - executedSol - FEE_EST_SOL * executedSlices,
-        );
-        bot.tokenBalance = bot.posToken;
+    if (side === "buy") {
+      const qty = executedSol / pnow;
+      const newPos = bot.posToken + qty;
+      bot.avgSol =
+        newPos > 0 ? (bot.avgSol * bot.posToken + executedSol) / newPos : pnow;
+      bot.posToken = newPos;
+      bot.solBalance = Math.max(
+        0,
+        (bot.solBalance ?? 0) - executedSol - FEE_EST_SOL * executedSlices,
+      );
+      bot.tokenBalance = bot.posToken;
 
-        buysInRow++;
-        sellsInRow = 0;
-        lastBuyTs = Date.now();
-        lastBuyAtPrice = pnow;
-        lastBuyAtTs = Date.now();
-        if (trailHighPrice <= 0 || pnow > trailHighPrice) trailHighPrice = pnow;
-          tpTriggered.clear();
-          lastTpBase = bot.avgSol > 0 ? bot.avgSol : pnow; // NOTE: re-arm TP ladder after buy
-      } else {
-        const sellQty =
-          executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
-        bot.realized = safeAdd(
-          bot.realized || 0,
-          safeMultiply((pnow || 0) - (bot.avgSol || pnow || 0), sellQty || 0),
-        );
-        bot.posToken = Math.max(0, bot.posToken - sellQty);
-        bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
-        bot.solBalance = Math.max(
-          0,
-          (bot.solBalance ?? 0) +
-            Math.max(0, sellQty * pnow - FEE_EST_SOL * executedSlices),
-        );
-        bot.tokenBalance = bot.posToken;
+      buysInRow++;
+      sellsInRow = 0;
+      lastBuyTs = Date.now();
+      lastBuyAtPrice = pnow;
+      lastBuyAtTs = Date.now();
+      if (trailHighPrice <= 0 || pnow > trailHighPrice) trailHighPrice = pnow;
+    } else {
+      const sellQty =
+        executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
+      bot.realized = safeAdd(
+        bot.realized || 0,
+        safeMultiply((pnow || 0) - (bot.avgSol || pnow || 0), sellQty || 0),
+      );
+      bot.posToken = Math.max(0, bot.posToken - sellQty);
+      bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
+      bot.solBalance = Math.max(
+        0,
+        (bot.solBalance ?? 0) +
+          Math.max(0, sellQty * pnow - FEE_EST_SOL * executedSlices),
+      );
+      bot.tokenBalance = bot.posToken;
 
-        sellsInRow++;
-        buysInRow = 0;
-        lastSellTs = Date.now();
-          if (bot.posToken <= 0) tpTriggered.clear();
-        if (bot.posToken <= 0) trailHighPrice = 0;
-          lastTpBase = bot.avgSol > 0 ? bot.avgSol : pnow;
-      }
+      sellsInRow++;
+      buysInRow = 0;
+      lastSellTs = Date.now();
+      if (bot.posToken <= 0) trailHighPrice = 0;
+    }
 
       bot.unrealized = safeMultiply(
       bot.posToken || 0,
@@ -1474,7 +1221,6 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       side === "buy"
         ? `buy ${executedSol.toFixed(6)} SOL @ slp=${usedBps.toFixed(0)}bps`
         : `sell ${roundTok(executedTok, decimals)} TOK @ slp=${usedBps.toFixed(0)}bps`;
-      lastTradeAt = Date.now();
 
     pushUpdate({
       last: bot.last,
@@ -1499,11 +1245,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       clearQuoteFailures();
       fallbackQuoteUntil = 0;
       reportStats("interval");
-      const execMsg =
-        side === "buy"
-          ? `BUY ${executedSol.toFixed(6)} SOL @ ${usedBps.toFixed(0)}bps (slices=${executedSlices})`
-          : `SELL ${roundTok(executedTok, decimals)} TOK @ ${usedBps.toFixed(0)}bps (slices=${executedSlices})`;
-      log("ok", execMsg); // NOTE: concise exec log
+    log("ok", `${side.toUpperCase()} executed (slices ${executedSlices})`);
 
     // on-chain refresh + мягкий refresh всего стора
     await refreshOnChainBalances();
@@ -1633,39 +1375,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
   async function loop() {
     if (stopped || !bot.running || ctx.abortSignal?.aborted) return;
-    const now = Date.now();
-
-    if (now - minWindowStart >= 60_000) {
-      minWindowStart = now;
-      buysThisMin = 0;
-      sellsThisMin = 0;
-      notionalThisMin = 0;
-    }
-
-    if (
-      lastTradeAt > 0 &&
-      now - lastTradeAt >= NOTIONAL_IDLE_DECAY_INTERVAL_MS &&
-      notionalThisMin > 0
-    ) {
-      notionalThisMin = Math.max(
-        0,
-        +(notionalThisMin - NOTIONAL_IDLE_DECAY_STEP).toFixed(6),
-      );
-    }
-
-    if (
-      failStreak > 0 &&
-      lastNetErrAt > 0 &&
-      now - lastNetErrAt >= FAIL_STREAK_DECAY_MS &&
-      now - lastFailDecayAt >= FAIL_STREAK_DECAY_MS
-    ) {
-      failStreak = Math.max(0, failStreak - 1);
-      lastFailDecayAt = now;
-      if (failStreak === 0) nextRetryAt = 0;
-    }
-
     if (pending) return;
 
+    const now = Date.now();
     if (now < nextRetryAt) {
       setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
@@ -1916,83 +1628,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-          // стратегии pump → pullback → pump
-          let did = false;
-          let tpFired = false;
-          if (tpLevels.length && bot.posToken > 0 && bot.avgSol > 0) {
-            const baseAvg = bot.avgSol;
-            const relGain = (p - baseAvg) / Math.max(1e-9, baseAvg);
-            const smallestTrigger =
-              tpLevels.reduce((m, lvl) => Math.min(m, lvl.pct), Infinity) || 0.05;
-            if (
-              Math.abs(baseAvg - lastTpBase) / Math.max(1e-9, baseAvg) > 0.012 ||
-              relGain < smallestTrigger * 0.25
-            ) {
-              tpTriggered.clear();
-              lastTpBase = baseAvg;
-            }
-            for (const lvl of tpLevels) {
-              if (relGain >= lvl.pct && !tpTriggered.has(lvl.key)) {
-                const qty = roundTok(
-                  Math.max(0, bot.posToken * lvl.sell),
-                  ctx.tokenDecimals(),
-                );
-                if (qty > 0) {
-                  const sold = await trade("sell", 0, { sellTokens: qty });
-                  if (sold) {
-                    tpTriggered.add(lvl.key);
-                    lastPartialSellAt = Date.now();
-                    tpFired = true;
-                    did = true;
-                    log(
-                      "info",
-                      `tp sell ${lvl.key} ${((lvl.pct || 0) * 100).toFixed(2)}% qty=${qty}`,
-                    ); // NOTE: TP ladder event
-                  }
-                }
-                break;
-              }
-            }
-          }
-          if (tpFired) {
-            pending = false;
-            const jitter = 200 + Math.floor(Math.random() * 300);
-            return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-          }
-          if (
-            !tpFired &&
-            bot.posToken > 0 &&
-            trailHighPrice > 0 &&
-            TRAIL_SELL > 0
-          ) {
-            const draw = (p - trailHighPrice) / Math.max(1e-9, trailHighPrice);
-            if (
-              draw <= TRAIL_DD &&
-              Date.now() - lastTrailSellAt > 2_500
-            ) {
-              const qty = roundTok(
-                Math.max(0, bot.posToken * Math.min(0.5, TRAIL_SELL)),
-                ctx.tokenDecimals(),
-              );
-              if (qty > 0) {
-                const sold = await trade("sell", 0, { sellTokens: qty });
-                if (sold) {
-                  lastTrailSellAt = Date.now();
-                  lastPartialSellAt = lastTrailSellAt;
-                  tpFired = true;
-                  did = true;
-                  log(
-                    "info",
-                    `trail sell ${((TRAIL_DD || 0) * 100).toFixed(2)}% qty=${qty}`,
-                  ); // NOTE: trailing protection
-                  pending = false;
-                  const jitter = 200 + Math.floor(Math.random() * 300);
-                  return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-                }
-              }
-            }
-          }
-        const strat = bot.strategy as InternalStrategy;
+      // стратегии pump → pullback → pump
+      let did = false;
+      const strat = bot.strategy as InternalStrategy;
 
       switch (strat) {
         case "trend": {
@@ -2343,100 +1981,54 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-        if (!did) {
-          // универсальное бритьё позиции для сглаживания
-          if (bot.posToken > 0) {
-            const sinceSell = Date.now() - (lastSellTs || 0);
-            const shaveCooldown = Math.max(7000, bot.speedMs * 2);
-            const sinceShave = Date.now() - lastShaveAt;
-            const sincePartial = Date.now() - lastPartialSellAt;
-            if (
-              !tpFired &&
-              (buysInRow >= 2 || sinceSell > shaveCooldown) &&
-              sinceShave > shaveCooldown &&
-              sincePartial > shaveCooldown
-            ) {
-              const shave = roundTok(
-                Math.max(
-                  bot.posToken * 0.05,
-                  bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04,
-                ),
-                ctx.tokenDecimals(),
-              );
-              if (shave > 0) {
-                const sold = await trade("sell", 0, { sellTokens: shave });
-                if (sold) {
-                  lastShaveAt = Date.now();
-                  pending = false;
-                  const jitter = 200 + Math.floor(Math.random() * 300);
-                  return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-                }
+      if (!did) {
+        // универсальное бритьё позиции для сглаживания
+        if (bot.posToken > 0) {
+          const sinceSell = Date.now() - (lastSellTs || 0);
+          if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
+            const shave = roundTok(
+              Math.max(
+                bot.posToken * 0.05,
+                bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04,
+              ),
+              ctx.tokenDecimals(),
+            );
+            if (shave > 0) {
+              const sold = await trade("sell", 0, { sellTokens: shave });
+              if (sold) {
+                pending = false;
+                const jitter = 200 + Math.floor(Math.random() * 300);
+                return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
               }
             }
           }
-          const idleNow = Date.now();
+        }
+        const idleNow = Date.now();
           if (idleNow - lastIdleBalanceRefreshAt >= IDLE_BAL_REFRESH_MS) {
             try {
-              await refreshOnChainBalances(); // cursor: idle balance refresh
+              await refreshOnChainBalances();
               ctx.setLightRefresh?.();
               ctx.afterTrade?.("idle");
               reportStats("idle");
             } catch {}
             lastIdleBalanceRefreshAt = Date.now();
           }
-          bot.last = "hold";
-          bot.unrealized = safeMultiply(
-            bot.posToken || 0,
-            (p || 0) - (bot.avgSol || p || 0),
-          );
-          pushUpdate({
-            last: bot.last,
-            unrealized: bot.unrealized,
-            fills: bot.fills,
-          });
-
-            const probeNow = Date.now();
-            const sinceTrade =
-              lastTradeAt > 0 ? probeNow - lastTradeAt : Number.POSITIVE_INFINITY;
-            const sinceProbe = probeNow - lastProbeAttemptAt;
-            const solBalance = bot.solBalance ?? 0;
-            const allocNearMax = allocTok >= MAX_ALLOC - 0.002;
-            const lossCooling = lossCooldownUntil > 0 && probeNow < lossCooldownUntil;
-            if (
-              sinceTrade >= PROBE_IDLE_MS &&
-              sinceProbe >= PROBE_IDLE_MS &&
-              !lossCooling &&
-              probeNow >= cooldownUntil &&
-              !allocNearMax &&
-              solBalance > reserve + PROBE_SOL_FIXED + FEE_EST_SOL
-            ) {
-              lastProbeAttemptAt = probeNow;
-              if (probeNow - lastProbeLogAt >= PROBE_LOG_THROTTLE_MS) {
-                log(
-                  "info",
-                  `keep-alive probe: BUY ${PROBE_SOL_FIXED.toFixed(
-                    6,
-                  )} SOL @ pf≥${PROBE_PRIORITY_FLOOR_SOL.toFixed(6)}`,
-                );
-                lastProbeLogAt = probeNow;
-              }
-              const probeOk = await trade("buy", PROBE_SOL_FIXED, {
-                priorityFeeFloor: PROBE_PRIORITY_FLOOR_SOL,
-              });
-              if (probeOk) {
-                pending = false;
-                const jitter = 200 + Math.floor(Math.random() * 300);
-                return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-              }
-            }
-        }
-      } catch (e: any) {
-        const errNow = Date.now();
-        lastNetErrAt = errNow;
-        failStreak++;
-        ctx.onFailStreak?.(failStreak);
-        const cool = Math.min(MAX_NET_BACKOFF_MS, 1000 * failStreak);
-        nextRetryAt = errNow + cool;
+        bot.last = "hold";
+        bot.unrealized = safeMultiply(
+          bot.posToken || 0,
+          (p || 0) - (bot.avgSol || p || 0),
+        );
+        pushUpdate({
+          last: bot.last,
+          unrealized: bot.unrealized,
+          fills: bot.fills,
+        });
+      }
+    } catch (e: any) {
+      failStreak++;
+      ctx.onFailStreak?.(failStreak);
+      const cool = Math.min(20_000, 1000 * failStreak);
+      nextRetryAt = Date.now() + cool;
       bot.lastError = e?.message || String(e);
       pushUpdate({ lastError: bot.lastError });
       const nextPf = bumpPriority(lastExecMeta.pf);
