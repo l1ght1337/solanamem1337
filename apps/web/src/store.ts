@@ -81,8 +81,17 @@ const START_MICRO_JITTER_MS_MAX = Math.max(
 
 const runnerFaults = new Map<string, number>();
 const manualStops = new Set<string>();
+const runnerBeats = new Map<string, number>();
 let runnerWatchdog: ReturnType<typeof setInterval> | null = null;
-const RUNNER_WATCHDOG_MS = 12_000;
+const BOT_WATCHDOG_SEC = Math.max(
+  15,
+  Number((import.meta as any).env?.VITE_BOT_WATCHDOG_SEC ?? 45),
+);
+const BOT_WATCHDOG_MS = BOT_WATCHDOG_SEC * 1_000;
+const RUNNER_WATCHDOG_MS = Math.max(
+  15_000,
+  Math.min(20_000, Math.floor(BOT_WATCHDOG_MS / 2)),
+);
 const RUNNER_FAIL_WINDOW_MS = 30_000;
 
 export type BotStrategy =
@@ -656,10 +665,10 @@ export type Store = {
   lightRefresh?: LightRefresh;
 
   /** Central bot scheduler for stability */
-  scheduler: Map<
-    string,
-    { running: boolean; abort: AbortController; stopFn?: () => void }
-  >;
+    scheduler: Map<
+      string,
+      { running: boolean; abort: AbortController; stopFn?: () => void }
+    >;
   isStartingAll: boolean;
 
   /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
@@ -1446,7 +1455,7 @@ export const useStore = create<Store>()(
           async startBot(id, connection, opts) {
             ensureRunnerWatchdog();
             const state = get();
-            const bot = state.bots.find((b) => b.id === id);
+              let bot = state.bots.find((b) => b.id === id);
             if (!bot || !state.tokenMint) return;
 
             // Validate user inputs early
@@ -1495,6 +1504,16 @@ export const useStore = create<Store>()(
                   await get().topUpBot(connection, bot.id);
                 } catch {}
                 await get().refreshBalances(connection);
+                  const refreshed = get().bots.find((b) => b.id === id);
+                  if (!refreshed || refreshed.solBalance < state.minFeeSol) {
+                    state.addLog(
+                      "warn",
+                      `Бот ${bot.name} НЕ запущен: auto top-up не дал >= ${state.minFeeSol} SOL`,
+                    );
+                    manualStops.add(id);
+                    return;
+                  }
+                  bot = refreshed;
               } else {
                 state.addLog(
                   "warn",
@@ -1511,6 +1530,15 @@ export const useStore = create<Store>()(
               manualStops.add(id);
               return;
             }
+
+              const abort = new AbortController();
+
+              set((curr) => {
+                const scheduler = new Map(curr.scheduler);
+                scheduler.set(id, { running: false, abort });
+                return { scheduler };
+              });
+              runnerBeats.set(id, Date.now());
 
             let refreshKickTimer: ReturnType<typeof setTimeout> | null = null;
             let refreshKickDue = 0;
@@ -1530,14 +1558,6 @@ export const useStore = create<Store>()(
                   .catch(() => {});
               }, Math.max(0, dueAt - nowMs));
             };
-
-            const abort = new AbortController();
-
-            set((curr) => {
-              const scheduler = new Map(curr.scheduler);
-              scheduler.set(id, { running: false, abort });
-              return { scheduler };
-            });
 
             const staggerSpan = Math.max(
               0,
@@ -1639,10 +1659,11 @@ export const useStore = create<Store>()(
                             },
                       ),
                     })),
-                  afterTrade: (reason?: "trade" | "idle") => {
-                    const lag = reason === "idle" ? 2200 : 800;
-                    scheduleRefresh(lag);
-                  },
+                    afterTrade: (reason?: "trade" | "idle") => {
+                      runnerBeats.set(id, Date.now());
+                      const lag = reason === "idle" ? 2200 : 800;
+                      scheduleRefresh(lag);
+                    },
                   shouldLogStop: () => {
                     const entry = get().scheduler.get(id);
                     return entry ? entry.running !== false : false;
@@ -1661,18 +1682,19 @@ export const useStore = create<Store>()(
                 } as any,
               );
 
-                set((curr) => {
-                  const scheduler = new Map(curr.scheduler);
-                  const entry = scheduler.get(id);
-                  if (entry)
-                    scheduler.set(id, { ...entry, running: true, stopFn: stop });
-                  const bots = curr.bots.map((b) =>
-                    b.id === id
-                      ? { ...b, running: true, lastError: undefined }
-                      : b,
-                  );
-                  return { bots, scheduler };
-                });
+                  set((curr) => {
+                    const scheduler = new Map(curr.scheduler);
+                    const entry = scheduler.get(id);
+                    if (entry)
+                      scheduler.set(id, { ...entry, running: true, stopFn: stop });
+                    const bots = curr.bots.map((b) =>
+                      b.id === id
+                        ? { ...b, running: true, lastError: undefined }
+                        : b,
+                    );
+                    return { bots, scheduler };
+                  });
+                  runnerBeats.set(id, Date.now());
                 bot.running = true;
                 bot.lastError = undefined;
                 scheduleRefresh(800); // NOTE: soft refresh after boot
@@ -1709,6 +1731,7 @@ export const useStore = create<Store>()(
           stopBot: (id) => {
             manualStops.add(id);
             runnerFaults.delete(id);
+              runnerBeats.delete(id);
             const entry = get().scheduler.get(id);
             if (entry) {
               try {
@@ -1773,12 +1796,14 @@ export const useStore = create<Store>()(
                   )}, wsProvider=${wsProvider}`,
                 );
                 const launches = state.bots.map((botRec) => {
-                  const delay =
-                    START_STAGGER_MS_MIN +
-                    Math.floor(Math.random() * Math.max(1, staggerSpan + 1));
+                    const delay =
+                      START_STAGGER_MS_MIN +
+                      Math.floor(Math.random() * Math.max(1, staggerSpan + 1));
+                    const micro = 5 + Math.floor(Math.random() * 21);
+                    const totalDelay = delay + micro;
                   state.addLog(
                     "info",
-                    `startAll: ${botRec.name} in ${delay}ms`, // cursor: micro-stagger
+                      `startAll: ${botRec.name} in ${totalDelay}ms`, // cursor: micro-stagger
                   );
                   return new Promise<void>((resolve) => {
                     setTimeout(() => {
@@ -1791,7 +1816,7 @@ export const useStore = create<Store>()(
                           ),
                         )
                         .finally(resolve);
-                    }, delay);
+                      }, totalDelay);
                   });
                 });
                 await Promise.allSettled(launches);
@@ -3095,6 +3120,7 @@ export const useStore = create<Store>()(
             if (!alreadyHydrated) {
               manualStops.clear();
               runnerFaults.clear();
+                runnerBeats.clear();
               set((curr) => ({
                 __hydrated: true,
                 scheduler: new Map(),
@@ -3184,50 +3210,74 @@ export const useStore = create<Store>()(
 function ensureRunnerWatchdog() {
   if (typeof window === "undefined") return;
   if (runnerWatchdog) return;
-    runnerWatchdog = setInterval(() => {
+  runnerWatchdog = setInterval(() => {
     const state = useStore.getState();
     const now = Date.now();
     const conn = (window as any).__conn as Connection | undefined;
-      state.bots.forEach((bot) => {
-        if (!bot.running) return;
-        if (manualStops.has(bot.id)) return;
-        const entry = state.scheduler.get(bot.id);
-        if (entry && !entry.abort.signal.aborted) return;
-        const last = runnerFaults.get(bot.id) || 0;
-        if (now - last < RUNNER_FAIL_WINDOW_MS / 2) return;
-        runnerFaults.set(bot.id, now);
-      });
-    runnerFaults.forEach((flagAt, botId) => {
-      if (now - flagAt > RUNNER_FAIL_WINDOW_MS) {
-        runnerFaults.delete(botId);
-        return;
-      }
-      if (manualStops.has(botId)) return;
-      const bot = state.bots.find((b) => b.id === botId);
-      if (!bot) {
-        runnerFaults.delete(botId);
-        manualStops.delete(botId);
-        return;
-      }
-      const entry = state.scheduler.get(botId);
-      if (entry?.running) return;
-      if (bot.running) return;
+    const restarts: Array<{ id: string; name: string }> = [];
+
+    state.bots.forEach((bot) => {
+      if (!bot.running) return;
+      if (manualStops.has(bot.id)) return;
+      const entry = state.scheduler.get(bot.id);
+      if (!entry) return;
+
+      const aborted = entry.abort?.signal?.aborted ?? false;
+      const beatAt = runnerBeats.get(bot.id) || 0;
+      const heartbeatStale =
+        entry.running && beatAt > 0 && now - beatAt > BOT_WATCHDOG_MS;
+
+      if (!aborted && !heartbeatStale) return;
+
+      const throttleWindow = aborted
+        ? RUNNER_FAIL_WINDOW_MS / 2
+        : BOT_WATCHDOG_MS / 2;
+      const flaggedAt = runnerFaults.get(bot.id) || 0;
+      if (flaggedAt && now - flaggedAt < throttleWindow) return;
+
+      runnerFaults.set(bot.id, now);
       if (!conn) return;
-      runnerFaults.set(botId, now);
-      setTimeout(() => {
-        if (manualStops.has(botId)) return;
-        useStore
-          .getState()
-            .startBot(botId, conn, { skipPreDelay: true })
-          .catch((e: any) =>
-            useStore
-              .getState()
-              .addLog(
-                "warn",
-                `watchdog restart ${bot.name || botId}: ${e?.message || e}`,
-              ),
-          );
-      }, 120 + Math.floor(Math.random() * 420));
+      state.addLog(
+        "warn",
+        `watchdog: restarting ${bot.name} (${aborted ? "stopped" : "idle"} ${(Math.max(0, Math.floor((now - beatAt) / 1000))) || 0}s)`,
+      );
+      restarts.push({ id: bot.id, name: bot.name });
     });
+
+    restarts.forEach(({ id, name }) => {
+      const stopDelay = 50 + Math.floor(Math.random() * 201);
+      setTimeout(() => {
+        const latestState = useStore.getState();
+        if (manualStops.has(id)) return;
+        latestState.stopBot(id);
+        manualStops.delete(id);
+        const restartConn = (window as any).__conn as Connection | undefined;
+        if (!restartConn) return;
+        const startDelay = 50 + Math.floor(Math.random() * 201);
+        setTimeout(() => {
+          if (manualStops.has(id)) return;
+          useStore
+            .getState()
+            .startBot(id, restartConn, { skipPreDelay: true })
+            .catch((e: any) =>
+              useStore
+                .getState()
+                .addLog(
+                  "warn",
+                  `watchdog restart ${name || id}: ${e?.message || e}`,
+                ),
+            );
+        }, startDelay);
+      }, stopDelay);
+    });
+
+    const expiry = Math.max(RUNNER_FAIL_WINDOW_MS, BOT_WATCHDOG_MS);
+      runnerFaults.forEach((flagAt, botId) => {
+        const botExists = state.bots.some((b) => b.id === botId);
+        if (!botExists || now - flagAt > expiry) {
+          runnerFaults.delete(botId);
+          if (!botExists) runnerBeats.delete(botId);
+        }
+      });
   }, RUNNER_WATCHDOG_MS);
 }
