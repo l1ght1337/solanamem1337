@@ -3112,6 +3112,8 @@ export const useStore = create<Store>()(
           maxSellSliceTokPct: 0.06, // ↑ один sell‑срез
           minSliceGapMs: 500,
           maxSliceGapMs: 1400,
+            noLossFloorBps: 22,
+            maxRoundtripLoss: 0.007,
         }),
       }) as Store,
     {
