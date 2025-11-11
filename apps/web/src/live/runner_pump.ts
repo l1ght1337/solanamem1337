@@ -226,11 +226,53 @@ const MIN_KEEP_SOL = 0.0006;
 const EXEC_MIN_SOL = Math.max(
   0.00002,
   Number((import.meta as any).env?.VITE_TRADE_EXEC_MIN_SOL ?? 0.00005),
-);
+); // cursor: execMin guard
 const IDLE_BAL_REFRESH_MS = Math.max(
   10_000,
   Number((import.meta as any).env?.VITE_BOT_IDLE_REFRESH_MS ?? 45_000),
 );
+const SELL_LADDER_BANDS_DEFAULT = [5, 10, 15, 20];
+const SELL_LADDER_PCTS_DEFAULT = [6, 8, 10, 12];
+
+function parseEnvNumberList(
+  raw: string | undefined,
+  fallback: number[],
+  bounds: { min: number; max: number },
+) {
+  if (!raw) return fallback.slice();
+  const out = raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n));
+  if (!out.length) return fallback.slice();
+  return out
+    .map((n) =>
+      Math.max(bounds.min, Math.min(bounds.max, Number.isFinite(n) ? n : bounds.min)),
+    )
+    .filter((n, idx, arr) => arr.indexOf(n) === idx)
+    .sort((a, b) => a - b);
+}
+
+const SELL_LADDER_BANDS = parseEnvNumberList(
+  String((import.meta as any).env?.VITE_SELL_LADDER_BANDS ?? ""),
+  SELL_LADDER_BANDS_DEFAULT,
+  { min: 1, max: 200 },
+);
+const SELL_LADDER_PCTS = parseEnvNumberList(
+  String((import.meta as any).env?.VITE_SELL_LADDER_PCTS ?? ""),
+  SELL_LADDER_PCTS_DEFAULT,
+  { min: 1, max: 50 },
+);
+const SELL_LADDER_PRESET = SELL_LADDER_BANDS.map((band, idx) => {
+  const pctArr = SELL_LADDER_PCTS.length
+    ? SELL_LADDER_PCTS
+    : SELL_LADDER_PCTS_DEFAULT;
+  const pctRaw =
+    pctArr[Math.min(idx, pctArr.length - 1)] ??
+    SELL_LADDER_PCTS_DEFAULT[Math.min(idx, SELL_LADDER_PCTS_DEFAULT.length - 1)] ??
+    SELL_LADDER_PCTS_DEFAULT[SELL_LADDER_PCTS_DEFAULT.length - 1];
+  return { band, pct: Math.max(0.01, Math.min(0.5, pctRaw / 100)) };
+}); // cursor: ladder sell
 
 let TARGET_ALLOC = 0.7;
 let MAX_ALLOC = 0.85;
@@ -327,6 +369,11 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
   let deferredSell: { dueAt: number; amountTok: number } | null = null;
   let lastIdleBalanceRefreshAt = Date.now();
+    const sellBandsHit = new Set<number>(); // cursor: ladder sell
+    let ladderBandBase = bot.avgSol > 0 ? bot.avgSol : 0; // cursor: ladder sell
+    let lastLadderSellAt = 0; // cursor: ladder sell
+    let lastShaveAt = 0;
+    let refreshInFlight: Promise<void> | null = null; // cursor: idle balance refresh
     const priceHist: number[] = [];
     const stats = {
       since: Date.now(),
@@ -480,18 +527,30 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     deferredSell = { dueAt: now + delay, amountTok: Math.max(0, amountTok) };
   }
 
-  async function refreshOnChainBalances() {
-    try {
-      const kp = ctx.keypair();
-      const lam = await connection.getBalance(kp.publicKey, "processed");
-      const sol = lam / LAMPORTS_PER_SOL;
-      const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
-      const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
-      bot.solBalance = sol;
-      bot.tokenBalance = tok;
-      pushUpdate({ solBalance: sol, tokenBalance: tok });
-    } catch {}
-  }
+    async function refreshOnChainBalances() {
+      if (refreshInFlight) {
+        try {
+          await refreshInFlight;
+        } catch {}
+        return;
+      }
+      refreshInFlight = (async () => {
+        try {
+          const kp = ctx.keypair();
+          const lam = await connection.getBalance(kp.publicKey, "processed");
+          const sol = lam / LAMPORTS_PER_SOL;
+          const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
+          const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
+          bot.solBalance = sol;
+          bot.tokenBalance = tok;
+          pushUpdate({ solBalance: sol, tokenBalance: tok });
+        } catch {}
+      })(); // cursor: idle balance refresh
+      try {
+        await refreshInFlight;
+      } catch {}
+      refreshInFlight = null;
+    }
 
   async function trade(
     side: "buy" | "sell",
@@ -550,16 +609,21 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       return Math.max(EXEC_MIN_SOL, +(base * jitter).toFixed(6));
     };
 
-    const kp = ctx.keypair();
-    const decimals = ctx.tokenDecimals();
+      const kp = ctx.keypair();
+      const decimals = ctx.tokenDecimals();
+      sizeSol = Number.isFinite(sizeSol) ? +Math.max(0, sizeSol).toFixed(6) : 0; // cursor: execMin guard
+      if (side === "sell" && opts?.sellTokens != null) {
+        (opts as any).sellTokens = roundTok(
+          Math.max(0, Number(opts.sellTokens) || 0),
+          decimals,
+        );
+      }
       const priceNow = priceNowSafe();
     const noLossMul =
       1 + Math.max(0, Number(risk.noLossFloorBps) || 0) / 10_000;
 
-    let amountTok: number | undefined =
-      side === "sell" && opts?.sellTokens
-        ? roundTok(opts.sellTokens, decimals)
-        : undefined;
+      let amountTok: number | undefined =
+        side === "sell" && opts?.sellTokens != null ? opts.sellTokens : undefined;
     let minuteRetry = false;
 
     // жёсткий коридор до сборки сделки
@@ -744,19 +808,38 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     }
     const rawBps = Number((ctx as any).slippageBps?.() ?? 50);
     const fallbackActive = Date.now() < fallbackQuoteUntil;
-    let usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
-    if (fallbackActive) {
-      usedBps = Math.min(MAX_SLP_BPS, usedBps + 25);
-    }
-    const multByFail = failStreak >= 4 ? 4 : failStreak >= 2 ? 2 : 1;
-    let priorityFeeSol =
-      PF_BASE_SOL *
-      multByFail *
-      (volScore > 0.006 ? 1.35 : volScore > 0.003 ? 1.15 : 1.0);
-    if (fallbackActive) {
-      priorityFeeSol = bumpPriority(priorityFeeSol);
-    }
-    priorityFeeSol = Math.min(PF_MAX_SOL, +priorityFeeSol.toFixed(6));
+      let usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
+      const failTier = Math.min(6, Math.max(0, failStreak));
+      const failBoost =
+        failTier >= 6
+          ? 2.8
+          : failTier >= 5
+            ? 2.3
+            : failTier >= 4
+              ? 1.8
+              : failTier >= 3
+                ? 1.45
+                : failTier >= 2
+                  ? 1.2
+                  : 1;
+      let priorityFeeSol =
+        PF_BASE_SOL *
+        failBoost *
+        (volScore > 0.006 ? 1.35 : volScore > 0.003 ? 1.15 : 1.0);
+      if (fallbackActive || failTier >= 4) {
+        priorityFeeSol = bumpPriority(priorityFeeSol);
+      }
+      priorityFeeSol = Math.min(PF_MAX_SOL, +priorityFeeSol.toFixed(6));
+      const pfAtCap = priorityFeeSol >= PF_MAX_SOL * 0.98;
+      if (fallbackActive && !pfAtCap) {
+        priorityFeeSol = Math.min(PF_MAX_SOL, bumpPriority(priorityFeeSol));
+      }
+      if (fallbackActive) {
+        usedBps = Math.min(MAX_SLP_BPS, usedBps + 15);
+      }
+      if (pfAtCap && failTier >= 4) {
+        usedBps = Math.min(MAX_SLP_BPS, usedBps + 8);
+      }
     lastExecMeta = {
       side,
       pf: priorityFeeSol,
@@ -786,7 +869,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             outputMint: ctx.mint,
             amount: pay,
           });
-          const fairOut = pay / 1e9 / priceNow;
+            const fairOut = pay / 1e9 / priceNow;
           const out = Number(q?.outAmount || 0) / Math.pow(10, decimals);
           if (!isFinite(out) || out <= 0) {
             recordQuoteFailure();
@@ -798,10 +881,12 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             Math.min(0.2, Number(risk.maxImpact ?? MAX_SINGLE_TRADE_IMPACT)),
           );
           const impact = fairOut > 0 ? Math.max(0, 1 - out / fairOut) : 1;
-          if (fairOut > 0 && impact > maxImpact) {
+            if (fairOut > 0 && impact > maxImpact) {
             noteSkip(
               "impact",
-              `skip BUY: impact ${(impact * 100).toFixed(1)}% > ${(maxImpact * 100).toFixed(1)}%`,
+                `skip BUY: impact ${(impact * 100).toFixed(1)}% > ${(maxImpact * 100).toFixed(
+                  1,
+                )}% size=${(pay / 1e9).toFixed(6)} SOL`,
             );
             return false;
           }
@@ -1047,10 +1132,16 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             );
             let impact = fair > 0 ? Math.max(0, 1 - outSol / fair) : 0;
 
-            if (impact > thr) {
+              if (impact > thr) {
               // одно «сжатие», затем второе — если всё ещё >thr, выходим
               const sh1 = roundTok(qty * 0.55, decimals);
               if (sh1 > 0 && sh1 < qty) {
+                  log(
+                    "info",
+                    `sell impact ${(impact * 100).toFixed(1)}% > ${(thr * 100).toFixed(
+                      1,
+                    )}% → reduce ${roundTok(qty, decimals)}→${sh1}`,
+                  );
                 qty = sh1;
                 // перезапрос для новой qty
                 const raw2 = Math.max(
@@ -1065,17 +1156,21 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                 const out2 = Number(q2?.outAmount || 0) / 1e9;
                 const imp2 =
                   qty * pnow > 0 ? Math.max(0, 1 - out2 / (qty * pnow)) : 0;
-                if (imp2 > thr) {
+                  if (imp2 > thr) {
                   noteSkip(
                     "impact",
-                    `skip SELL: impact ${(imp2 * 100).toFixed(1)}% > ${(thr * 100).toFixed(1)}%`,
+                      `skip SELL: impact ${(imp2 * 100).toFixed(1)}% > ${(thr * 100).toFixed(
+                        1,
+                      )}% qty=${roundTok(qty, decimals)}`,
                   );
                   break;
                 }
               } else {
                 noteSkip(
                   "impact",
-                  `skip SELL: impact ${(impact * 100).toFixed(1)}% > ${(thr * 100).toFixed(1)}%`,
+                    `skip SELL: impact ${(impact * 100).toFixed(1)}% > ${(thr * 100).toFixed(
+                      1,
+                    )}% qty=${roundTok(qty, decimals)}`,
                 );
                 break;
               }
@@ -1172,45 +1267,51 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
     // локальная фиксация состояний (только по исполненному!)
     const pnow = priceNowSafe();
-    if (side === "buy") {
-      const qty = executedSol / pnow;
-      const newPos = bot.posToken + qty;
-      bot.avgSol =
-        newPos > 0 ? (bot.avgSol * bot.posToken + executedSol) / newPos : pnow;
-      bot.posToken = newPos;
-      bot.solBalance = Math.max(
-        0,
-        (bot.solBalance ?? 0) - executedSol - FEE_EST_SOL * executedSlices,
-      );
-      bot.tokenBalance = bot.posToken;
+      if (side === "buy") {
+        const qty = executedSol / pnow;
+        const newPos = bot.posToken + qty;
+        bot.avgSol =
+          newPos > 0 ? (bot.avgSol * bot.posToken + executedSol) / newPos : pnow;
+        bot.posToken = newPos;
+        bot.solBalance = Math.max(
+          0,
+          (bot.solBalance ?? 0) - executedSol - FEE_EST_SOL * executedSlices,
+        );
+        bot.tokenBalance = bot.posToken;
 
-      buysInRow++;
-      sellsInRow = 0;
-      lastBuyTs = Date.now();
-      lastBuyAtPrice = pnow;
-      lastBuyAtTs = Date.now();
-      if (trailHighPrice <= 0 || pnow > trailHighPrice) trailHighPrice = pnow;
-    } else {
-      const sellQty =
-        executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
-      bot.realized = safeAdd(
-        bot.realized || 0,
-        safeMultiply((pnow || 0) - (bot.avgSol || pnow || 0), sellQty || 0),
-      );
-      bot.posToken = Math.max(0, bot.posToken - sellQty);
-      bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
-      bot.solBalance = Math.max(
-        0,
-        (bot.solBalance ?? 0) +
-          Math.max(0, sellQty * pnow - FEE_EST_SOL * executedSlices),
-      );
-      bot.tokenBalance = bot.posToken;
+        buysInRow++;
+        sellsInRow = 0;
+        lastBuyTs = Date.now();
+        lastBuyAtPrice = pnow;
+        lastBuyAtTs = Date.now();
+        if (trailHighPrice <= 0 || pnow > trailHighPrice) trailHighPrice = pnow;
+        ladderBandBase = bot.avgSol > 0 ? bot.avgSol : pnow;
+        sellBandsHit.clear();
+      } else {
+        const sellQty =
+          executedTok > 0 ? executedTok : (amountTok ?? bot.posToken);
+        bot.realized = safeAdd(
+          bot.realized || 0,
+          safeMultiply((pnow || 0) - (bot.avgSol || pnow || 0), sellQty || 0),
+        );
+        bot.posToken = Math.max(0, bot.posToken - sellQty);
+        bot.avgSol = bot.posToken > 0 ? bot.avgSol : 0;
+        bot.solBalance = Math.max(
+          0,
+          (bot.solBalance ?? 0) +
+            Math.max(0, sellQty * pnow - FEE_EST_SOL * executedSlices),
+        );
+        bot.tokenBalance = bot.posToken;
 
-      sellsInRow++;
-      buysInRow = 0;
-      lastSellTs = Date.now();
-      if (bot.posToken <= 0) trailHighPrice = 0;
-    }
+        sellsInRow++;
+        buysInRow = 0;
+        lastSellTs = Date.now();
+        if (bot.posToken <= 0) {
+          ladderBandBase = 0;
+          sellBandsHit.clear();
+        }
+        if (bot.posToken <= 0) trailHighPrice = 0;
+      }
 
       bot.unrealized = safeMultiply(
       bot.posToken || 0,
@@ -1628,9 +1729,58 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      // стратегии pump → pullback → pump
-      let did = false;
-      const strat = bot.strategy as InternalStrategy;
+        // стратегии pump → pullback → pump
+        let did = false;
+        let ladderTriggered = false;
+        if (SELL_LADDER_PRESET.length && bot.posToken > 0) {
+          const baseCandidate =
+            ladderBandBase > 0 && Number.isFinite(ladderBandBase)
+              ? ladderBandBase
+              : bot.avgSol > 0
+                ? bot.avgSol
+                : p;
+          if (baseCandidate > 0) {
+            if (p <= baseCandidate * 0.97) {
+              ladderBandBase = bot.avgSol > 0 ? bot.avgSol : p;
+              sellBandsHit.clear();
+            } else if (!ladderBandBase || !Number.isFinite(ladderBandBase)) {
+              ladderBandBase = baseCandidate;
+            }
+            const baseRef = ladderBandBase || baseCandidate;
+            if (baseRef > 0) {
+              const r = (p - baseRef) / baseRef;
+              for (const entry of SELL_LADDER_PRESET) {
+                if (ladderTriggered) break;
+                if (r * 100 >= entry.band && !sellBandsHit.has(entry.band)) {
+                  const qty = roundTok(
+                    Math.max(0, bot.posToken * entry.pct),
+                    ctx.tokenDecimals(),
+                  );
+                  if (qty > 0) {
+                    const sold = await trade("sell", 0, { sellTokens: qty });
+                    if (sold) {
+                      sellBandsHit.add(entry.band);
+                      lastLadderSellAt = Date.now();
+                      ladderBandBase = baseRef;
+                      did = true;
+                      ladderTriggered = true;
+                      log(
+                        "info",
+                        `ladder sell band=${entry.band}% qty=${qty}`,
+                      ); // cursor: ladder sell
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (ladderTriggered) {
+          pending = false;
+          const jitter = 200 + Math.floor(Math.random() * 300);
+          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+        }
+        const strat = bot.strategy as InternalStrategy;
 
       switch (strat) {
         case "trend": {
@@ -1981,49 +2131,58 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         }
       }
 
-      if (!did) {
-        // универсальное бритьё позиции для сглаживания
-        if (bot.posToken > 0) {
-          const sinceSell = Date.now() - (lastSellTs || 0);
-          if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
-            const shave = roundTok(
-              Math.max(
-                bot.posToken * 0.05,
-                bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04,
-              ),
-              ctx.tokenDecimals(),
-            );
-            if (shave > 0) {
-              const sold = await trade("sell", 0, { sellTokens: shave });
-              if (sold) {
-                pending = false;
-                const jitter = 200 + Math.floor(Math.random() * 300);
-                return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+        if (!did) {
+          // универсальное бритьё позиции для сглаживания
+          if (bot.posToken > 0) {
+            const sinceSell = Date.now() - (lastSellTs || 0);
+            const shaveCooldown = Math.max(7000, bot.speedMs * 2);
+            const sinceShave = Date.now() - lastShaveAt;
+            const sinceLadder = Date.now() - lastLadderSellAt;
+            if (
+              !ladderTriggered &&
+              (buysInRow >= 2 || sinceSell > shaveCooldown) &&
+              sinceShave > shaveCooldown &&
+              sinceLadder > shaveCooldown
+            ) {
+              const shave = roundTok(
+                Math.max(
+                  bot.posToken * 0.05,
+                  bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04,
+                ),
+                ctx.tokenDecimals(),
+              );
+              if (shave > 0) {
+                const sold = await trade("sell", 0, { sellTokens: shave });
+                if (sold) {
+                  lastShaveAt = Date.now();
+                  pending = false;
+                  const jitter = 200 + Math.floor(Math.random() * 300);
+                  return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+                }
               }
             }
           }
-        }
-        const idleNow = Date.now();
+          const idleNow = Date.now();
           if (idleNow - lastIdleBalanceRefreshAt >= IDLE_BAL_REFRESH_MS) {
             try {
-              await refreshOnChainBalances();
+              await refreshOnChainBalances(); // cursor: idle balance refresh
               ctx.setLightRefresh?.();
               ctx.afterTrade?.("idle");
               reportStats("idle");
             } catch {}
             lastIdleBalanceRefreshAt = Date.now();
           }
-        bot.last = "hold";
-        bot.unrealized = safeMultiply(
-          bot.posToken || 0,
-          (p || 0) - (bot.avgSol || p || 0),
-        );
-        pushUpdate({
-          last: bot.last,
-          unrealized: bot.unrealized,
-          fills: bot.fills,
-        });
-      }
+          bot.last = "hold";
+          bot.unrealized = safeMultiply(
+            bot.posToken || 0,
+            (p || 0) - (bot.avgSol || p || 0),
+          );
+          pushUpdate({
+            last: bot.last,
+            unrealized: bot.unrealized,
+            fills: bot.fills,
+          });
+        }
     } catch (e: any) {
       failStreak++;
       ctx.onFailStreak?.(failStreak);
