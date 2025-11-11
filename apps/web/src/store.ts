@@ -70,6 +70,14 @@ const START_STAGGER_MS_MAX = Math.max(
   START_STAGGER_MS_MIN,
   Number((import.meta as any).env?.VITE_BOT_START_STAGGER_MS_MAX ?? 120),
 ); // cursor: micro-stagger
+const START_MICRO_JITTER_MS_MIN = Math.max(
+  0,
+  Number((import.meta as any).env?.VITE_BOT_MICRO_JITTER_MS_MIN ?? 50),
+);
+const START_MICRO_JITTER_MS_MAX = Math.max(
+  START_MICRO_JITTER_MS_MIN,
+  Number((import.meta as any).env?.VITE_BOT_MICRO_JITTER_MS_MAX ?? 250),
+); // NOTE: per-bot micro jitter
 
 const runnerFaults = new Map<string, number>();
 const manualStops = new Set<string>();
@@ -981,6 +989,7 @@ export const useStore = create<Store>()(
         drainMinKeepSol: 0.01,
         drainDelayMs: 30_000,
 
+        _lastTopUp: {}, // NOTE: top-up dedupe cache
         _ppSub: undefined as any,
         setTokenUrl: (u) => {
           const mint = parsePumpMint(u) || b58(u);
@@ -1451,8 +1460,15 @@ export const useStore = create<Store>()(
             }
 
             // Prevent duplicate runners
-              const existing = state.scheduler.get(id);
-              if (existing) {
+            const existing = state.scheduler.get(id);
+            if (existing) {
+              if (existing.abort?.signal?.aborted) {
+                set((curr) => {
+                  const scheduler = new Map(curr.scheduler);
+                  scheduler.delete(id);
+                  return { scheduler };
+                });
+              } else {
                 state.addLog(
                   "info",
                   existing.running
@@ -1461,6 +1477,7 @@ export const useStore = create<Store>()(
                 );
                 return;
               }
+            }
 
             manualStops.delete(id);
             runnerFaults.delete(id);
@@ -1514,30 +1531,57 @@ export const useStore = create<Store>()(
               }, Math.max(0, dueAt - nowMs));
             };
 
-              const abort = new AbortController();
+            const abort = new AbortController();
 
+            set((curr) => {
+              const scheduler = new Map(curr.scheduler);
+              scheduler.set(id, { running: false, abort });
+              return { scheduler };
+            });
+
+            const staggerSpan = Math.max(
+              0,
+              START_STAGGER_MS_MAX - START_STAGGER_MS_MIN,
+            );
+            const delay = opts?.skipPreDelay
+              ? 0
+              : START_STAGGER_MS_MIN +
+                Math.floor(Math.random() * Math.max(1, staggerSpan + 1));
+            if (delay > 0)
+              await new Promise((resolve) => setTimeout(resolve, delay));
+
+            if (abort.signal.aborted) {
               set((curr) => {
                 const scheduler = new Map(curr.scheduler);
-                scheduler.set(id, { running: false, abort });
+                scheduler.delete(id);
                 return { scheduler };
               });
+              manualStops.add(id);
+              return;
+            }
 
-              const staggerSpan = Math.max(0, START_STAGGER_MS_MAX - START_STAGGER_MS_MIN);
-              const delay = opts?.skipPreDelay
-                ? 0
-                : START_STAGGER_MS_MIN +
-                  Math.floor(Math.random() * Math.max(1, staggerSpan + 1));
-              if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+            // NOTE: micro jitter to desync bot start bursts
+            const microSpan = Math.max(
+              0,
+              START_MICRO_JITTER_MS_MAX - START_MICRO_JITTER_MS_MIN,
+            );
+            const microDelay =
+              START_MICRO_JITTER_MS_MIN +
+              (microSpan > 0
+                ? Math.floor(Math.random() * Math.max(1, microSpan + 1))
+                : 0);
+            if (microDelay > 0)
+              await new Promise((resolve) => setTimeout(resolve, microDelay));
 
-              if (abort.signal.aborted) {
-                set((curr) => {
-                  const scheduler = new Map(curr.scheduler);
-                  scheduler.delete(id);
-                  return { scheduler };
-                });
-                manualStops.add(id);
-                return;
-              }
+            if (abort.signal.aborted) {
+              set((curr) => {
+                const scheduler = new Map(curr.scheduler);
+                scheduler.delete(id);
+                return { scheduler };
+              });
+              manualStops.add(id);
+              return;
+            }
 
             const runnerLoader =
               get().external.provider === "pumpportal"
@@ -1631,6 +1675,12 @@ export const useStore = create<Store>()(
                 });
                 bot.running = true;
                 bot.lastError = undefined;
+                scheduleRefresh(800); // NOTE: soft refresh after boot
+                const totalDelay = delay + microDelay;
+                state.addLog(
+                  "ok",
+                  `started ${bot.name} (delay ${totalDelay}ms)`,
+                );
             } catch (error: any) {
               set((curr) => {
                 const scheduler = new Map(curr.scheduler);
@@ -1665,6 +1715,7 @@ export const useStore = create<Store>()(
                 entry.abort.abort();
               } catch {}
             }
+              const botName = get().bots.find((b) => b.id === id)?.name || id;
             set((curr) => {
               const scheduler = new Map(curr.scheduler);
               scheduler.delete(id);
@@ -1678,6 +1729,7 @@ export const useStore = create<Store>()(
                 entry.stopFn();
               } catch {}
             }
+              get().addLog("info", `stopped ${botName}`);
           },
 
             startAll: async (connection) => {
@@ -2190,6 +2242,7 @@ export const useStore = create<Store>()(
                 decimals = d ?? 9;
               } catch {
                 decimals = 9;
+                set({ _mintDecimals: 9 });
               }
             }
 
@@ -3002,7 +3055,9 @@ export const useStore = create<Store>()(
         partialize: (s) => ({
           tokenUrl: s.tokenUrl,
           tokenMint: s.tokenMint,
-          bots: s.bots,
+          bots: s.bots.map(
+            ({ running, fills, last, lastError, unrealized, ...rest }) => rest,
+          ), // NOTE: strip runtime bot flags from persistence
           slippageBps: s.slippageBps,
           useRandomSize: s.useRandomSize,
           tradeRange: s.tradeRange,
@@ -3025,8 +3080,17 @@ export const useStore = create<Store>()(
           autoStartJitterMs: s.autoStartJitterMs,
           autoStartAfterReload: s.autoStartAfterReload,
         }),
-        onRehydrateStorage: () => (state: any) => {
+          onRehydrateStorage: () => (state: any) => {
           try {
+              try {
+                const prevSub = useStore.getState()._ppSub;
+                if (prevSub) {
+                  try {
+                    prevSub.detach?.();
+                  } catch {}
+                  set({ _ppSub: undefined });
+                }
+              } catch {}
             const alreadyHydrated = useStore.getState().__hydrated;
             if (!alreadyHydrated) {
               manualStops.clear();
@@ -3040,6 +3104,8 @@ export const useStore = create<Store>()(
                   running: false,
                   fills: 0,
                   lastError: undefined,
+                    last: undefined,
+                    unrealized: 0,
                 })),
               }));
             }
