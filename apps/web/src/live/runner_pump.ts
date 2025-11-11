@@ -245,6 +245,10 @@ const MAX_SLP_BPS = 120;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// endurance: force live
+const FORCE_LIVE =
+  String((import.meta as any).env?.VITE_FORCE_LIVE ?? "0") === "1";
+
 function roundTok(tokens: number, decimals: number) {
   const p = Math.pow(10, Math.min(6, decimals));
   return Math.max(0, Math.floor(tokens * p) / p);
@@ -309,6 +313,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let stopped = false;
   let pending = false;
   let cooldownUntil = 0;
+
+  // endurance: heartbeat
+  const HB_EVERY_MS = Math.max(
+    1500,
+    Number((import.meta as any).env?.VITE_BOT_HEARTBEAT_MS ?? 2000),
+  );
+  let lastHbAt = 0;
 
   // пер‑ботовый backoff при сетевых проблемах
   let failStreak = 0;
@@ -1377,7 +1388,13 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     if (stopped || !bot.running || ctx.abortSignal?.aborted) return;
     if (pending) return;
 
-    const now = Date.now();
+      const now = Date.now();
+      if (now - lastHbAt >= HB_EVERY_MS) {
+        lastHbAt = now;
+        try {
+          ctx.onUpdate({ id: bot.id, hb: now } as any);
+        } catch {}
+      }
     if (now < nextRetryAt) {
       setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
@@ -1387,10 +1404,29 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       return;
     }
 
-    if (lossCooldownUntil && now >= lossCooldownUntil) {
-      log("info", "loss cooldown ended");
-      lossCooldownUntil = 0;
-    }
+      if (lossCooldownUntil && now >= lossCooldownUntil) {
+        log("info", "loss cooldown ended");
+        lossCooldownUntil = 0;
+      }
+
+      const p = priceNowSafe();
+
+      // endurance: cooldown unfreeze on momentum+recovery
+      if (lossCooldownUntil) {
+        let thr = 0.004;
+        try {
+          const rawThr = Number(ctx.getRisk?.().lossThrPct);
+          thr = Math.max(0, Number.isFinite(rawThr) ? rawThr : 0.004);
+        } catch {}
+        if (lastBuyAtPrice && thr > 0) {
+          const recovered = p >= lastBuyAtPrice * (1 - thr / 2);
+          const momentum = Math.abs(ctx.changeFast?.(8) || 0) > 0.005;
+          if (momentum && recovered) {
+            lossCooldownUntil = 0;
+            log("info", "loss cooldown cleared (momentum+recovery)");
+          }
+        }
+      }
 
     // выполнить отложенную маленькую продажу (для комиссий/сглаживания)
     if (deferredSell && now >= deferredSell.dueAt && bot.posToken > 0) {
@@ -1439,15 +1475,14 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           ctx.setLightRefresh?.();
         }
 
-      if (ctx.isAiPaused && ctx.isAiPaused()) {
-        bot.last = "ai:off";
-        pushUpdate({ last: bot.last });
-        pending = false;
-        const jitter = 200 + Math.floor(Math.random() * 300);
-        return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
-      }
+        if (!FORCE_LIVE && ctx.isAiPaused && ctx.isAiPaused()) {
+          bot.last = "ai:off";
+          pushUpdate({ last: bot.last });
+          pending = false;
+          const jitter = 200 + Math.floor(Math.random() * 300);
+          return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+        }
 
-    const p = priceNowSafe();
       priceHist.push(p);
       if (priceHist.length > 120) priceHist.shift();
       const fast = ctx.changeFast?.(12) ?? 0;
