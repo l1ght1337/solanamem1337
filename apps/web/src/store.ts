@@ -62,10 +62,19 @@ const PF_MAX_SOL = Math.max(
 const calcPriorityFeeSol = (mult = 1) =>
   Math.min(PF_MAX_SOL, +(PF_BASE_SOL * Math.max(1, mult)).toFixed(6));
 
+const START_STAGGER_MS_MIN = Math.max(
+  0,
+  Number((import.meta as any).env?.VITE_BOT_START_STAGGER_MS_MIN ?? 20),
+);
+const START_STAGGER_MS_MAX = Math.max(
+  START_STAGGER_MS_MIN,
+  Number((import.meta as any).env?.VITE_BOT_START_STAGGER_MS_MAX ?? 120),
+); // cursor: micro-stagger
+
 const runnerFaults = new Map<string, number>();
 const manualStops = new Set<string>();
 let runnerWatchdog: ReturnType<typeof setInterval> | null = null;
-const RUNNER_WATCHDOG_MS = 5000;
+const RUNNER_WATCHDOG_MS = 12_000;
 const RUNNER_FAIL_WINDOW_MS = 30_000;
 
 export type BotStrategy =
@@ -643,6 +652,7 @@ export type Store = {
     string,
     { running: boolean; abort: AbortController; stopFn?: () => void }
   >;
+  isStartingAll: boolean;
 
   /** быстрые тики за последнюю минуту (для импульса 10–15 сек) */
   ticks: { t: number; p: number }[];
@@ -712,9 +722,13 @@ export type Store = {
   removeBot: (id: string) => void;
   exportBotKey: (id: string) => string | null;
 
-  startBot: (id: string, connection: any) => Promise<void>;
+  startBot: (
+    id: string,
+    connection: any,
+    opts?: { skipPreDelay?: boolean },
+  ) => Promise<void>;
   stopBot: (id: string) => void;
-  startAll: (connection: any) => void;
+  startAll: (connection: any) => Promise<void>;
   stopAll: () => void;
     resumeAllIfWanted: (connection: Connection, opts?: { force?: boolean }) => void;
     autoStartAfterReload: boolean;
@@ -857,6 +871,7 @@ export const useStore = create<Store>()(
           candles: [],
           lightRefresh: { ts: 0 },
           scheduler: new Map(),
+          isStartingAll: false,
 
         ticks: [],
         getChangeFast(sec = 15) {
@@ -1419,7 +1434,7 @@ export const useStore = create<Store>()(
         },
 
           // Запуск/остановка with central scheduler
-          async startBot(id, connection) {
+          async startBot(id, connection, opts) {
             ensureRunnerWatchdog();
             const state = get();
             const bot = state.bots.find((b) => b.id === id);
@@ -1436,19 +1451,16 @@ export const useStore = create<Store>()(
             }
 
             // Prevent duplicate runners
-            const existing = state.scheduler.get(id);
-            if (existing?.running) {
-              state.addLog("info", `Bot ${bot.name} уже активен`);
-              return;
-            }
-            if (existing) {
-              try {
-                existing.abort.abort();
-              } catch {}
-              try {
-                existing.stopFn?.();
-              } catch {}
-            }
+              const existing = state.scheduler.get(id);
+              if (existing) {
+                state.addLog(
+                  "info",
+                  existing.running
+                    ? `Bot ${bot.name} уже активен`
+                    : `Bot ${bot.name} уже запускается`,
+                );
+                return;
+              }
 
             manualStops.delete(id);
             runnerFaults.delete(id);
@@ -1502,24 +1514,30 @@ export const useStore = create<Store>()(
               }, Math.max(0, dueAt - nowMs));
             };
 
-            const abort = new AbortController();
-            bot.running = true;
-            bot.lastError = undefined;
+              const abort = new AbortController();
 
-            set((curr) => {
-              const scheduler = new Map(curr.scheduler);
-              scheduler.set(id, { running: true, abort });
-              const bots = curr.bots.map((b) =>
-                b.id === id
-                  ? { ...b, running: true, lastError: undefined }
-                  : b,
-              );
-              return { bots, scheduler };
-            });
+              set((curr) => {
+                const scheduler = new Map(curr.scheduler);
+                scheduler.set(id, { running: false, abort });
+                return { scheduler };
+              });
 
-            // slight stagger to de-sync network bursts
-            const delay = Math.floor(Math.random() * 400);
-            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+              const staggerSpan = Math.max(0, START_STAGGER_MS_MAX - START_STAGGER_MS_MIN);
+              const delay = opts?.skipPreDelay
+                ? 0
+                : START_STAGGER_MS_MIN +
+                  Math.floor(Math.random() * Math.max(1, staggerSpan + 1));
+              if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+
+              if (abort.signal.aborted) {
+                set((curr) => {
+                  const scheduler = new Map(curr.scheduler);
+                  scheduler.delete(id);
+                  return { scheduler };
+                });
+                manualStops.add(id);
+                return;
+              }
 
             const runnerLoader =
               get().external.provider === "pumpportal"
@@ -1599,12 +1617,20 @@ export const useStore = create<Store>()(
                 } as any,
               );
 
-              set((curr) => {
-                const scheduler = new Map(curr.scheduler);
-                const entry = scheduler.get(id);
-                if (entry) scheduler.set(id, { ...entry, stopFn: stop });
-                return { scheduler };
-              });
+                set((curr) => {
+                  const scheduler = new Map(curr.scheduler);
+                  const entry = scheduler.get(id);
+                  if (entry)
+                    scheduler.set(id, { ...entry, running: true, stopFn: stop });
+                  const bots = curr.bots.map((b) =>
+                    b.id === id
+                      ? { ...b, running: true, lastError: undefined }
+                      : b,
+                  );
+                  return { bots, scheduler };
+                });
+                bot.running = true;
+                bot.lastError = undefined;
             } catch (error: any) {
               set((curr) => {
                 const scheduler = new Map(curr.scheduler);
@@ -1620,6 +1646,7 @@ export const useStore = create<Store>()(
                 );
                 return { bots, scheduler };
               });
+                bot.running = false;
               manualStops.add(id);
               runnerFaults.set(id, Date.now());
               state.addLog(
@@ -1653,49 +1680,83 @@ export const useStore = create<Store>()(
             }
           },
 
-          startAll: async (connection) => {
-            const s = get();
-            if (!connection) return;
-            set({ autoStartAfterReload: true });
-            try {
-              s.addLog(
-                "info",
-                "startAll: pre-refresh (tickReal + refreshBalances)...",
+            startAll: async (connection) => {
+              const state = get();
+              if (!connection) return;
+              if (get().isStartingAll) {
+                state.addLog("info", "startAll: already in progress, skip"); // cursor: startAll idempotent
+                return;
+              }
+              if (state.bots.some((b) => b.running)) {
+                state.addLog("info", "startAll: bots already running, skip"); // cursor: startAll idempotent
+                return;
+              }
+              if (!state.bots.length) {
+                state.addLog("info", "startAll: нет ботов для запуска");
+                return;
+              }
+              set({ autoStartAfterReload: true, isStartingAll: true });
+              const staggerSpan = Math.max(
+                0,
+                START_STAGGER_MS_MAX - START_STAGGER_MS_MIN,
               );
-              await s.tickReal();
-              await s.refreshBalances(connection);
-            } catch (e: any) {
-              s.addLog("warn", `startAll pre-refresh: ${e?.message || e}`);
-            }
-            const decimals = s._mintDecimals ?? 9;
-            const price = s.price || 0;
-            const wsProvider = s.external.provider || "none";
-            s.addLog(
-              "info",
-              `startAll: ${s.bots.length} bots scheduled, decimals=${decimals}, price=${price.toFixed(9)}, wsProvider=${wsProvider}`,
-            );
-            for (let i = 0; i < s.bots.length; i++) {
-              const b = s.bots[i];
-              const jitter = Math.floor(Math.random() * 400);
-              setTimeout(() => {
-                get()
-                  .startBot(b.id, connection)
-                  .catch((e: any) =>
-                    get().addLog("err", `startBot ${b.name}: ${e?.message || e}`),
+              try {
+                try {
+                  state.addLog(
+                    "info",
+                    "startAll: pre-refresh (tickReal + refreshBalances)...",
                   );
-              }, jitter);
-            }
-          },
+                  await state.tickReal();
+                  await state.refreshBalances(connection);
+                } catch (e: any) {
+                  state.addLog("warn", `startAll pre-refresh: ${e?.message || e}`);
+                }
+                const decimals = state._mintDecimals ?? 9;
+                const price = state.price || 0;
+                const wsProvider = state.external.provider || "none";
+                state.addLog(
+                  "info",
+                  `startAll: ${state.bots.length} bots scheduled, decimals=${decimals}, price=${price.toFixed(
+                    9,
+                  )}, wsProvider=${wsProvider}`,
+                );
+                const launches = state.bots.map((botRec) => {
+                  const delay =
+                    START_STAGGER_MS_MIN +
+                    Math.floor(Math.random() * Math.max(1, staggerSpan + 1));
+                  state.addLog(
+                    "info",
+                    `startAll: ${botRec.name} in ${delay}ms`, // cursor: micro-stagger
+                  );
+                  return new Promise<void>((resolve) => {
+                    setTimeout(() => {
+                      get()
+                        .startBot(botRec.id, connection, { skipPreDelay: true })
+                        .catch((e: any) =>
+                          get().addLog(
+                            "err",
+                            `startBot ${botRec.name}: ${e?.message || e}`,
+                          ),
+                        )
+                        .finally(resolve);
+                    }, delay);
+                  });
+                });
+                await Promise.allSettled(launches);
+              } finally {
+                set({ isStartingAll: false });
+              }
+            },
           stopAll: () => {
             get().bots.forEach((b) => get().stopBot(b.id));
-            set({ autoStartAfterReload: false });
+              set({ autoStartAfterReload: false, isStartingAll: false });
           },
           resumeAllIfWanted: (connection, opts) => {
             const force = opts?.force ?? false;
             const state = get();
             if (!connection || !state.tokenMint) return;
             if (!force && !state.autoStartAfterReload) return;
-            state.startAll(connection);
+              void state.startAll(connection);
           },
 
         setLightRefresh: () =>
@@ -2973,6 +3034,7 @@ export const useStore = create<Store>()(
               set((curr) => ({
                 __hydrated: true,
                 scheduler: new Map(),
+                isStartingAll: false,
                 bots: curr.bots.map((b) => ({
                   ...b,
                   running: false,
@@ -3056,10 +3118,19 @@ export const useStore = create<Store>()(
 function ensureRunnerWatchdog() {
   if (typeof window === "undefined") return;
   if (runnerWatchdog) return;
-  runnerWatchdog = setInterval(() => {
+    runnerWatchdog = setInterval(() => {
     const state = useStore.getState();
     const now = Date.now();
     const conn = (window as any).__conn as Connection | undefined;
+      state.bots.forEach((bot) => {
+        if (!bot.running) return;
+        if (manualStops.has(bot.id)) return;
+        const entry = state.scheduler.get(bot.id);
+        if (entry && !entry.abort.signal.aborted) return;
+        const last = runnerFaults.get(bot.id) || 0;
+        if (now - last < RUNNER_FAIL_WINDOW_MS / 2) return;
+        runnerFaults.set(bot.id, now);
+      });
     runnerFaults.forEach((flagAt, botId) => {
       if (now - flagAt > RUNNER_FAIL_WINDOW_MS) {
         runnerFaults.delete(botId);
@@ -3081,7 +3152,7 @@ function ensureRunnerWatchdog() {
         if (manualStops.has(botId)) return;
         useStore
           .getState()
-          .startBot(botId, conn)
+            .startBot(botId, conn, { skipPreDelay: true })
           .catch((e: any) =>
             useStore
               .getState()
