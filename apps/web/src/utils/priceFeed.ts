@@ -5,9 +5,12 @@
 import { scheduleFetch } from "./network";
 import { getJupiterQuote, WSOL } from "./jupiter";
 
+type PriceSource = "jupiter" | "dexscreener" | "unavailable";
+
 export async function getTokenPriceSOL(
-  mint: string
-): Promise<{ price: number | null; reason?: string }> {
+  mint: string,
+  signal?: AbortSignal,
+): Promise<{ price: number | null; reason?: string; source?: PriceSource }> {
   try {
     // 1) Jupiter QUOTE: 1 SOL -> TOKEN
     const oneSolLamports = 1_000_000_000;
@@ -23,7 +26,7 @@ export async function getTokenPriceSOL(
       const tokensFor1Sol = out / Math.pow(10, dec);
       if (tokensFor1Sol > 0) {
         const priceInSol = 1 / tokensFor1Sol;
-        return { price: +priceInSol.toFixed(12) };
+          return { price: +priceInSol.toFixed(12), source: "jupiter" };
       }
     }
   } catch {
@@ -34,7 +37,7 @@ export async function getTokenPriceSOL(
   try {
     const r = await scheduleFetch(
       `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`,
-      { timeoutMs: 12_000, tries: 1 } as any,
+        { timeoutMs: 12_000, tries: 1, signal } as any,
       "price"
     );
     if (r?.ok) {
@@ -44,12 +47,12 @@ export async function getTokenPriceSOL(
           j.pairs[0]
         : null;
       const pv = Number(pair?.priceNative || 0); // уже в SOL
-      if (pv > 0) return { price: pv };
+        if (pv > 0) return { price: pv, source: "dexscreener" };
     }
   } catch {
     // ignore
   }
 
-  return { price: null, reason: "unavailable" };
+  return { price: null, reason: "unavailable", source: "unavailable" };
 }
 

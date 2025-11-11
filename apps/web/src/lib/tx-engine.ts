@@ -147,13 +147,24 @@ export function createTxEngine(opts: EngineOpts) {
 
     if (res?.result) return res.result;
     // если Any не дал result – разрулим вручную
-    const pr = await primaryP.catch(()=>null);
+      let pr: any = null;
+      try {
+        pr = await primaryP;
+      } catch {
+        pr = null;
+      }
     if (pr?.result) return pr.result;
-    if (fallbackP) {
-      const fb = await fallbackP.catch(()=>null);
-      if (fb?.result) return fb.result;
-    }
-    const err = pr?.error || (await fallbackP)?.error || { message: 'sendRawTransaction failed' };
+      let fb: any = null;
+      const fallbackSnapshot = fallbackP;
+      if (fallbackSnapshot) {
+        try {
+          fb = await fallbackSnapshot;
+        } catch {
+          fb = null;
+        }
+        if (fb?.result) return fb.result;
+      }
+      const err = pr?.error || fb?.error || { message: 'sendRawTransaction failed' };
     throw new Error(typeof err === 'string' ? err : (err.message || JSON.stringify(err)));
   }
 

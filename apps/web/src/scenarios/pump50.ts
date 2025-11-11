@@ -82,7 +82,7 @@ export async function applyPump50Scenario(connection: any, opts: ScenarioOpts = 
 
   // ── Распределяем роли, скоростя, бюджеты
   const roleMix = opts.scalpersOnly
-    ? Array(botsCount).fill<"scalper">("scalper")
+    ? Array.from({ length: botsCount }, () => "scalper" as const)
     : [
         "scalper","scalper","scalper","scalper","scalper","scalper","scalper","scalper","scalper","scalper",
         "momentum","momentum","momentum","momentum","momentum","momentum","trend","trend","trend","trend",
