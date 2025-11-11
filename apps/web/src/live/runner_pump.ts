@@ -97,6 +97,11 @@ const PUMP_BASES = [
   "https://pumpportal.fun",
 ].filter(Boolean);
 
+const PUMP_BUILD_TIMEOUT_MS = Math.max(
+  3_000,
+  Number((import.meta as any).env?.VITE_PUMP_BUILD_TIMEOUT_MS ?? 12_000),
+);
+
 const PF_BASE_SOL = Math.max(
   0.000006,
   Number((import.meta as any).env?.VITE_PRIORITY_FEE_BASE ?? 0.000008),
@@ -160,7 +165,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
       try {
         const r = await scheduleFetch(
           url,
-          { ...(init as any), timeoutMs: 20_000, tries: 1 },
+            { ...(init as any), timeoutMs: PUMP_BUILD_TIMEOUT_MS, tries: 1 },
           "pump",
         );
         if (r.ok) {
@@ -236,13 +241,28 @@ const IDLE_BAL_REFRESH_MS = Math.max(
   ),
 );
 
+const PROBE_IDLE_SEC = Math.max(
+  6,
+  Number((import.meta as any).env?.VITE_PROBE_IDLE_SEC ?? 18),
+);
+const PROBE_IDLE_MS = PROBE_IDLE_SEC * 1_000;
+const PROBE_SOL = Math.max(
+  EXEC_MIN_SOL,
+  Number((import.meta as any).env?.VITE_PROBE_SOL ?? 0.00006),
+);
+const PROBE_SOL_FIXED = +PROBE_SOL.toFixed(6);
+const NOTIONAL_IDLE_DECAY_STEP = 0.0002;
+const NOTIONAL_IDLE_DECAY_INTERVAL_MS = 3_000;
+const FAIL_STREAK_DECAY_MS = 10_000;
+const PROBE_LOG_THROTTLE_MS = 6_000;
+
 const MICRO_SLICE_JITTER_MS_MIN = Math.max(
   0,
-  Number((import.meta as any).env?.VITE_MICRO_SLICE_JITTER_MS_MIN ?? 20),
+  Number((import.meta as any).env?.VITE_MICRO_SLICE_JITTER_MS_MIN ?? 15),
 );
 const MICRO_SLICE_JITTER_MS_MAX = Math.max(
   MICRO_SLICE_JITTER_MS_MIN,
-  Number((import.meta as any).env?.VITE_MICRO_SLICE_JITTER_MS_MAX ?? 40),
+  Number((import.meta as any).env?.VITE_MICRO_SLICE_JITTER_MS_MAX ?? 35),
 );
 const MICRO_SLICE_JITTER_SPAN =
   MICRO_SLICE_JITTER_MS_MAX - MICRO_SLICE_JITTER_MS_MIN;
@@ -260,6 +280,21 @@ const QUOTE_RETRY_MAX_MS = Math.max(
 const PF_HOT_CAP_SOL = Math.max(
   PF_BASE_SOL,
   Number((import.meta as any).env?.VITE_PF_HOT_CAP ?? PF_MAX_SOL),
+);
+
+const MAX_NET_BACKOFF_MS = Math.max(
+  1_000,
+  Number((import.meta as any).env?.VITE_MAX_NET_BACKOFF_MS ?? 3_000),
+);
+
+const PROBE_PF_MULT = Math.max(
+  1,
+  Number((import.meta as any).env?.VITE_PROBE_PF_MULT ?? 1.2),
+);
+
+const PROBE_PRIORITY_FLOOR_SOL = Math.min(
+  PF_HOT_CAP_SOL,
+  +(PF_BASE_SOL * PROBE_PF_MULT).toFixed(6),
 );
 
 const TP_JITTER = Math.max(
@@ -379,19 +414,22 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
   let cooldownUntil = 0;
 
   // пер‑ботовый backoff при сетевых проблемах
-  let failStreak = 0;
-  let nextRetryAt = 0;
-  let lastWarnTs = 0;
+    let failStreak = 0;
+    let nextRetryAt = 0;
+    let lastWarnTs = 0;
+    let lastNetErrAt = 0;
+    let lastFailDecayAt = 0;
 
   // защита портфеля
   let baselineValue = 0;
 
   // поведение
   let buysInRow = 0;
-  let sellsInRow = 0;
-  let lastBuyTs = 0;
-  let lastSellTs = 0;
-  let trailHighPrice = 0;
+    let sellsInRow = 0;
+    let lastBuyTs = 0;
+    let lastSellTs = 0;
+    let trailHighPrice = 0;
+    let lastTradeAt = 0;
 
     let deferredSell: { dueAt: number; amountTok: number } | null = null;
     let lastIdleBalanceRefreshAt = Date.now();
@@ -446,6 +484,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     const quoteFailures: number[] = [];
     let fallbackQuoteUntil = 0;
     let fallbackNotifiedUntil = 0;
+    let lastProbeAttemptAt = 0;
+    let lastProbeLogAt = 0;
 
     type SkipReasonKey = keyof typeof stats.skip;
     const zeroSkipCounters = () => ({
@@ -606,10 +646,10 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       }
 
   async function trade(
-    side: "buy" | "sell",
-    sizeSol: number,
-    opts?: { sellTokens?: number },
-  ): Promise<boolean> {
+      side: "buy" | "sell",
+      sizeSol: number,
+      opts?: { sellTokens?: number; priorityFeeFloor?: number },
+    ): Promise<boolean> {
     const execMin = EXEC_MIN_SOL;
     // риски из стора
     let risk = {
@@ -885,6 +925,15 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         usedBps = Math.min(MAX_SLP_BPS, Math.max(MIN_SLP_BPS, usedBps + 12));
       }
       priorityFeeSol = Math.min(PF_HOT_CAP_SOL, +priorityFeeSol.toFixed(6));
+        if (opts?.priorityFeeFloor != null) {
+          const floor = Math.max(0, Number(opts.priorityFeeFloor) || 0);
+          if (floor > 0) {
+            priorityFeeSol = Math.min(
+              PF_HOT_CAP_SOL,
+              Math.max(priorityFeeSol, +floor.toFixed(6)),
+            );
+          }
+        }
       usedBps = Math.max(MIN_SLP_BPS, Math.min(MAX_SLP_BPS, usedBps));
     lastExecMeta = {
       side,
@@ -1337,13 +1386,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           si < slices - 1 &&
           (pl.action === "buy" ? remainingSol > 0 : remainingTok > 0)
         ) {
-          if (
-            failStreak === 0 &&
-            Math.max(
-              Math.abs(ctx.changeFast?.(12) || 0),
-              Math.abs(ctx.change1m?.() || 0),
-            ) > 0.006
-          ) {
+          if (volScore > 0.006) {
             const microDelay =
               MICRO_SLICE_JITTER_MS_MIN +
               (MICRO_SLICE_JITTER_SPAN > 0
@@ -1431,6 +1474,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       side === "buy"
         ? `buy ${executedSol.toFixed(6)} SOL @ slp=${usedBps.toFixed(0)}bps`
         : `sell ${roundTok(executedTok, decimals)} TOK @ slp=${usedBps.toFixed(0)}bps`;
+      lastTradeAt = Date.now();
 
     pushUpdate({
       last: bot.last,
@@ -1589,9 +1633,39 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
   async function loop() {
     if (stopped || !bot.running || ctx.abortSignal?.aborted) return;
+    const now = Date.now();
+
+    if (now - minWindowStart >= 60_000) {
+      minWindowStart = now;
+      buysThisMin = 0;
+      sellsThisMin = 0;
+      notionalThisMin = 0;
+    }
+
+    if (
+      lastTradeAt > 0 &&
+      now - lastTradeAt >= NOTIONAL_IDLE_DECAY_INTERVAL_MS &&
+      notionalThisMin > 0
+    ) {
+      notionalThisMin = Math.max(
+        0,
+        +(notionalThisMin - NOTIONAL_IDLE_DECAY_STEP).toFixed(6),
+      );
+    }
+
+    if (
+      failStreak > 0 &&
+      lastNetErrAt > 0 &&
+      now - lastNetErrAt >= FAIL_STREAK_DECAY_MS &&
+      now - lastFailDecayAt >= FAIL_STREAK_DECAY_MS
+    ) {
+      failStreak = Math.max(0, failStreak - 1);
+      lastFailDecayAt = now;
+      if (failStreak === 0) nextRetryAt = 0;
+    }
+
     if (pending) return;
 
-    const now = Date.now();
     if (now < nextRetryAt) {
       setTimeout(loop, Math.max(200, nextRetryAt - now));
       return;
@@ -2320,12 +2394,49 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             unrealized: bot.unrealized,
             fills: bot.fills,
           });
+
+            const probeNow = Date.now();
+            const sinceTrade =
+              lastTradeAt > 0 ? probeNow - lastTradeAt : Number.POSITIVE_INFINITY;
+            const sinceProbe = probeNow - lastProbeAttemptAt;
+            const solBalance = bot.solBalance ?? 0;
+            const allocNearMax = allocTok >= MAX_ALLOC - 0.002;
+            const lossCooling = lossCooldownUntil > 0 && probeNow < lossCooldownUntil;
+            if (
+              sinceTrade >= PROBE_IDLE_MS &&
+              sinceProbe >= PROBE_IDLE_MS &&
+              !lossCooling &&
+              probeNow >= cooldownUntil &&
+              !allocNearMax &&
+              solBalance > reserve + PROBE_SOL_FIXED + FEE_EST_SOL
+            ) {
+              lastProbeAttemptAt = probeNow;
+              if (probeNow - lastProbeLogAt >= PROBE_LOG_THROTTLE_MS) {
+                log(
+                  "info",
+                  `keep-alive probe: BUY ${PROBE_SOL_FIXED.toFixed(
+                    6,
+                  )} SOL @ pf≥${PROBE_PRIORITY_FLOOR_SOL.toFixed(6)}`,
+                );
+                lastProbeLogAt = probeNow;
+              }
+              const probeOk = await trade("buy", PROBE_SOL_FIXED, {
+                priorityFeeFloor: PROBE_PRIORITY_FLOOR_SOL,
+              });
+              if (probeOk) {
+                pending = false;
+                const jitter = 200 + Math.floor(Math.random() * 300);
+                return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+              }
+            }
         }
-    } catch (e: any) {
-      failStreak++;
-      ctx.onFailStreak?.(failStreak);
-      const cool = Math.min(20_000, 1000 * failStreak);
-      nextRetryAt = Date.now() + cool;
+      } catch (e: any) {
+        const errNow = Date.now();
+        lastNetErrAt = errNow;
+        failStreak++;
+        ctx.onFailStreak?.(failStreak);
+        const cool = Math.min(MAX_NET_BACKOFF_MS, 1000 * failStreak);
+        nextRetryAt = errNow + cool;
       bot.lastError = e?.message || String(e);
       pushUpdate({ lastError: bot.lastError });
       const nextPf = bumpPriority(lastExecMeta.pf);
