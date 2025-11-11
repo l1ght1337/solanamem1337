@@ -68,6 +68,22 @@ let runnerWatchdog: ReturnType<typeof setInterval> | null = null;
 const RUNNER_WATCHDOG_MS = 5000;
 const RUNNER_FAIL_WINDOW_MS = 30_000;
 
+// endurance: keepalive watchdog
+const KA_EVERY_MS = Math.max(
+  8000,
+  Number((import.meta as any).env?.VITE_KEEPALIVE_EVERY_MS ?? 12_000),
+);
+const KA_STALE_MS = Math.max(
+  25_000,
+  Number((import.meta as any).env?.VITE_KEEPALIVE_STALE_MS ?? 35_000),
+);
+const KA_BACKOFF_MS = Math.max(
+  60_000,
+  Number((import.meta as any).env?.VITE_KEEPALIVE_BACKOFF_MS ?? 90_000),
+);
+let _kaTimer: ReturnType<typeof setInterval> | null = null;
+const _kaRestartGuard: Record<string, number> = Object.create(null);
+
 export type BotStrategy =
   | "trend"
   | "revert"
@@ -96,6 +112,7 @@ export type LiveBot = {
   fills: number;
   last?: string;
   lastError?: string;
+    hb?: number;
 };
 
 type Log = { ts: string; level: "info" | "ok" | "warn" | "err"; msg: string };
@@ -1419,8 +1436,8 @@ export const useStore = create<Store>()(
         },
 
           // Запуск/остановка with central scheduler
-          async startBot(id, connection) {
-            ensureRunnerWatchdog();
+            async startBot(id, connection) {
+              ensureRunnerWatchdog();
             const state = get();
             const bot = state.bots.find((b) => b.id === id);
             if (!bot || !state.tokenMint) return;
@@ -1552,31 +1569,36 @@ export const useStore = create<Store>()(
                     const r = get().getTradeSize();
                     return r > 0 ? r : bot.budgetSol;
                   },
-                  isAiPaused: () => {
-                    const curr = get().bots.find((x) => x.id === bot.id);
-                    return !curr?.aiEnabled;
-                  },
-                  onLog: (lvl: any, msg: any) =>
-                    get().addLog(lvl as any, String(msg)),
-                  onUpdate: (patch: any) =>
-                    set((st) => ({
-                      bots: st.bots.map((x) =>
-                        x.id !== patch.id
-                          ? x
-                          : {
-                              ...x,
-                              last: patch.last,
-                              lastError: patch.lastError,
-                              fills: patch.fills,
-                              posToken: patch.posToken,
-                              avgSol: patch.avgSol,
-                              realized: patch.realized,
-                              unrealized: patch.unrealized,
-                              solBalance: patch.solBalance ?? x.solBalance,
-                              tokenBalance: patch.tokenBalance ?? x.tokenBalance,
-                            },
-                      ),
-                    })),
+                    isAiPaused: () => {
+                      const curr = get().bots.find((x) => x.id === bot.id);
+                      return !curr?.aiEnabled;
+                    },
+                    onLog: (lvl: any, msg: any) =>
+                      get().addLog(lvl as any, String(msg)),
+                    // endurance: store heartbeat
+                    onUpdate: (patch: any) =>
+                      set((st) => ({
+                        bots: st.bots.map((x) =>
+                          x.id !== patch.id
+                            ? x
+                            : {
+                                ...x,
+                                last: patch.last ?? x.last,
+                                lastError: patch.lastError ?? x.lastError,
+                                fills: patch.fills ?? x.fills,
+                                posToken: patch.posToken ?? x.posToken,
+                                avgSol: patch.avgSol ?? x.avgSol,
+                                realized: patch.realized ?? x.realized,
+                                unrealized: patch.unrealized ?? x.unrealized,
+                                solBalance: patch.solBalance ?? x.solBalance,
+                                tokenBalance: patch.tokenBalance ?? x.tokenBalance,
+                                hb:
+                                  typeof patch.hb === "number"
+                                    ? patch.hb
+                                    : (x as any).hb,
+                              },
+                        ),
+                      })),
                   afterTrade: (reason?: "trade" | "idle") => {
                     const lag = reason === "idle" ? 2200 : 800;
                     scheduleRefresh(lag);
@@ -1674,17 +1696,36 @@ export const useStore = create<Store>()(
               "info",
               `startAll: ${s.bots.length} bots scheduled, decimals=${decimals}, price=${price.toFixed(9)}, wsProvider=${wsProvider}`,
             );
-            for (let i = 0; i < s.bots.length; i++) {
-              const b = s.bots[i];
-              const jitter = Math.floor(Math.random() * 400);
-              setTimeout(() => {
-                get()
-                  .startBot(b.id, connection)
-                  .catch((e: any) =>
-                    get().addLog("err", `startBot ${b.name}: ${e?.message || e}`),
-                  );
-              }, jitter);
-            }
+              // endurance: start-all stagger
+              const staggerMinRaw = Number(
+                (import.meta as any).env?.VITE_BOT_START_STAGGER_MS_MIN ?? 20,
+              );
+              const staggerMaxRaw = Number(
+                (import.meta as any).env?.VITE_BOT_START_STAGGER_MS_MAX ?? 120,
+              );
+              const staggerMin = Math.max(
+                0,
+                Math.floor(Number.isFinite(staggerMinRaw) ? staggerMinRaw : 20),
+              );
+              const staggerMax = Math.max(
+                staggerMin + 1,
+                Math.floor(
+                  Number.isFinite(staggerMaxRaw) ? staggerMaxRaw : staggerMin + 1,
+                ),
+              );
+              for (let i = 0; i < s.bots.length; i++) {
+                const b = s.bots[i];
+                const span = Math.max(1, staggerMax - staggerMin);
+                const jitter =
+                  staggerMin + Math.floor(Math.random() * span);
+                setTimeout(() => {
+                  get()
+                    .startBot(b.id, connection)
+                    .catch((e: any) =>
+                      get().addLog("err", `startBot ${b.name}: ${e?.message || e}`),
+                    );
+                }, jitter);
+              }
           },
           stopAll: () => {
             get().bots.forEach((b) => get().stopBot(b.id));
@@ -2683,6 +2724,7 @@ export const useStore = create<Store>()(
           autoStartJitterMs: 400,
         async initAfterReload(connection: Connection) {
           const s = get();
+            ensureKeepAlive();
           try {
             // (а) WS feed уже подключается через setTokenUrl в onRehydrateStorage
             // (б) Получить «живую» цену
@@ -2970,20 +3012,22 @@ export const useStore = create<Store>()(
             if (!alreadyHydrated) {
               manualStops.clear();
               runnerFaults.clear();
-              set((curr) => ({
-                __hydrated: true,
-                scheduler: new Map(),
-                bots: curr.bots.map((b) => ({
-                  ...b,
-                  running: false,
-                  fills: 0,
-                  lastError: undefined,
-                })),
-              }));
-            }
-            ensureRunnerWatchdog();
+                set((curr) => ({
+                  __hydrated: true,
+                  scheduler: new Map(),
+                  bots: curr.bots.map((b) => ({
+                    ...b,
+                    running: false,
+                    fills: 0,
+                    lastError: undefined,
+                    hb: undefined,
+                  })),
+                }));
+              }
+              ensureRunnerWatchdog();
+              ensureKeepAlive();
 
-            const u = state?.tokenUrl;
+              const u = state?.tokenUrl;
             if (u)
               setTimeout(() => {
                 try {
@@ -3092,5 +3136,55 @@ function ensureRunnerWatchdog() {
           );
       }, 120 + Math.floor(Math.random() * 420));
     });
-  }, RUNNER_WATCHDOG_MS);
+    }, RUNNER_WATCHDOG_MS);
+  }
+
+function ensureKeepAlive() {
+  if (typeof window === "undefined") return;
+  if (_kaTimer) return;
+  _kaTimer = setInterval(() => {
+    const st = useStore.getState() as any;
+    const now = Date.now();
+    const conn = (window as any).__conn as Connection | undefined;
+
+    for (const b of st.bots as LiveBot[]) {
+      if (!b.running) continue;
+
+      const guardUntil = _kaRestartGuard[b.id];
+      if (guardUntil && now < guardUntil) continue;
+
+      const sched = st.scheduler.get(b.id);
+      const aborted = !sched || sched.abort?.signal?.aborted === true;
+      const hb = (b as any).hb as number | undefined;
+      const stale = !hb || now - hb > KA_STALE_MS;
+
+      if (aborted || stale) {
+        st.addLog(
+          "warn",
+          `keepalive: restart ${b.name} (${aborted ? "no-scheduler" : "stale"})`,
+        );
+        try {
+          st.stopBot(b.id);
+        } catch {}
+        const jitter = 100 + Math.floor(Math.random() * 200);
+        setTimeout(() => {
+          const c =
+            ((window as any).__conn as Connection | undefined) || conn;
+          if (!c) return;
+          useStore
+            .getState()
+            .startBot(b.id, c)
+            .catch((e: any) =>
+              useStore
+                .getState()
+                .addLog(
+                  "warn",
+                  `keepalive start ${b.name}: ${e?.message || e}`,
+                ),
+            );
+        }, jitter);
+        _kaRestartGuard[b.id] = now + KA_BACKOFF_MS;
+      }
+    }
+  }, KA_EVERY_MS);
 }
