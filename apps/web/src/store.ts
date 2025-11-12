@@ -20,8 +20,15 @@ import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
   createTransferCheckedInstruction,
+  createTransferCheckedWithTransferHookInstruction,
+  createTransferCheckedWithFeeInstruction,
+  createTransferCheckedWithFeeAndTransferHookInstruction,
+  getMint,
+  getTransferHook,
+  getTransferFeeConfig,
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
+  calculateEpochFee,
 } from "@solana/spl-token";
 import { fetchExternalPrice } from "./store-price-feeds";
 import { logger } from "./utils/logger";
@@ -1912,6 +1919,35 @@ export const useStore = create<Store>()(
             }
             decimals = decimals ?? 9;
 
+            const connectionTyped = connection as Connection;
+            let mintProgramId = TOKEN_PROGRAM_ID;
+            try {
+              mintProgramId = await detectTokenProgramUtil(
+                connectionTyped,
+                mintPk,
+              );
+            } catch {}
+            const mintInfo =
+              (await getMint(
+                connectionTyped,
+                mintPk,
+                "processed",
+                mintProgramId,
+              ).catch(() => null)) ?? null;
+            const transferHookInfo = mintInfo ? getTransferHook(mintInfo) : null;
+            const transferFeeConfig = mintInfo
+              ? getTransferFeeConfig(mintInfo)
+              : null;
+            let transferFeeEpoch: bigint | null = null;
+            if (transferFeeConfig) {
+              try {
+                const epochInfo = await connectionTyped.getEpochInfo(
+                  "processed",
+                );
+                transferFeeEpoch = BigInt(epochInfo?.epoch ?? 0);
+              } catch {}
+            }
+
             const bots = get().bots.slice();
             const maxPar = Math.max(
               1,
@@ -1942,144 +1978,216 @@ export const useStore = create<Store>()(
                 },
               });
 
-              try {
-                const kp = getKeypair(b.keyId);
-                if (!kp) {
-                  get().addLog("err", `Sell ALL: нет ключа для ${b.name}`);
-                  return;
-                }
-
-                // источники (classic / 2022)
-                const srcClassic = await getAssociatedTokenAddress(
-                  mintPk,
-                  kp.publicKey,
-                  false,
-                  TOKEN_PROGRAM_ID,
-                );
-                const src22 = await getAssociatedTokenAddress(
-                  mintPk,
-                  kp.publicKey,
-                  false,
-                  TOKEN_2022_PROGRAM_ID,
-                );
-                const infos = await fetchMultipleAccountInfos(
-                  connection as Connection,
-                  [srcClassic, src22],
-                );
-                const [srcCInfo, src22Info] = infos;
-
-                const decodeAmount = (acc: any): bigint => {
-                  try {
-                    if (!acc || !acc.data || acc.data.byteLength < 72)
-                      return 0n;
-                    const view = new DataView(
-                      acc.data.buffer,
-                      acc.data.byteOffset + 64,
-                      8,
-                    );
-                    const lo = view.getUint32(0, true),
-                      hi = view.getUint32(4, true);
-                    return (BigInt(hi) << 32n) + BigInt(lo);
-                  } catch {
-                    return 0n;
+                try {
+                  const kp = getKeypair(b.keyId);
+                  if (!kp) {
+                    get().addLog("err", `Sell ALL: нет ключа для ${b.name}`);
+                    return;
                   }
-                };
 
-                const amtC = decodeAmount(srcCInfo);
-                const amt22 = decodeAmount(src22Info);
-                let programId = TOKEN_PROGRAM_ID;
-                let srcAta = srcClassic;
-                let amountRaw = amtC;
-                if (amt22 > 0n || (!srcCInfo && src22Info)) {
-                  programId = TOKEN_2022_PROGRAM_ID;
-                  srcAta = src22;
-                  amountRaw = amt22;
-                }
-                if (amountRaw <= 0n) return;
+                  // источники (classic / 2022)
+                  const srcClassic = await getAssociatedTokenAddress(
+                    mintPk,
+                    kp.publicKey,
+                    false,
+                    TOKEN_PROGRAM_ID,
+                  );
+                  const src22 = await getAssociatedTokenAddress(
+                    mintPk,
+                    kp.publicKey,
+                    false,
+                    TOKEN_2022_PROGRAM_ID,
+                  );
+                  const infos = await fetchMultipleAccountInfos(connectionTyped, [
+                    srcClassic,
+                    src22,
+                  ]);
+                  const [srcCInfo, src22Info] = infos;
 
-                // гарантируем целевой ATA
-                const { ata: dstAta, ix: ensureIx } = await ensureAtaIx({
-                  connection,
-                  mint: mintPk,
-                  owner: dstOwner,
-                  payer: kp.publicKey,
-                  preferProgramId: programId,
-                });
+                  const decodeAmount = (acc: any): bigint => {
+                    try {
+                      if (!acc || !acc.data || acc.data.byteLength < 72)
+                        return 0n;
+                      const view = new DataView(
+                        acc.data.buffer,
+                        acc.data.byteOffset + 64,
+                        8,
+                      );
+                      const lo = view.getUint32(0, true),
+                        hi = view.getUint32(4, true);
+                      return (BigInt(hi) << 32n) + BigInt(lo);
+                    } catch {
+                      return 0n;
+                    }
+                  };
 
-                const tx = new Transaction();
-                tx.add(
-                  ComputeBudgetProgram.setComputeUnitPrice({
-                    microLamports: Math.max(
-                      500,
-                      Number(
-                        (import.meta as any).env?.VITE_SELLALL_CU_PRICE ?? 1500,
+                  const amtC = decodeAmount(srcCInfo);
+                  const amt22 = decodeAmount(src22Info);
+                  let programId = mintProgramId;
+                  let srcAta = programId.equals(TOKEN_2022_PROGRAM_ID)
+                    ? src22
+                    : srcClassic;
+                  let amountRaw = programId.equals(TOKEN_2022_PROGRAM_ID)
+                    ? amt22
+                    : amtC;
+
+                  if (amountRaw <= 0n) {
+                    if (amt22 > 0n) {
+                      programId = TOKEN_2022_PROGRAM_ID;
+                      srcAta = src22;
+                      amountRaw = amt22;
+                    } else if (amtC > 0n) {
+                      programId = TOKEN_PROGRAM_ID;
+                      srcAta = srcClassic;
+                      amountRaw = amtC;
+                    }
+                  }
+                  if (amountRaw <= 0n) return;
+
+                  // гарантируем целевой ATA
+                  const ensured = await ensureAtaIx({
+                    connection: connectionTyped,
+                    mint: mintPk,
+                    owner: dstOwner,
+                    payer: kp.publicKey,
+                    preferProgramId: programId,
+                  });
+                  const dstAta = ensured.ata;
+                  const ensureIx = ensured.ix;
+                  programId = ensured.programId || programId;
+
+                  const tx = new Transaction();
+                  tx.add(
+                    ComputeBudgetProgram.setComputeUnitLimit({ units: 200_000 }),
+                  );
+                  tx.add(
+                    ComputeBudgetProgram.setComputeUnitPrice({
+                      microLamports: Math.max(
+                        500,
+                        Number(
+                          (import.meta as any).env?.VITE_SELLALL_CU_PRICE ?? 1500,
+                        ),
                       ),
-                    ),
-                  }),
-                );
-                if (ensureIx) tx.add(ensureIx);
+                    }),
+                  );
+                  if (ensureIx) tx.add(ensureIx);
 
-                if (typeof decimals === "number") {
-                  tx.add(
-                    createTransferCheckedInstruction(
+                  let transferIx: TransactionInstruction | null = null;
+                  if (typeof decimals === "number") {
+                    const usesToken2022 = programId.equals(TOKEN_2022_PROGRAM_ID);
+                    const hasHook = usesToken2022 && !!transferHookInfo;
+                    const hasFee = usesToken2022 && !!transferFeeConfig;
+                    if (hasFee) {
+                      let fee = calculateEpochFee(
+                        transferFeeConfig as any,
+                        transferFeeEpoch ?? BigInt(0),
+                        amountRaw,
+                      );
+                      if (fee < 0n) fee = 0n;
+                      if (fee > amountRaw) fee = amountRaw;
+                      if (hasHook) {
+                        transferIx =
+                          await createTransferCheckedWithFeeAndTransferHookInstruction(
+                            connectionTyped,
+                            srcAta,
+                            mintPk,
+                            dstAta,
+                            kp.publicKey,
+                            amountRaw,
+                            decimals,
+                            fee,
+                            [],
+                            "processed",
+                            programId,
+                          );
+                      } else {
+                        transferIx = createTransferCheckedWithFeeInstruction(
+                          srcAta,
+                          mintPk,
+                          dstAta,
+                          kp.publicKey,
+                          amountRaw,
+                          decimals,
+                          fee,
+                          [],
+                          programId,
+                        );
+                      }
+                    } else if (hasHook) {
+                      transferIx =
+                        await createTransferCheckedWithTransferHookInstruction(
+                          connectionTyped,
+                          srcAta,
+                          mintPk,
+                          dstAta,
+                          kp.publicKey,
+                          amountRaw,
+                          decimals,
+                          [],
+                          "processed",
+                          programId,
+                        );
+                    } else {
+                      transferIx = createTransferCheckedInstruction(
+                        srcAta,
+                        mintPk,
+                        dstAta,
+                        kp.publicKey,
+                        amountRaw,
+                        decimals,
+                        [],
+                        programId,
+                      );
+                    }
+                  } else {
+                    const { createTransferInstruction } = await import(
+                      "@solana/spl-token"
+                    );
+                    transferIx = createTransferInstruction(
                       srcAta,
-                      mintPk,
                       dstAta,
                       kp.publicKey,
                       amountRaw,
-                      decimals,
                       [],
                       programId,
-                    ),
+                    );
+                  }
+                  if (!transferIx) return;
+                  tx.add(transferIx);
+
+                  // 👇 Этого не хватало: payer, blockhash, подпись
+                  const { blockhash } = await connectionTyped.getLatestBlockhash(
+                    "finalized",
                   );
-                } else {
-                  const { createTransferInstruction } = await import(
-                    "@solana/spl-token"
+                  tx.feePayer = kp.publicKey;
+                  tx.recentBlockhash = blockhash;
+                  tx.sign(kp);
+
+                  const sig = await connectionTyped.sendRawTransaction(
+                    tx.serialize(),
+                    { skipPreflight: false, maxRetries: 3 },
                   );
-                  tx.add(
-                    createTransferInstruction(
-                      srcAta,
-                      dstAta,
-                      kp.publicKey,
-                      amountRaw,
-                      [],
-                      programId,
-                    ),
+
+                  const elapsed = Date.now() - started;
+                  const curr = get().sellAllState.progressByBot || {};
+                  curr[b.id] = {
+                    ...(curr[b.id] || {}),
+                    transferred: true,
+                    signature: sig,
+                    retries: 0,
+                    ms: elapsed,
+                  } as any;
+                  set({
+                    sellAllState: {
+                      ...get().sellAllState,
+                      progressByBot: { ...curr },
+                    },
+                  });
+
+                  get().addLog(
+                    "ok",
+                    `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0, 4)}… (${sig.slice(0, 8)}…)`,
                   );
-                }
-
-                // 👇 Этого не хватало: payer, blockhash, подпись
-                const { blockhash } =
-                  await connection.getLatestBlockhash("finalized");
-                tx.feePayer = kp.publicKey;
-                tx.recentBlockhash = blockhash;
-                tx.sign(kp);
-
-                const sig = await connection.sendRawTransaction(
-                  tx.serialize(),
-                  { skipPreflight: true, maxRetries: 3 },
-                );
-
-                const elapsed = Date.now() - started;
-                const curr = get().sellAllState.progressByBot || {};
-                curr[b.id] = {
-                  ...(curr[b.id] || {}),
-                  transferred: true,
-                  signature: sig,
-                  retries: 0,
-                  ms: elapsed,
-                } as any;
-                set({
-                  sellAllState: {
-                    ...get().sellAllState,
-                    progressByBot: { ...curr },
-                  },
-                });
-
-                get().addLog(
-                  "ok",
-                  `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0, 4)}… (${sig.slice(0, 8)}…)`,
-                );
               } catch (e: any) {
                 const curr = get().sellAllState.progressByBot || {};
                 const msg =
