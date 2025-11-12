@@ -91,11 +91,11 @@ const ALT_PUMP = ((import.meta as any).env?.VITE_PUMP_API || "").replace(
   /\/+$/,
   "",
 );
-const PUMP_BASES = [
-  API_BASE ? `${API_BASE}/x/pump` : "",
-  ALT_PUMP,
-  "https://pumpportal.fun",
-].filter(Boolean);
+// Порядок попыток: same-origin → ваш API/прокси → публичный pumpportal
+const PUMP_BASES: string[] = [""];
+if (API_BASE) PUMP_BASES.push(`${API_BASE.replace(/\/+$/, "")}/x/pump`);
+if (ALT_PUMP) PUMP_BASES.push(ALT_PUMP.replace(/\/+$/, ""));
+PUMP_BASES.push("https://pumpportal.fun");
 
 const PF_BASE_SOL = Math.max(
   0.000006,
@@ -142,6 +142,10 @@ const enqueueTradeBuild =
 
 let stickyBaseIdx = -1;
 async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
+  // Абсолютные URL — ходим напрямую (без перебора баз)
+  if (/^https?:\/\//i.test(path)) {
+    return scheduleFetch(path, { ...(init as any), timeoutMs: 20_000, tries: 1 }, "pump");
+  }
   const order = [...PUMP_BASES.keys()];
   if (stickyBaseIdx >= 0) {
     const i = order.indexOf(stickyBaseIdx);
@@ -152,7 +156,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
   }
   let lastErr: any;
   for (const idx of order) {
-    const base = PUMP_BASES[idx];
+    const base = PUMP_BASES[idx] || "";
     const url = `${base.replace(/\/$/, "")}${path}`;
     for (let a = 0; a <= retries; a++) {
       const backoff = a === 0 ? 0 : 250 * a + Math.floor(Math.random() * 250);
@@ -167,7 +171,8 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retries = 2) {
           stickyBaseIdx = idx;
           return r;
         }
-        if (r.status === 429 || r.status >= 500) {
+        // На 429/5xx/404 — пробуем следующую базу
+        if (r.status === 429 || r.status >= 500 || r.status === 404) {
           lastErr = new Error(`${r.status} ${r.statusText}`);
           continue;
         }
@@ -187,8 +192,12 @@ async function buildTradeTxPump(
 ): Promise<VersionedTransaction> {
   return enqueueTradeBuild(async () => {
     const tries: Array<{ path: string; bin: boolean }> = [
+      // Сначала — те же origin ручки вашего приложения
       { path: "/api/trade-local", bin: true },
       { path: "/api/trade", bin: false },
+      // Затем — то же самое, но через /x/pump на ваших прокси/бэкендах
+      { path: "/x/pump/trade-local", bin: true },
+      { path: "/x/pump/trade", bin: false },
     ];
     let lastErr: any;
     for (const t of tries) {
