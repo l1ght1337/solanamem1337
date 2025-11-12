@@ -2,11 +2,13 @@ import {
   Connection,
   PublicKey,
   ParsedAccountData,
+  AccountInfo,
 } from '@solana/web3.js';
 import {
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
+  getAssociatedTokenAddress,
 } from '@solana/spl-token';
 
 export async function getMintDecimals(c: Connection, mint: string): Promise<number> {
@@ -19,6 +21,92 @@ export async function getMintDecimals(c: Connection, mint: string): Promise<numb
   const raw = info.value?.data as Buffer | undefined;
   if (raw && raw.length >= 45) return raw[44]; // стандартный offset decimals
   return 9;
+}
+
+type CommitmentString = 'processed' | 'confirmed' | 'finalized';
+
+export async function safeGetAccountInfo(
+  connection: Connection,
+  key: PublicKey,
+  commitment: CommitmentString = 'processed',
+): Promise<AccountInfo<Buffer> | null> {
+  try {
+    const info = await connection.getAccountInfo(key, commitment);
+    return info ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchMultipleAccountInfos(
+  connection: Connection,
+  keys: PublicKey[],
+  commitment: CommitmentString = 'processed',
+): Promise<(AccountInfo<Buffer> | null)[]> {
+  if (!keys.length) return [];
+  try {
+    const arr = await connection.getMultipleAccountsInfo(
+      keys,
+      { commitment } as any,
+    );
+    return (arr || []).map((x) => x ?? null);
+  } catch {
+    return Promise.all(
+      keys.map((k) => safeGetAccountInfo(connection, k, commitment)),
+    );
+  }
+}
+
+function decodeAtaAmount(acc: AccountInfo<Buffer> | null): bigint {
+  try {
+    if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+    const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+    const lo = view.getUint32(0, true);
+    const hi = view.getUint32(4, true);
+    return (BigInt(hi) << 32n) + BigInt(lo);
+  } catch {
+    return 0n;
+  }
+}
+
+// Суммарный «сырой» баланс во всех возможных ATA (SPL + Token‑2022)
+export async function readOwnerTokenRaw(
+  connection: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+): Promise<{
+  raw: bigint;
+  hasClassic: boolean;
+  has2022: boolean;
+  classicAta: PublicKey;
+  t22Ata: PublicKey;
+}> {
+  const classicAta = await getAssociatedTokenAddress(
+    mint,
+    owner,
+    false,
+    TOKEN_PROGRAM_ID,
+  );
+  const t22Ata = await getAssociatedTokenAddress(
+    mint,
+    owner,
+    false,
+    TOKEN_2022_PROGRAM_ID,
+  );
+
+  const [accC, acc22] = await fetchMultipleAccountInfos(
+    connection,
+    [classicAta, t22Ata],
+    'processed',
+  );
+
+  return {
+    raw: decodeAtaAmount(accC) + decodeAtaAmount(acc22),
+    hasClassic: !!accC,
+    has2022: !!acc22,
+    classicAta,
+    t22Ata,
+  };
 }
 
 /** Определяем, под какой программой создан mint (classic или token-2022). */
@@ -53,17 +141,14 @@ export async function findAtaAnyTokenProgram(
     TOKEN_2022_PROGRAM_ID,
   );
 
-  try {
-    const [accClassic, accT22] = await connection.getMultipleAccountsInfo(
-      [ataClassic, ataT22],
-      'processed',
-    );
-    if (accClassic) return { ata: ataClassic, programId: TOKEN_PROGRAM_ID };
-    if (accT22) return { ata: ataT22, programId: TOKEN_2022_PROGRAM_ID };
-    return { ata: null, programId: null };
-  } catch {
-    return { ata: null, programId: null };
-  }
+  const [accClassic, accT22] = await fetchMultipleAccountInfos(
+    connection,
+    [ataClassic, ataT22],
+    'processed',
+  );
+  if (accClassic) return { ata: ataClassic, programId: TOKEN_PROGRAM_ID };
+  if (accT22) return { ata: ataT22, programId: TOKEN_2022_PROGRAM_ID };
+  return { ata: null, programId: null };
 }
 
 /**
@@ -92,7 +177,7 @@ export async function getSPLBalance(
     const bal = await connection.getTokenAccountBalance(ata, 'processed');
     return BigInt(bal?.value?.amount ?? '0');
   } catch {
-    const info = await connection.getAccountInfo(ata, 'processed');
+    const info = await safeGetAccountInfo(connection, ata, 'processed');
     if (!info || !info.data || info.data.length < 72) return 0n;
     const view = new DataView(
       info.data.buffer,
