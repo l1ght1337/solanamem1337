@@ -41,7 +41,11 @@ import {
   exportSecret,
   removeKey,
 } from "./utils/keyring";
-import { getMintDecimals, getSPLBalance } from "./utils/solana";
+import {
+  getMintDecimals,
+  getSPLBalance,
+  findAtaAnyTokenProgram,
+} from "./utils/solana";
 import { scheduleFetch, getNetMetrics } from "./utils/network";
 import {
   createLimiter,
@@ -2051,70 +2055,65 @@ export const useStore = create<Store>()(
               });
 
                 try {
-                  const kp = getKeypair(b.keyId);
-                  if (!kp) {
-                    get().addLog("err", `Sell ALL: нет ключа для ${b.name}`);
-                    return;
-                  }
+                    const kp = getKeypair(b.keyId);
+                    if (!kp) {
+                      get().addLog("err", `Sell ALL: нет ключа для ${b.name}`);
+                      return;
+                    }
 
-                  // источники (classic / 2022)
-                  const srcClassic = await getAssociatedTokenAddress(
-                    mintPk,
-                    kp.publicKey,
-                    false,
-                    TOKEN_PROGRAM_ID,
-                  );
-                  const src22 = await getAssociatedTokenAddress(
-                    mintPk,
-                    kp.publicKey,
-                    false,
-                    TOKEN_2022_PROGRAM_ID,
-                  );
-                  const infos = await fetchMultipleAccountInfos(connectionTyped, [
-                    srcClassic,
-                    src22,
-                  ]);
-                  const [srcCInfo, src22Info] = infos;
+                    const mintShort = mintPk.toBase58().slice(0, 6);
 
-                  const decodeAmount = (acc: any): bigint => {
-                    try {
-                      if (!acc || !acc.data || acc.data.byteLength < 72)
-                        return 0n;
-                      const view = new DataView(
-                        acc.data.buffer,
-                        acc.data.byteOffset + 64,
-                        8,
+                    const markSkip = (msg: string) => {
+                      const state = get();
+                      const progress = {
+                        ...(state.sellAllState.progressByBot || {}),
+                      };
+                      const prev = progress[b.id] || {};
+                      progress[b.id] = {
+                        ...prev,
+                        transferred: true,
+                        skipped: true,
+                        retries: prev.retries ?? 0,
+                        signature: undefined,
+                        error: undefined,
+                        ms: Date.now() - started,
+                      } as any;
+                      set({
+                        sellAllState: {
+                          ...state.sellAllState,
+                          progressByBot: progress,
+                        },
+                      });
+                      state.addLog("info", msg);
+                    };
+
+                    const safeBalance = await getSPLBalance(
+                      connectionTyped,
+                      kp.publicKey,
+                      mintPk,
+                    );
+                    if (safeBalance <= 0n) {
+                      markSkip(
+                        `Sell ALL: ${b.name} — balance=0 for ${mintShort}… (skip)`,
                       );
-                      const lo = view.getUint32(0, true),
-                        hi = view.getUint32(4, true);
-                      return (BigInt(hi) << 32n) + BigInt(lo);
-                    } catch {
-                      return 0n;
+                      return;
                     }
-                  };
 
-                  const amtC = decodeAmount(srcCInfo);
-                  const amt22 = decodeAmount(src22Info);
-                  let programId = mintProgramId;
-                  let srcAta = programId.equals(TOKEN_2022_PROGRAM_ID)
-                    ? src22
-                    : srcClassic;
-                  let amountRaw = programId.equals(TOKEN_2022_PROGRAM_ID)
-                    ? amt22
-                    : amtC;
-
-                  if (amountRaw <= 0n) {
-                    if (amt22 > 0n) {
-                      programId = TOKEN_2022_PROGRAM_ID;
-                      srcAta = src22;
-                      amountRaw = amt22;
-                    } else if (amtC > 0n) {
-                      programId = TOKEN_PROGRAM_ID;
-                      srcAta = srcClassic;
-                      amountRaw = amtC;
+                    const detectedSrc = await findAtaAnyTokenProgram(
+                      connectionTyped,
+                      kp.publicKey,
+                      mintPk,
+                    );
+                    if (!detectedSrc.ata) {
+                      markSkip(
+                        `Sell ALL: ${b.name} — no ATA for ${mintShort}… (skip)`,
+                      );
+                      return;
                     }
-                  }
-                  if (amountRaw <= 0n) return;
+
+                    let programId = detectedSrc.programId ?? mintProgramId;
+                    let srcAta = detectedSrc.ata;
+                    let amountRaw = safeBalance;
 
                   // гарантируем целевой ATA
                   const ensured = await ensureAtaIx({
@@ -2336,7 +2335,7 @@ export const useStore = create<Store>()(
                 sellAllState: {
                   ...st.sellAllState,
                   status: "done",
-                  msg: "no tokens to sell",
+                  msg: "ok: no tokens to sell",
                 },
               }));
               await get().refreshBalances(connection);
@@ -2352,7 +2351,7 @@ export const useStore = create<Store>()(
               sellAllState: {
                 ...st.sellAllState,
                 status: "done",
-                msg: "no tokens to sell",
+                  msg: "ok: no tokens to sell",
               },
             }));
             await get().refreshBalances(connection);
