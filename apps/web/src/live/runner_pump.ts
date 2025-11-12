@@ -310,6 +310,16 @@ function capsForStrategy(s: InternalStrategy) {
 
 /* ───────────────────────────── Runner ───────────────────────────── */
 export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
+  // SELLALL-FIX: decimals cache that auto-updates from ctx
+  let DEC = 9;
+  const getDec = () => {
+    try {
+      const d = ctx.tokenDecimals?.();
+      if (typeof d === "number" && d > 0 && d !== DEC) DEC = d;
+    } catch {}
+    return DEC;
+  };
+
   let stopped = false;
   let pending = false;
   let cooldownUntil = 0;
@@ -497,7 +507,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
       const lam = await connection.getBalance(kp.publicKey, "processed");
       const sol = lam / LAMPORTS_PER_SOL;
       const raw = await getSPLBalance(connection, bot.pubkey, ctx.mint);
-      const tok = Number(raw as any) / Math.pow(10, ctx.tokenDecimals());
+      const tok = Number(raw as any) / Math.pow(10, getDec());
       bot.solBalance = sol;
       bot.tokenBalance = tok;
       pushUpdate({ solBalance: sol, tokenBalance: tok });
@@ -562,7 +572,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     };
 
     const kp = ctx.keypair();
-    const decimals = ctx.tokenDecimals();
+    const decimals = getDec();
       const priceNow = priceNowSafe();
     const noLossMul =
       1 + Math.max(0, Number(risk.noLossFloorBps) || 0) / 10_000;
@@ -1441,7 +1451,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
         }
         const capPct = Math.min(0.5, Math.max(0.005, 0.035));
-        const capTok = roundTok(bot.posToken * capPct, ctx.tokenDecimals());
+        const capTok = roundTok(bot.posToken * capPct, getDec());
         const qty = Math.min(
           capTok,
           Math.min(bot.posToken * 0.2, Math.max(0, deferredSell.amountTok)),
@@ -1572,7 +1582,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
         const needSol = Math.max(0, reserve + 0.0015 - bot.solBalance);
         const tokToSell = roundTok(
           Math.min(bot.posToken * 0.22, needSol / Math.max(1e-12, p)),
-          ctx.tokenDecimals(),
+          getDec(),
         );
         if (tokToSell > 0) {
           const sold = await trade("sell", 0, { sellTokens: tokToSell });
@@ -1595,7 +1605,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           bot.posToken,
           roundTok(
             Math.max(bot.posToken * 0.12, (excessVal * factor) / p),
-            ctx.tokenDecimals(),
+            getDec(),
           ),
         );
         if (tokToSell > 0) {
@@ -1636,7 +1646,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               bot.posToken * 0.08,
               Math.min(bot.posToken * 0.2, (needVal * 0.25) / p),
             ),
-            ctx.tokenDecimals(),
+            getDec(),
           );
           if (tokToSell > 0) {
             const sold = await trade("sell", 0, { sellTokens: tokToSell });
@@ -1709,7 +1719,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               const pct = 0.08 + Math.random() * 0.1;
               const part = roundTok(
                 Math.max(0, bot.posToken * pct),
-                ctx.tokenDecimals(),
+                getDec(),
               );
               if (part > 0) {
                 const sold = await trade("sell", 0, { sellTokens: part });
@@ -1726,7 +1736,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               const pct = 0.06 + Math.random() * 0.06;
               const part = roundTok(
                 Math.max(0, bot.posToken * pct),
-                ctx.tokenDecimals(),
+                getDec(),
               );
               if (part > 0) {
                 const sold = await trade("sell", 0, { sellTokens: part });
@@ -1744,7 +1754,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               bot.posToken,
               roundTok(
                 Math.max(bot.posToken * 0.1, (excessVal * 0.5) / p),
-                ctx.tokenDecimals(),
+                getDec(),
               ),
             );
             if (part > 0) {
@@ -1801,7 +1811,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const pct = 0.08 + Math.random() * 0.07;
             const part = roundTok(
               Math.max(0, bot.posToken * pct),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (part > 0) {
               const sold = await trade("sell", 0, { sellTokens: part });
@@ -1814,7 +1824,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const pct = 0.08 + Math.random() * 0.07;
             const part = roundTok(
               Math.max(0, bot.posToken * pct),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (part > 0) {
               const sold = await trade("sell", 0, { sellTokens: part });
@@ -1829,7 +1839,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                 bot.posToken * 0.04,
                 bot.posToken * 0.03 + Math.random() * bot.posToken * 0.03,
               ),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (planned > 0) scheduleSell(planned, 1600, 3400);
           }
@@ -1867,7 +1877,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               bot.posToken,
               roundTok(
                 Math.max(bot.posToken * 0.12, (excessVal * 0.45) / p),
-                ctx.tokenDecimals(),
+                getDec(),
               ),
             );
             if (part > 0) {
@@ -1880,7 +1890,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                 bot.posToken * 0.06,
                 bot.posToken * Math.random() * 0.08,
               ),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (shave > 0) {
               const sold = await trade("sell", 0, { sellTokens: shave });
@@ -1920,7 +1930,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                   bot.posToken * 0.1,
                   bot.posToken * 0.06 + Math.random() * 0.06,
                 ),
-                ctx.tokenDecimals(),
+                getDec(),
               );
               const sold = await trade("sell", 0, { sellTokens: part });
               if (sold) {
@@ -1941,7 +1951,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
               bot.posToken,
               roundTok(
                 Math.max(bot.posToken * 0.18, (excessVal * 0.55) / p),
-                ctx.tokenDecimals(),
+                getDec(),
               ),
             );
             if (part > 0) {
@@ -1970,7 +1980,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           if (dev > 0.012 || allocTok > MAX_ALLOC || protect) {
             const part = roundTok(
               Math.max(bot.posToken * 0.12, (bot.posToken * dev) / 2),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (part > 0) {
               const sold = await trade("sell", 0, { sellTokens: part });
@@ -1996,7 +2006,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           ) {
             const part = roundTok(
               Math.max(bot.posToken * 0.07, bot.posToken * Math.random() * 0.1),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (part > 0) {
               const sold = await trade("sell", 0, { sellTokens: part });
@@ -2008,7 +2018,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                 bot.posToken * 0.03,
                 bot.posToken * 0.02 + Math.random() * bot.posToken * 0.03,
               ),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             scheduleSell(planned, 1200, 2600);
           }
@@ -2026,7 +2036,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
                 bot.posToken * 0.05,
                 bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04,
               ),
-              ctx.tokenDecimals(),
+              getDec(),
             );
             if (shave > 0) {
               const sold = await trade("sell", 0, { sellTokens: shave });
