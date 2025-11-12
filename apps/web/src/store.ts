@@ -104,6 +104,47 @@ async function getCombinedTokenBalance(
   return Number(raw) / Math.pow(10, Math.max(0, decimals || 9));
 }
 
+// SELLALL-FIX: read both classic & 2022 ATAs and sum amounts
+async function readOwnerTokenRaw(
+  connection: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+): Promise<{ raw: bigint; hasClassic: boolean; has2022: boolean }> {
+  const classic = await getAssociatedTokenAddress(
+    mint,
+    owner,
+    false,
+    TOKEN_PROGRAM_ID,
+  );
+  const t22 = await getAssociatedTokenAddress(
+    mint,
+    owner,
+    false,
+    TOKEN_2022_PROGRAM_ID,
+  );
+
+  const infos = await fetchMultipleAccountInfos(connection, [classic, t22]);
+  const [accC, acc22] = infos;
+
+  const decode = (acc: any): bigint => {
+    try {
+      const data: Uint8Array | undefined = acc?.data as any;
+      if (!data || data.byteLength < 72) return 0n;
+      // amount u64 LE at offset 64
+      const view = new DataView(data.buffer, data.byteOffset + 64, 8);
+      const lo = view.getUint32(0, true),
+        hi = view.getUint32(4, true);
+      return (BigInt(hi) << 32n) + BigInt(lo);
+    } catch {
+      return 0n;
+    }
+  };
+
+  const rawC = decode(accC);
+  const raw22 = decode(acc22);
+  return { raw: rawC + raw22, hasClassic: !!accC, has2022: !!acc22 };
+}
+
 async function waitForDestTokens(
   connection: Connection,
   owner: PublicKey,
@@ -1604,6 +1645,23 @@ export const useStore = create<Store>()(
               return;
             }
 
+            // SELLALL-FIX: ensure decimals before runner starts
+            try {
+              if (get()._mintDecimals == null && state.tokenMint) {
+                const mintPk = new PublicKey(state.tokenMint);
+                let d = await getMintDecimalsFast(
+                  connection as Connection,
+                  mintPk,
+                );
+                if (d == null)
+                  d = await getMintDecimals(
+                    connection as Connection,
+                    state.tokenMint,
+                  );
+                if (d != null) set({ _mintDecimals: d });
+              }
+            } catch {}
+
             let refreshKickTimer: ReturnType<typeof setTimeout> | null = null;
             let refreshKickDue = 0;
             const scheduleRefresh = (delayMs: number) => {
@@ -1881,6 +1939,20 @@ export const useStore = create<Store>()(
             s.addLog("warn", "Sell ALL уже выполняется");
             return;
           }
+
+          // SELLALL-FIX: ensure decimals before Sell ALL
+          try {
+            if (get()._mintDecimals == null && s.tokenMint) {
+              const mintPkEnsure = new PublicKey(s.tokenMint);
+              let d = await getMintDecimalsFast(
+                connection as Connection,
+                mintPkEnsure,
+              );
+              if (d == null)
+                d = await getMintDecimals(connection as Connection, s.tokenMint);
+              if (d != null) set({ _mintDecimals: d });
+            }
+          } catch {}
 
           const opId = `sellall:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
           const ac = new AbortController();
@@ -2232,41 +2304,34 @@ export const useStore = create<Store>()(
               await new Promise((r) => setTimeout(r, 350));
             } catch {}
 
-            // ждём появления токенов суммарно (SPL + Token22)
-            const waited = await waitForDestTokens(
+          // SELLALL-FIX: устойчивое ожидание прихода токенов и чтение classic+2022
+          const deadline = Date.now() + 8000; // ждём до 8 c обновления RPC
+          let rawTotal: bigint = 0n;
+          let seenClassic = false,
+            seen2022 = false;
+
+          do {
+            const res = await readOwnerTokenRaw(
               connection as Connection,
               dstOwner,
               mintPk,
-              decimals,
-              { timeoutMs: 22_000, everyMs: 280, abort: ac.signal },
-            ).catch(() => ({ amount: 0, classic: 0, v2022: 0 }));
-
-            get().addLog(
-              waited.amount > 0 ? "ok" : "info",
-              `Sell ALL: dst ready ≈ ${waited.amount.toFixed(Math.min(6, decimals))} TOK (classic=${waited.classic.toFixed(Math.min(6, decimals))}, v2022=${waited.v2022.toFixed(Math.min(6, decimals))})`,
             );
+            rawTotal = res.raw;
+            seenClassic = res.hasClassic || seenClassic;
+            seen2022 = res.has2022 || seen2022;
+            if (rawTotal > 0n) break;
+            await new Promise((r) => setTimeout(r, 250));
+          } while (Date.now() < deadline);
 
-            // последний резервный опрос старым helper'ом, если вдруг сумма 0
-            let amountTok = waited.amount;
-            if (amountTok <= 0) {
-              try {
-                const rawWallet = await getSPLBalance(
-                  connection,
-                  dstOwner.toBase58(),
-                  s.tokenMint,
-                );
-                const alt = Number(rawWallet as any) / Math.pow(10, decimals);
-                if (alt > 0) {
-                  amountTok = alt;
-                  get().addLog("warn", "Sell ALL: fallback getSPLBalance helped");
-                }
-              } catch {}
-            }
+          const dec = decimals ?? 9;
+          const amountTok = Number(rawTotal) / Math.pow(10, dec);
 
-            // минимальный «непыльный» порог
-            const dustThr =
-              1 / Math.pow(10, Math.min(6, Math.max(0, decimals || 9)));
-            if (amountTok <= dustThr) {
+          get().addLog(
+            "info",
+            `Sell ALL: dst raw=${rawTotal.toString()} (classic=${seenClassic ? "yes" : "no"}; t22=${seen2022 ? "yes" : "no"}; dec=${dec})`,
+          );
+
+          if (!Number.isFinite(amountTok) || amountTok <= 0) {
               set((st) => ({
                 sellAllState: {
                   ...st.sellAllState,
@@ -2278,14 +2343,27 @@ export const useStore = create<Store>()(
               return;
             }
 
-            const amountRounded = Math.max(
-              dustThr,
-              +amountTok.toFixed(Math.min(6, decimals)),
-            );
-            get().addLog(
-              "info",
-              `Sell ALL: aggregated amount=${amountRounded.toFixed(Math.min(6, decimals))} TOK`,
-            );
+          let amountRounded = +amountTok.toFixed(Math.min(6, dec));
+
+          const dustThr =
+            1 / Math.pow(10, Math.min(6, Math.max(0, dec)));
+          if (amountTok <= dustThr) {
+            set((st) => ({
+              sellAllState: {
+                ...st.sellAllState,
+                status: "done",
+                msg: "no tokens to sell",
+              },
+            }));
+            await get().refreshBalances(connection);
+            return;
+          }
+
+          if (amountRounded < dustThr) amountRounded = dustThr;
+          get().addLog(
+            "info",
+            `Sell ALL: aggregated amount=${amountRounded.toFixed(Math.min(6, dec))} TOK`,
+          );
 
             const priorityFeeSol = Math.max(
               Number((import.meta as any).env?.VITE_PRIORITY_FEE_MIN ?? 1500) /
@@ -2313,6 +2391,10 @@ export const useStore = create<Store>()(
                   );
                 const { signature } = await ph.signAndSendTransaction(vtx);
                 await confirmSigHttp(connection, signature);
+                // SELLALL-FIX: tiny settle gap, чтобы RPC гарантированно отдал обновлённые балансы
+                try {
+                  await new Promise((r) => setTimeout(r, 120));
+                } catch {}
                 return signature as string;
               } else {
                 const id = get().treasuryKeyId!;
@@ -2324,6 +2406,10 @@ export const useStore = create<Store>()(
                   { skipPreflight: true, maxRetries: 3 },
                 );
                 await confirmSigHttp(connection, sig);
+                // SELLALL-FIX: tiny settle gap, чтобы RPC гарантированно отдал обновлённые балансы
+                try {
+                  await new Promise((r) => setTimeout(r, 120));
+                } catch {}
                 return sig as string;
               }
             };
