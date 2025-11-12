@@ -52,7 +52,7 @@ import {
   safeAdd,
 } from "./utils/number";
 
-// ---------- helpers: combined token balance & wait ----------
+// ---------- helpers: combined token balance (SPL + Token-2022) & wait ----------
 // u64 amount из ATA (LE, offset=64), без тяжёлых парсеров
 function _decodeAtaAmount(
   acc: import("@solana/web3.js").AccountInfo<Buffer> | null,
@@ -60,8 +60,7 @@ function _decodeAtaAmount(
   try {
     if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
     const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
-    const lo = view.getUint32(0, true),
-      hi = view.getUint32(4, true);
+    const lo = view.getUint32(0, true), hi = view.getUint32(4, true);
     return (BigInt(hi) << 32n) + BigInt(lo);
   } catch {
     return 0n;
@@ -104,28 +103,48 @@ async function waitForDestTokens(
   mint: PublicKey,
   decimals: number,
   opts?: { timeoutMs?: number; everyMs?: number; abort?: AbortSignal },
-): Promise<number> {
+): Promise<{ amount: number; classic: number; v2022: number }> {
   const timeoutMs = Math.max(5000, opts?.timeoutMs ?? 22_000);
   const everyMs = Math.max(200, opts?.everyMs ?? 350);
   const stopAt = Date.now() + timeoutMs;
-  let last = 0,
-    attempt = 0;
+
+  const { getAssociatedTokenAddress } = await import("@solana/spl-token");
+  const { fetchMultipleAccountInfos } = await import("./utils/balances");
+
+  const mintPk = mint;
+  const ataClassic = await getAssociatedTokenAddress(
+    mintPk,
+    owner,
+    false,
+    TOKEN_PROGRAM_ID,
+  );
+  const ata2022 = await getAssociatedTokenAddress(
+    mintPk,
+    owner,
+    false,
+    TOKEN_2022_PROGRAM_ID,
+  );
+
+  let classic = 0,
+    v2022 = 0;
 
   while (Date.now() < stopAt) {
-    if (opts?.abort?.aborted) return last;
-    last = await getCombinedTokenBalance(
-      connection,
-      owner,
-      mint,
-      decimals,
-    ).catch(() => 0);
-    if (last > 0) return last;
-    await new Promise((r) =>
-      setTimeout(r, everyMs + Math.min(1500, attempt * 60)),
-    );
-    attempt++;
+    if (opts?.abort?.aborted) break;
+    const infos = await fetchMultipleAccountInfos(connection, [
+      ataClassic,
+      ata2022,
+    ]).catch(() => null);
+    if (infos && infos.length === 2) {
+      classic = Number(_decodeAtaAmount(infos[0])) / Math.pow(10, decimals);
+      v2022 = Number(_decodeAtaAmount(infos[1])) / Math.pow(10, decimals);
+      const amount = (classic || 0) + (v2022 || 0);
+      if (amount > 0)
+        return { amount, classic: classic || 0, v2022: v2022 || 0 };
+    }
+    await new Promise((r) => setTimeout(r, everyMs));
   }
-  return last;
+  const amount = (classic || 0) + (v2022 || 0);
+  return { amount, classic: classic || 0, v2022: v2022 || 0 };
 }
 const PF_BASE_SOL = Math.max(
   0.000006,
@@ -2100,21 +2119,27 @@ export const useStore = create<Store>()(
               throw new Error("cancelled");
             }
 
-            // After transfers, perform one aggregated sell from destination
-            // wait a tiny bit for balances to settle
+            // --- после confirmManyHttp(...) перед сборкой payload на продажу:
             try {
-              await new Promise((r) => setTimeout(r, 200));
+              await new Promise((r) => setTimeout(r, 350));
             } catch {}
 
-            let amountTok = await waitForDestTokens(
+            // ждём появления токенов суммарно (SPL + Token22)
+            const waited = await waitForDestTokens(
               connection as Connection,
               dstOwner,
               mintPk,
               decimals,
-              { timeoutMs: 22_000, abort: ac.signal },
-            ).catch(() => 0);
+              { timeoutMs: 22_000, everyMs: 280, abort: ac.signal },
+            ).catch(() => ({ amount: 0, classic: 0, v2022: 0 }));
 
-            // последний шанс — прежний helper (если прокси/WS подвёл)
+            get().addLog(
+              waited.amount > 0 ? "ok" : "info",
+              `Sell ALL: dst ready ≈ ${waited.amount.toFixed(Math.min(6, decimals))} TOK (classic=${waited.classic.toFixed(Math.min(6, decimals))}, v2022=${waited.v2022.toFixed(Math.min(6, decimals))})`,
+            );
+
+            // последний резервный опрос старым helper'ом, если вдруг сумма 0
+            let amountTok = waited.amount;
             if (amountTok <= 0) {
               try {
                 const rawWallet = await getSPLBalance(
@@ -2123,19 +2148,17 @@ export const useStore = create<Store>()(
                   s.tokenMint,
                 );
                 const alt = Number(rawWallet as any) / Math.pow(10, decimals);
-                if (alt > 0)
+                if (alt > 0) {
+                  amountTok = alt;
                   get().addLog("warn", "Sell ALL: fallback getSPLBalance helped");
-                amountTok = Math.max(amountTok, alt);
+                }
               } catch {}
             }
 
+            // минимальный «непыльный» порог
             const dustThr =
               1 / Math.pow(10, Math.min(6, Math.max(0, decimals || 9)));
             if (amountTok <= dustThr) {
-              get().addLog(
-                "info",
-                "Sell ALL: на адресе продажи нет токенов (classic+2022 суммарно)",
-              );
               set((st) => ({
                 sellAllState: {
                   ...st.sellAllState,
@@ -2150,6 +2173,10 @@ export const useStore = create<Store>()(
             const amountRounded = Math.max(
               dustThr,
               +amountTok.toFixed(Math.min(6, decimals)),
+            );
+            get().addLog(
+              "info",
+              `Sell ALL: aggregated amount=${amountRounded.toFixed(Math.min(6, decimals))} TOK`,
             );
 
             const priorityFeeSol = Math.max(
@@ -3055,9 +3082,9 @@ export const useStore = create<Store>()(
           maxSellSliceTokPct: 0.06,
           minSliceGapMs: 500,
           maxSliceGapMs: 1400,
-          // Новые поля — раннер уже их поддерживает
-          maxRoundtripLoss: 0.006, // ограничиваем round-trip
-          noLossFloorBps: 15, // мягкий no-loss (не продаём < avg*(1+0.15%))
+          // ↓ Новое — раннер уже читает эти поля
+          maxRoundtripLoss: 0.006, // отсечь плохие маршруты (≈0.6%)
+          noLossFloorBps: 15, // не продавать ниже avg * (1+0.15%) для обычных sell
         }),
       }) as Store,
     {
