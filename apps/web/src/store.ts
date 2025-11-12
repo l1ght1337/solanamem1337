@@ -45,6 +45,9 @@ import {
   getMintDecimals,
   getSPLBalance,
   findAtaAnyTokenProgram,
+  safeGetAccountInfo,
+  fetchMultipleAccountInfos,
+  readOwnerTokenRaw,
 } from "./utils/solana";
 import { scheduleFetch, getNetMetrics } from "./utils/network";
 import {
@@ -55,7 +58,6 @@ import {
   buildPriorityComputeIxs,
 } from "./utils/tx";
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
-import { fetchMultipleAccountInfos } from "./utils/balances";
 import {
   safeParseNumber,
   safeDivide,
@@ -84,9 +86,6 @@ async function getCombinedTokenBalance(
   mint: PublicKey,
   decimals: number,
 ): Promise<number> {
-  const { getAssociatedTokenAddress } = await import("@solana/spl-token");
-  const { fetchMultipleAccountInfos } = await import("./utils/balances");
-
   const ataClassic = await getAssociatedTokenAddress(
     mint,
     owner,
@@ -108,47 +107,6 @@ async function getCombinedTokenBalance(
   return Number(raw) / Math.pow(10, Math.max(0, decimals || 9));
 }
 
-// SELLALL-FIX: read both classic & 2022 ATAs and sum amounts
-async function readOwnerTokenRaw(
-  connection: Connection,
-  owner: PublicKey,
-  mint: PublicKey,
-): Promise<{ raw: bigint; hasClassic: boolean; has2022: boolean }> {
-  const classic = await getAssociatedTokenAddress(
-    mint,
-    owner,
-    false,
-    TOKEN_PROGRAM_ID,
-  );
-  const t22 = await getAssociatedTokenAddress(
-    mint,
-    owner,
-    false,
-    TOKEN_2022_PROGRAM_ID,
-  );
-
-  const infos = await fetchMultipleAccountInfos(connection, [classic, t22]);
-  const [accC, acc22] = infos;
-
-  const decode = (acc: any): bigint => {
-    try {
-      const data: Uint8Array | undefined = acc?.data as any;
-      if (!data || data.byteLength < 72) return 0n;
-      // amount u64 LE at offset 64
-      const view = new DataView(data.buffer, data.byteOffset + 64, 8);
-      const lo = view.getUint32(0, true),
-        hi = view.getUint32(4, true);
-      return (BigInt(hi) << 32n) + BigInt(lo);
-    } catch {
-      return 0n;
-    }
-  };
-
-  const rawC = decode(accC);
-  const raw22 = decode(acc22);
-  return { raw: rawC + raw22, hasClassic: !!accC, has2022: !!acc22 };
-}
-
 async function waitForDestTokens(
   connection: Connection,
   owner: PublicKey,
@@ -159,9 +117,6 @@ async function waitForDestTokens(
   const timeoutMs = Math.max(5000, opts?.timeoutMs ?? 22_000);
   const everyMs = Math.max(200, opts?.everyMs ?? 350);
   const stopAt = Date.now() + timeoutMs;
-
-  const { getAssociatedTokenAddress } = await import("@solana/spl-token");
-  const { fetchMultipleAccountInfos } = await import("./utils/balances");
 
   const mintPk = mint;
   const ataClassic = await getAssociatedTokenAddress(
@@ -2041,6 +1996,26 @@ export const useStore = create<Store>()(
                     return k.publicKey;
                   })();
 
+              const sysAccount = await safeGetAccountInfo(
+                connectionTyped,
+                dstOwner,
+                "processed",
+              );
+              if (!sysAccount) {
+                set((st) => ({
+                  sellAllState: {
+                    ...st.sellAllState,
+                    status: "done",
+                    msg: "Destination wallet is not created on-chain (top up ≥0.003 SOL)",
+                  },
+                }));
+                get().addLog(
+                  "warn",
+                  `Sell ALL: dst owner ${dstOwner.toBase58()} не создан на сети (0 SOL). Пропускаю без ошибки.`,
+                );
+                return;
+              }
+
             const transferOne = async (b: LiveBot) => {
               const started = Date.now();
               const prog = get().sellAllState.progressByBot || {};
@@ -2310,11 +2285,11 @@ export const useStore = create<Store>()(
             seen2022 = false;
 
           do {
-            const res = await readOwnerTokenRaw(
-              connection as Connection,
-              dstOwner,
-              mintPk,
-            );
+              const res = await readOwnerTokenRaw(
+                connectionTyped,
+                dstOwner,
+                mintPk,
+              );
             rawTotal = res.raw;
             seenClassic = res.hasClassic || seenClassic;
             seen2022 = res.has2022 || seen2022;
@@ -2325,38 +2300,38 @@ export const useStore = create<Store>()(
           const dec = decimals ?? 9;
           const amountTok = Number(rawTotal) / Math.pow(10, dec);
 
-          get().addLog(
-            "info",
-            `Sell ALL: dst raw=${rawTotal.toString()} (classic=${seenClassic ? "yes" : "no"}; t22=${seen2022 ? "yes" : "no"}; dec=${dec})`,
-          );
+            get().addLog(
+              "info",
+              `Sell ALL: dst raw=${rawTotal.toString()} (classic=${seenClassic ? "yes" : "no"}; t22=${seen2022 ? "yes" : "no"}; dec=${dec})`,
+            );
 
-          if (!Number.isFinite(amountTok) || amountTok <= 0) {
+            if (!Number.isFinite(amountTok) || amountTok <= 0) {
               set((st) => ({
                 sellAllState: {
                   ...st.sellAllState,
                   status: "done",
-                  msg: "ok: no tokens to sell",
+                  msg: "No tokens to sell",
                 },
               }));
               await get().refreshBalances(connection);
               return;
             }
 
-          let amountRounded = +amountTok.toFixed(Math.min(6, dec));
+            let amountRounded = +amountTok.toFixed(Math.min(6, dec));
 
-          const dustThr =
-            1 / Math.pow(10, Math.min(6, Math.max(0, dec)));
-          if (amountTok <= dustThr) {
-            set((st) => ({
-              sellAllState: {
-                ...st.sellAllState,
-                status: "done",
-                  msg: "ok: no tokens to sell",
-              },
-            }));
-            await get().refreshBalances(connection);
-            return;
-          }
+            const dustThr =
+              1 / Math.pow(10, Math.min(6, Math.max(0, dec)));
+            if (amountTok <= dustThr) {
+              set((st) => ({
+                sellAllState: {
+                  ...st.sellAllState,
+                  status: "done",
+                  msg: "No tokens to sell",
+                },
+              }));
+              await get().refreshBalances(connection);
+              return;
+            }
 
           if (amountRounded < dustThr) amountRounded = dustThr;
           get().addLog(
