@@ -51,6 +51,82 @@ import {
   safeMultiply,
   safeAdd,
 } from "./utils/number";
+
+// ---------- helpers: combined token balance & wait ----------
+// u64 amount из ATA (LE, offset=64), без тяжёлых парсеров
+function _decodeAtaAmount(
+  acc: import("@solana/web3.js").AccountInfo<Buffer> | null,
+): bigint {
+  try {
+    if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+    const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+    const lo = view.getUint32(0, true),
+      hi = view.getUint32(4, true);
+    return (BigInt(hi) << 32n) + BigInt(lo);
+  } catch {
+    return 0n;
+  }
+}
+
+async function getCombinedTokenBalance(
+  connection: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+  decimals: number,
+): Promise<number> {
+  const { getAssociatedTokenAddress } = await import("@solana/spl-token");
+  const { fetchMultipleAccountInfos } = await import("./utils/balances");
+
+  const ataClassic = await getAssociatedTokenAddress(
+    mint,
+    owner,
+    false,
+    TOKEN_PROGRAM_ID,
+  );
+  const ata2022 = await getAssociatedTokenAddress(
+    mint,
+    owner,
+    false,
+    TOKEN_2022_PROGRAM_ID,
+  );
+
+  const infos = await fetchMultipleAccountInfos(connection, [
+    ataClassic,
+    ata2022,
+  ]);
+  const raw = _decodeAtaAmount(infos[0]) + _decodeAtaAmount(infos[1]);
+  return Number(raw) / Math.pow(10, Math.max(0, decimals || 9));
+}
+
+async function waitForDestTokens(
+  connection: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+  decimals: number,
+  opts?: { timeoutMs?: number; everyMs?: number; abort?: AbortSignal },
+): Promise<number> {
+  const timeoutMs = Math.max(5000, opts?.timeoutMs ?? 22_000);
+  const everyMs = Math.max(200, opts?.everyMs ?? 350);
+  const stopAt = Date.now() + timeoutMs;
+  let last = 0,
+    attempt = 0;
+
+  while (Date.now() < stopAt) {
+    if (opts?.abort?.aborted) return last;
+    last = await getCombinedTokenBalance(
+      connection,
+      owner,
+      mint,
+      decimals,
+    ).catch(() => 0);
+    if (last > 0) return last;
+    await new Promise((r) =>
+      setTimeout(r, everyMs + Math.min(1500, attempt * 60)),
+    );
+    attempt++;
+  }
+  return last;
+}
 const PF_BASE_SOL = Math.max(
   0.000006,
   Number((import.meta as any).env?.VITE_PRIORITY_FEE_BASE ?? 0.000008),
@@ -860,6 +936,8 @@ export type Store = {
     maxSellSliceTokPct: number; // максимум процента позиции на один sell-срез
     minSliceGapMs: number; // минимальная пауза между срезами
     maxSliceGapMs: number; // максимальная пауза между срезами
+    maxRoundtripLoss?: number;
+    noLossFloorBps?: number;
   };
 };
 
@@ -2028,14 +2106,36 @@ export const useStore = create<Store>()(
               await new Promise((r) => setTimeout(r, 200));
             } catch {}
 
-            const rawWallet = await getSPLBalance(
-              connection,
-              dstOwner.toBase58(),
-              s.tokenMint,
-            );
-            const amountTok = Number(rawWallet as any) / Math.pow(10, decimals);
+            let amountTok = await waitForDestTokens(
+              connection as Connection,
+              dstOwner,
+              mintPk,
+              decimals,
+              { timeoutMs: 22_000, abort: ac.signal },
+            ).catch(() => 0);
+
+            // последний шанс — прежний helper (если прокси/WS подвёл)
             if (amountTok <= 0) {
-              s.addLog("info", "Sell ALL: на адресе продажи нет токенов");
+              try {
+                const rawWallet = await getSPLBalance(
+                  connection,
+                  dstOwner.toBase58(),
+                  s.tokenMint,
+                );
+                const alt = Number(rawWallet as any) / Math.pow(10, decimals);
+                if (alt > 0)
+                  get().addLog("warn", "Sell ALL: fallback getSPLBalance helped");
+                amountTok = Math.max(amountTok, alt);
+              } catch {}
+            }
+
+            const dustThr =
+              1 / Math.pow(10, Math.min(6, Math.max(0, decimals || 9)));
+            if (amountTok <= dustThr) {
+              get().addLog(
+                "info",
+                "Sell ALL: на адресе продажи нет токенов (classic+2022 суммарно)",
+              );
               set((st) => ({
                 sellAllState: {
                   ...st.sellAllState,
@@ -2046,7 +2146,11 @@ export const useStore = create<Store>()(
               await get().refreshBalances(connection);
               return;
             }
-            const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
+
+            const amountRounded = Math.max(
+              dustThr,
+              +amountTok.toFixed(Math.min(6, decimals)),
+            );
 
             const priorityFeeSol = Math.max(
               Number((import.meta as any).env?.VITE_PRIORITY_FEE_MIN ?? 1500) /
@@ -2915,15 +3019,15 @@ export const useStore = create<Store>()(
         }),
 
         // Размер шага сделки и форма исполнения (уменьшили шаги для снижения импакта)
-        tradeStepMinSol: 0.0002,
-        tradeStepMaxSol: 0.0008,
-        tradeSlicesMax: 4,
+        tradeStepMinSol: 0.00015,
+        tradeStepMaxSol: 0.0009,
+        tradeSlicesMax: 5,
         tradeJitterPct: 0.25,
         setTradeStep: (minSol, maxSol, slicesMax, jitterPct) =>
           set({
-            tradeStepMinSol: Math.max(0.00005, Number(minSol) || 0.0002),
-            tradeStepMaxSol: Math.max(0.0001, Number(maxSol) || 0.0008),
-            tradeSlicesMax: Math.max(1, Math.floor(Number(slicesMax) || 4)),
+            tradeStepMinSol: Math.max(0.00005, Number(minSol) || 0.00015),
+            tradeStepMaxSol: Math.max(0.0001, Number(maxSol) || 0.0009),
+            tradeSlicesMax: Math.max(1, Math.floor(Number(slicesMax) || 5)),
             tradeJitterPct: Math.min(
               0.5,
               Math.max(0, Number(jitterPct) || 0.25),
@@ -2938,19 +3042,22 @@ export const useStore = create<Store>()(
 
         // Риск-настройки (пока без UI; при желании вынесем в контролы)
         getRisk: () => ({
-          maxImpact: 0.018, // позволяем больше импакта в воле
+          maxImpact: 0.015, // было 0.018
           maxDrawdown: 0.12,
           reserveSol: 0.005,
-          maxNotionalPerMin: 0.0035, // ↑ лимит нотационала/мин
-          maxBuysPerMin: 3, // ↑ ≤3 покупки/мин на бота
-          maxSellsPerMin: 6,
+          maxNotionalPerMin: 0.0042, // можно чуть чаще малыми срезами
+          maxBuysPerMin: 4, // было 3
+          maxSellsPerMin: 7,
           lossThrPct: 0.004,
           lossWindowMs: 30000,
           lossCooldownMs: 120000,
-          maxBuySliceSol: 0.00055, // ↑ размер одного buy‑среза
-          maxSellSliceTokPct: 0.06, // ↑ один sell‑срез
+          maxBuySliceSol: 0.0006,
+          maxSellSliceTokPct: 0.06,
           minSliceGapMs: 500,
           maxSliceGapMs: 1400,
+          // Новые поля — раннер уже их поддерживает
+          maxRoundtripLoss: 0.006, // ограничиваем round-trip
+          noLossFloorBps: 15, // мягкий no-loss (не продаём < avg*(1+0.15%))
         }),
       }) as Store,
     {
