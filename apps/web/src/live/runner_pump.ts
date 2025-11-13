@@ -65,8 +65,8 @@ type RunCtx = {
 const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, "");
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 const PUMP_BASES = [API_BASE ? `${API_BASE}/x/pump` : "", ALT_PUMP, "https://pumpportal.fun"].filter(Boolean);
-const PF_BASE_SOL = Math.max(0.000006, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000008));
-const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00012));
+const PF_BASE_SOL = Math.max(0.00001, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_BASE) ?? 0.000015));
+const PF_MAX_SOL  = Math.max(PF_BASE_SOL, Number(((import.meta as any).env?.VITE_PRIORITY_FEE_MAX)  ?? 0.00016));
 // === очередь с ограничением конкурентности (глобально на вкладку)
 type Job<T> = () => Promise<T>;
 function makeQueue(concurrency = 3, baseGapMs = 150) {
@@ -99,10 +99,8 @@ function makeQueue(concurrency = 3, baseGapMs = 150) {
   };
 }
 
-const TB_CONC = Math.max(1, Number(((import.meta as any).env?.VITE_TRADE_BUILD_CONC) ?? 12));
-const TB_GAP  = Math.max(20, Number(((import.meta as any).env?.VITE_TRADE_BUILD_GAP_MS) ?? 60));
 const enqueueTradeBuild: <T>(fn: () => Promise<T>) => Promise<T> =
-  (window as any).__tradeQ || ((window as any).__tradeQ = makeQueue(TB_CONC, TB_GAP));
+  (window as any).__tradeQ || ((window as any).__tradeQ = makeQueue(3, 150));
 
 function withTimeout<T>(p: Promise<T>, ms = 20_000): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -427,8 +425,8 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
     else { lo = 80; hi = 120; }
     const rawBps = Number((ctx as any).slippageBps?.() ?? 50);
     const usedBps = Math.round(Math.max(lo, Math.min(hi, rawBps)));
-    const multByFail = failStreak >= 4 ? 4 : (failStreak >= 2 ? 2 : 1);
-    let priorityFeeSol = PF_BASE_SOL * multByFail * (volScore > 0.006 ? 1.35 : (volScore > 0.003 ? 1.15 : 1.0));
+    const multByFail = failStreak >= 3 ? 4 : (failStreak >= 2 ? 2 : 1);
+    let priorityFeeSol = PF_BASE_SOL * multByFail * (volScore > 0.006 ? 1.5 : (volScore > 0.003 ? 1.2 : 1.0));
     priorityFeeSol = Math.min(PF_MAX_SOL, +priorityFeeSol.toFixed(6));
 
     const payload =
@@ -473,8 +471,7 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             return;
           }
           // Roundtrip-loss check: WSOL -> TOK -> WSOL на маленькой пробе
-          const RT_SAMPLE = Math.min(1, Math.max(0, Number(((import.meta as any).env?.VITE_RT_SAMPLE) ?? 0.33)));
-          if (out > 0 && Math.random() < RT_SAMPLE) {
+          if (out > 0) {
             try {
               const backRaw = Math.max(1, Math.round(out * Math.pow(10, decimals)));
               const qb = await quoteFn({ inputMint: ctx.mint, outputMint: WSOL, amount: backRaw });
