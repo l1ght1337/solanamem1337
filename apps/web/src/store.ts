@@ -1,4 +1,5 @@
 
+
 // @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
@@ -2016,6 +2017,30 @@ export const useStore = create<Store>()(
                 return;
               }
 
+              if (dest.to === "wallet") {
+                try {
+                  await ensureWalletAta(
+                    connectionTyped,
+                    (dest as any).walletPubkey,
+                    s.tokenMint!,
+                  );
+                } catch (e: any) {
+                  const msg = e?.message || String(e);
+                  set((st) => ({
+                    sellAllState: {
+                      ...st.sellAllState,
+                      status: "error",
+                      msg: `Failed to ensure wallet ATA: ${msg}`,
+                    },
+                  }));
+                  get().addLog(
+                    "err",
+                    `Sell ALL: ensureWalletAta(wallet) failed: ${msg}`,
+                  );
+                  return;
+                }
+              }
+
             const transferOne = async (b: LiveBot) => {
               const started = Date.now();
               const prog = get().sellAllState.progressByBot || {};
@@ -3023,6 +3048,14 @@ export const useStore = create<Store>()(
           }
           decimals = decimals ?? 9;
 
+          try {
+            await ensureWalletAta(connection as Connection, walletPubkey, s.tokenMint);
+          } catch (e: any) {
+            const msg = e?.message || String(e);
+            s.addLog("err", `Sell ALL: ensureWalletAta(wallet) failed: ${msg}`);
+            return;
+          }
+
           for (let i = 0; i < s.bots.length; i++) {
             const b = s.bots[i];
             try {
@@ -3080,14 +3113,12 @@ export const useStore = create<Store>()(
               let useProgram = TOKEN_PROGRAM_ID;
               let srcAta = srcClassic;
               let dstAta = dstClassic;
-              let dstInfo = dstCInfo;
               let amountRaw = amtC;
               if (amt22 > 0n || (!srcCInfo && src22Info)) {
                 // предпочитаем 2022, если там есть баланс или только он существует
                 useProgram = TOKEN_2022_PROGRAM_ID;
                 srcAta = src22;
                 dstAta = dst22;
-                dstInfo = dst22Info;
                 amountRaw = amt22;
               }
               if (amountRaw <= 0n) {
@@ -3096,17 +3127,10 @@ export const useStore = create<Store>()(
               }
 
               const tx = new Transaction();
-              if (!dstInfo)
-                tx.add(
-                  createAssociatedTokenAccountInstruction(
-                    kp.publicKey,
-                    dstAta,
-                    walletPk,
-                    mintPk,
-                    useProgram,
-                  ),
-                );
-              // Если decimals по-прежнему не удалось получить корректно — сделаем transfer без checked
+
+              // At this point ensureWalletAta(...) has already created the wallet ATA,
+              // so we only need a plain transfer. We deliberately do NOT try to create
+              // ATA from the bot balance to avoid "insufficient funds for rent".
               if (typeof decimals === "number" && Number.isFinite(decimals)) {
                 tx.add(
                   createTransferCheckedInstruction(
