@@ -1,4 +1,4 @@
-р## RUNBOOK
+ар## RUNBOOK
 
 See `apps/web/RUNBOOK.md` for operational guidance (Jito, priority fees, parallelism, monitoring). Configure environment via `.env` using keys from `.env.example`.
 
