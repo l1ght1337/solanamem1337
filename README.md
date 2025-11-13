@@ -6,7 +6,7 @@
 ## Быстрый старт (Gitpod)
 1. Откройте в Gitpod (или импортируйте ZIP в свой GitHub и откройте репозиторий в Gitpod).
 2. Workspace сам запустит `pnpm dev` (порт 5173). Если не запустился — выполните вручную:
-   ```bash
+   ```bashя
    cd apps/web
    pnpm install
    pnpm dev --host
