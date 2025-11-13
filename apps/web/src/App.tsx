@@ -607,39 +607,64 @@ export default function App() {
           <span style={{ opacity: 0.75 }}>Каждый бот купит на ~80% своего текущего SOL (с учётом резерва)</span>
         </div>
 
-        {/* SELL ALL */}
-        <div style={row}>
-          <label style={toggle}>
-            <input id="sell-dest-wallet" type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'wallet'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'wallet' } })} />
-            to Wallet
-          </label>
-          <label style={toggle}>
-            <input id="sell-dest-treasury" type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'treasury'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'treasury' } })} />
-            to Treasury
-          </label>
-          <button
-            onClick={async () => {
-              if (!ensureConnection()) return;
-              if (!walletPubkey) {
-                alert("Подключите Phantom");
-                return;
-              }
-              const dest = (useStore.getState().sellAllState.destination || 'wallet');
-              if (dest === 'wallet') {
+          {/* SELL ALL */}
+          <div style={row}>
+            <label style={toggle}>
+              <input
+                id="sell-dest-wallet"
+                type="radio"
+                name="sellDest"
+                checked={(useStore.getState().sellAllState.destination || 'wallet') === 'wallet'}
+                onChange={() =>
+                  useStore.setState({
+                    sellAllState: {
+                      ...useStore.getState().sellAllState,
+                      destination: 'wallet',
+                    },
+                  })
+                }
+              />
+              to Wallet
+            </label>
+            <label style={toggle}>
+              <input
+                id="sell-dest-treasury"
+                type="radio"
+                name="sellDest"
+                checked={(useStore.getState().sellAllState.destination || 'wallet') === 'treasury'}
+                onChange={() =>
+                  useStore.setState({
+                    sellAllState: {
+                      ...useStore.getState().sellAllState,
+                      destination: 'treasury',
+                    },
+                  })
+                }
+              />
+              to Treasury
+            </label>
+            <button
+              onClick={async () => {
+                if (!ensureConnection()) return;
+                if (!walletPubkey) {
+                  alert('Подключите Phantom');
+                  return;
+                }
                 await s.sellAllToWalletOnPump(connection!, walletPubkey);
-              } else {
-                await s.sellAllParallel(connection!, { to: 'treasury' });
-              }
-            }}
-            style={btn}
-          >
-            Sell ALL
-          </button>
-          <span style={{ opacity: 0.75 }}>Боты переведут токены на выбранный адрес и затем продадут всё разом</span>
-          {s.sellAllState.status === 'running' && (
-            <button onClick={() => s.cancelSellAll()} style={btnDanger}>Cancel</button>
-          )}
-        </div>
+              }}
+              style={btn}
+            >
+              Sell ALL via my wallet
+            </button>
+            <span style={{ opacity: 0.75 }}>
+              bots send tokens to my wallet and the wallet sells everything in one shot
+            </span>
+            {s.sellAllState.status === 'running' && (
+              <button onClick={() => s.cancelSellAll()} style={btnDanger}>
+                Cancel
+              </button>
+            )}
+          </div>
 
         {s.sellAllState.status !== 'idle' && s.sellAllState.id && (
           <div style={{ marginTop: 8, padding: 10, border: "1px dashed #2a3350", borderRadius: 10 }}>
