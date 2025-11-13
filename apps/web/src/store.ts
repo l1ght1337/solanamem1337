@@ -58,6 +58,8 @@ import {
   buildPriorityComputeIxs,
 } from "./utils/tx";
 import { getJupiterQuote, WSOL } from "./utils/jupiter";
+import { runBot as runBotClassic } from "./live/runner";
+import { runBot as runBotPump } from "./live/runner_pump";
 import {
   safeParseNumber,
   safeDivide,
@@ -1659,12 +1661,10 @@ export const useStore = create<Store>()(
             const delay = Math.floor(Math.random() * 400);
             if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
 
-            const runnerLoader =
+            const run =
               get().external.provider === "pumpportal"
-                ? () => import("./live/runner_pump").then((m) => m.runBot)
-                : () => import("./live/runner").then((m) => m.runBot);
-
-            const run = await runnerLoader();
+                ? (runBotPump as any)
+                : (runBotClassic as any);
 
             try {
               const stop = (run as any)(
