@@ -3453,22 +3453,22 @@ export const useStore = create<Store>()(
 
         // Риск-настройки (пока без UI; при желании вынесем в контролы)
         getRisk: () => ({
-          maxImpact: 0.015, // было 0.018
-          maxDrawdown: 0.12,
-          reserveSol: 0.005,
-          maxNotionalPerMin: 0.0042, // можно чуть чаще малыми срезами
-          maxBuysPerMin: 4, // было 3
+          maxImpact: 0.01, // было 0.015 — режем маршруты с >1% импактом
+          maxDrawdown: 0.12, // оставить как есть
+          reserveSol: 0.006, // чуть больше SOL в запасе → меньше форс-сейлов
+          maxNotionalPerMin: 0.0042,
+          maxBuysPerMin: 4,
           maxSellsPerMin: 7,
           lossThrPct: 0.004,
           lossWindowMs: 30000,
           lossCooldownMs: 120000,
           maxBuySliceSol: 0.0006,
-          maxSellSliceTokPct: 0.06,
+          maxSellSliceTokPct: 0.045, // было 0.06 — продаём поменьше за один раз
           minSliceGapMs: 500,
           maxSliceGapMs: 1400,
           // ↓ Новое — раннер уже читает эти поля
-          maxRoundtripLoss: 0.006, // отсечь плохие маршруты (≈0.6%)
-          noLossFloorBps: 15, // не продавать ниже avg * (1+0.15%) для обычных sell
+          maxRoundtripLoss: 0.005, // было 0.006 — отбраковываем более убыточные маршруты
+          noLossFloorBps: 25, // было 15 — не продавать ниже avg*(1+0.25%) для обычных sell
         }),
       }) as Store,
     {
