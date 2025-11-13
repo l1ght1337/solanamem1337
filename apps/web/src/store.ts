@@ -1,4 +1,3 @@
-
 // @ts-nocheck
 // apps/web/src/store.ts
 import "./polyfills";
@@ -79,8 +78,21 @@ const API_BASE = ((import.meta.env as any).VITE_API_BASE || "").replace(/\/+$/, 
 const ALT_PUMP = ((import.meta.env as any).VITE_PUMP_API || "").replace(/\/+$/, "");
 
 // ⬇️ Jupiter base (через твой воркер). По умолчанию — "/jup"
-const JUP_BASE = ((import.meta.env as any).VITE_JUP_BASE || "/jup").replace(/\/+$/, "");
+const JUP_BASE = ((import.meta as any).env?.VITE_JUP_BASE || "https://quote-api.jup.ag").replace(/\/+$/, "");
 
+export async function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
+  const p = path.startsWith("/") ? path : `/${path}`;
+  // если JUP_BASE — абсолютный URL, идём напрямую
+  if (/^https?:\/\//i.test(JUP_BASE)) {
+    return fetchFirstOk(`${JUP_BASE}${p}`, init, 0);
+  }
+  // иначе пробуем через ваш прокси, при ошибке — прямой Jupiter
+  try {
+    return await fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
+  } catch {
+    return fetchFirstOk(`https://quote-api.jup.ag${p}`, init, 0);
+  }
+}
 // финальный список апстримов (прокси → свой бекенд → alt → публичный)
 const PUMP_BASES: string[] = [
   ...PROXIES.map((p) => `${p}/x/pump`),
@@ -94,10 +106,19 @@ let stickyBaseIdx = -1;
 
 /** Усиленная обёртка: пробует все базы с приоритетом sticky, повторы на 429/5xx, таймауты */
 async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase = 1) {
+  // если path — абсолютный URL, ходим напрямую (без PUMP_BASES)
+  if (/^https?:\/\//i.test(path)) {
+    const baseInit: RequestInit = {
+      keepalive: false, credentials: "omit", cache: "no-store", mode: "cors",
+      ...init, headers: { "Cache-Control": "no-store", ...(init.headers || {}) },
+    };
+    return scheduleFetch(path, { ...(baseInit as any), timeoutMs: 15_000, tries: 1 }, "pump");
+  }
+  
   const order = [...PUMP_BASES.keys()];
   if (stickyBaseIdx >= 0) {
     const i = order.indexOf(stickyBaseIdx);
-    if (i > 0) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
+    if (i > -1) { order.splice(i, 1); order.unshift(stickyBaseIdx); }
   }
 
   const baseInit: RequestInit = {
@@ -140,10 +161,7 @@ async function fetchFirstOk(path: string, init: RequestInit = {}, retriesPerBase
 }
 
 /* ⬇️ helper для Jupiter: уходит на {proxy}/jup/... или {proxy}/x/pump/jup/... */
-export function jupFetch(path: string, init?: RequestInit, retriesPerBase = 1) {
-  const p = path.startsWith("/") ? path : `/${path}`;
-  return fetchFirstOk(`${JUP_BASE}${p}`, init, retriesPerBase);
-}
+
 
 /* ⛑ ГЛОБАЛЬНЫЙ АНТИ-CORS ПАТЧ ДЛЯ JUPITER
    Любой прямой fetch на https://quote-api.jup.ag/* или https://price.jup.ag/*
