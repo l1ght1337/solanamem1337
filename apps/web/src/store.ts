@@ -3156,38 +3156,69 @@ export const useStore = create<Store>()(
             if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
           }
 
-          try {
-            const rawWallet = await getSPLBalance(connection, walletPubkey, s.tokenMint);
-            const amountTok = Number(rawWallet as any) / Math.pow(10, decimals);
-            if (amountTok <= 0) {
-              s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи");
-              return;
+            try {
+              const walletClassic = await getAssociatedTokenAddress(
+                mintPk,
+                walletPk,
+                false,
+                TOKEN_PROGRAM_ID,
+              );
+              const wallet22 = await getAssociatedTokenAddress(
+                mintPk,
+                walletPk,
+                false,
+                TOKEN_2022_PROGRAM_ID,
+              );
+
+              const [walletClassicInfo, wallet22Info] = await connection.getMultipleAccountsInfo([
+                walletClassic,
+                wallet22,
+              ]);
+              const decodeAmount = (acc: any): bigint => {
+                try {
+                  if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                  const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                  const lo = view.getUint32(0, true);
+                  const hi = view.getUint32(4, true);
+                  return (BigInt(hi) << 32n) + BigInt(lo);
+                } catch {
+                  return 0n;
+                }
+              };
+              const rawClassic = decodeAmount(walletClassicInfo);
+              const raw22 = decodeAmount(wallet22Info);
+              const rawSum = rawClassic + raw22;
+              const amountTok = Number(rawSum) / Math.pow(10, decimals);
+              if (amountTok <= 0) {
+                s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи");
+                return;
+              }
+
+              const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
+              s.addLog("info", `Sell ALL: на кошельке ~${amountRounded} TOK перед продажей`);
+              const vtx = await buildTradeTxPumpLocal({
+                publicKey: walletPubkey,
+                action: "sell",
+                mint: s.tokenMint,
+                denominatedInSol: "false",
+                amount: amountRounded,
+                slippage: safeBps(get().getSmartBps(), 50) / 100,
+                priorityFee: 0.00001,
+                pool: "auto",
+              });
+
+              const ph = (window as any).solana;
+              if (!ph?.signAndSendTransaction)
+                throw new Error("Phantom не поддерживает signAndSendTransaction");
+              const { signature } = await ph.signAndSendTransaction(vtx);
+              await confirmSigHttp(connection, signature);
+              s.addLog(
+                "ok",
+                `Sell ALL: кошелёк продал ~${amountRounded} TOK (${signature.slice(0, 8)}…)`,
+              );
+            } catch (e: any) {
+              get().addLog("err", `Sell ALL sell-phase: ${e?.message || String(e)}`);
             }
-
-            const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
-            const vtx = await buildTradeTxPumpLocal({
-              publicKey: walletPubkey,
-              action: "sell",
-              mint: s.tokenMint,
-              denominatedInSol: "false",
-              amount: amountRounded,
-              slippage: safeBps(get().getSmartBps(), 50) / 100,
-              priorityFee: 0.00001,
-              pool: "auto",
-            });
-
-            const ph = (window as any).solana;
-            if (!ph?.signAndSendTransaction)
-              throw new Error("Phantom не поддерживает signAndSendTransaction");
-            const { signature } = await ph.signAndSendTransaction(vtx);
-            await confirmSigHttp(connection, signature);
-            s.addLog(
-              "ok",
-              `Sell ALL: кошелёк продал ~${amountRounded} TOK (${signature.slice(0, 8)}…)`,
-            );
-          } catch (e: any) {
-            get().addLog("err", `Sell ALL sell-phase: ${e?.message || String(e)}`);
-          }
 
           await get().refreshBalances(connection);
         },
