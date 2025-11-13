@@ -2999,12 +2999,197 @@ export const useStore = create<Store>()(
           await get().buyAllBotsAtPercentOnPump(connection, 0.8, opts);
         },
 
-        // === Sell ALL — новая параллельная реализация, вызов совместимый с UI (кошелёк)
+        // === Sell ALL — боты → кошелёк → одна продажа
         async sellAllToWalletOnPump(connection, walletPubkey) {
-          await get().sellAllParallel(connection, {
-            to: "wallet",
-            walletPubkey,
-          });
+          const s = get();
+          if (!s.tokenMint) {
+            s.addLog("warn", "Sell ALL: mint не задан");
+            return;
+          }
+
+          const mintPk = new PublicKey(s.tokenMint);
+          const walletPk = new PublicKey(walletPubkey);
+          let decimals = s._mintDecimals;
+          if (decimals == null) {
+            // Сначала быстрый raw-декод; если не получилось — обычный helper
+            const fast = await getMintDecimalsFast(connection as Connection, mintPk);
+            decimals = fast ?? null;
+            if (decimals == null) {
+              try {
+                decimals = await getMintDecimals(connection, s.tokenMint);
+              } catch {}
+            }
+            if (decimals != null) set({ _mintDecimals: decimals });
+          }
+          decimals = decimals ?? 9;
+
+          for (let i = 0; i < s.bots.length; i++) {
+            const b = s.bots[i];
+            try {
+              const kp = getKeypair(b.keyId);
+              // Определяем используемую программу по существующему ATA (без getAccountInfo на mint)
+              const srcClassic = await getAssociatedTokenAddress(
+                mintPk,
+                kp.publicKey,
+                false,
+                TOKEN_PROGRAM_ID,
+              );
+              const src22 = await getAssociatedTokenAddress(
+                mintPk,
+                kp.publicKey,
+                false,
+                TOKEN_2022_PROGRAM_ID,
+              );
+              const dstClassic = await getAssociatedTokenAddress(
+                mintPk,
+                walletPk,
+                false,
+                TOKEN_PROGRAM_ID,
+              );
+              const dst22 = await getAssociatedTokenAddress(
+                mintPk,
+                walletPk,
+                false,
+                TOKEN_2022_PROGRAM_ID,
+              );
+
+              const infos = await connection.getMultipleAccountsInfo([
+                srcClassic,
+                src22,
+                dstClassic,
+                dst22,
+              ]);
+              const [srcCInfo, src22Info, dstCInfo, dst22Info] = infos;
+
+              // локальный декодер amount из ATA
+              const decodeAmount = (acc: any): bigint => {
+                try {
+                  if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                  const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                  const lo = view.getUint32(0, true),
+                    hi = view.getUint32(4, true);
+                  return (BigInt(hi) << 32n) + BigInt(lo);
+                } catch {
+                  return 0n;
+                }
+              };
+
+              const amtC = decodeAmount(srcCInfo);
+              const amt22 = decodeAmount(src22Info);
+
+              let useProgram = TOKEN_PROGRAM_ID;
+              let srcAta = srcClassic;
+              let dstAta = dstClassic;
+              let dstInfo = dstCInfo;
+              let amountRaw = amtC;
+              if (amt22 > 0n || (!srcCInfo && src22Info)) {
+                // предпочитаем 2022, если там есть баланс или только он существует
+                useProgram = TOKEN_2022_PROGRAM_ID;
+                srcAta = src22;
+                dstAta = dst22;
+                dstInfo = dst22Info;
+                amountRaw = amt22;
+              }
+              if (amountRaw <= 0n) {
+                s.addLog("info", `Sell ALL: у ${b.name} токенов нет`);
+                continue;
+              }
+
+              const tx = new Transaction();
+              if (!dstInfo)
+                tx.add(
+                  createAssociatedTokenAccountInstruction(
+                    kp.publicKey,
+                    dstAta,
+                    walletPk,
+                    mintPk,
+                    useProgram,
+                  ),
+                );
+              // Если decimals по-прежнему не удалось получить корректно — сделаем transfer без checked
+              if (typeof decimals === "number" && Number.isFinite(decimals)) {
+                tx.add(
+                  createTransferCheckedInstruction(
+                    srcAta,
+                    mintPk,
+                    dstAta,
+                    kp.publicKey,
+                    amountRaw,
+                    decimals,
+                    [],
+                    useProgram,
+                  ),
+                );
+              } else {
+                // fallback на не-checked передачу
+                const { createTransferInstruction } = await import("@solana/spl-token");
+                tx.add(
+                  createTransferInstruction(
+                    srcAta,
+                    dstAta,
+                    kp.publicKey,
+                    amountRaw,
+                    [],
+                    useProgram,
+                  ),
+                );
+              }
+
+              const { blockhash } = await connection.getLatestBlockhash("finalized");
+              tx.feePayer = kp.publicKey;
+              (tx as any).recentBlockhash = blockhash;
+              tx.sign(kp);
+              const sig = await connection.sendRawTransaction(tx.serialize(), {
+                skipPreflight: true,
+              });
+              await confirmSigHttp(connection, sig);
+
+              s.addLog(
+                "ok",
+                `Sell ALL: ${b.name} → wallet ${
+                  Number(amountRaw) / Math.pow(10, decimals)
+                } TOK (${sig.slice(0, 8)}…)`,
+              );
+            } catch (e: any) {
+              s.addLog("warn", `Sell ALL transfer ${s.bots[i].name}: ${e?.message || String(e)}`);
+            }
+            if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
+          }
+
+          try {
+            const rawWallet = await getSPLBalance(connection, walletPubkey, s.tokenMint);
+            const amountTok = Number(rawWallet as any) / Math.pow(10, decimals);
+            if (amountTok <= 0) {
+              s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи");
+              return;
+            }
+
+            const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
+            const vtx = await buildTradeTxPumpLocal({
+              publicKey: walletPubkey,
+              action: "sell",
+              mint: s.tokenMint,
+              denominatedInSol: "false",
+              amount: amountRounded,
+              slippage: safeBps(get().getSmartBps(), 50) / 100,
+              priorityFee: 0.00001,
+              pool: "auto",
+            });
+
+            const ph = (window as any).solana;
+            if (!ph?.signAndSendTransaction)
+              throw new Error("Phantom не поддерживает signAndSendTransaction");
+            const { signature } = await ph.signAndSendTransaction(vtx);
+            await confirmSigHttp(connection, signature);
+            s.addLog(
+              "ok",
+              `Sell ALL: кошелёк продал ~${amountRounded} TOK (${signature.slice(0, 8)}…)`,
+            );
+          } catch (e: any) {
+            get().addLog("err", `Sell ALL sell-phase: ${e?.message || String(e)}`);
+          }
+
+          await get().refreshBalances(connection);
         },
 
           // Авто-профили
