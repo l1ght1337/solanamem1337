@@ -1,11 +1,18 @@
+// apps/web/src/App.tsx
 import "./polyfills"; // <— важно: полифилл до всего остального
 
 import React, { useEffect, useMemo, useState } from "react";
 import { useStore } from "./store";
+import { confirmSigHttp } from "./utils/confirm";
 import { Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import CandleTV from "./components/CandleTV";
 import { getNetMetrics } from "./utils/network";
-import { confirmSigHttp } from "./utils/confirm"; // NEW: быстрый HTTP-confirm
+import { getTxTelemetry } from "./utils/tx";
+import { getActiveConnection, getActiveRpcUrl, getRpcTelemetry, healthcheckAndMaybeFailover } from "./utils/connection";
+import { logger } from "./utils/logger";
+import { getTokenPriceSOL } from "./utils/priceFeed";
+import { parseMint as parsePumpMint } from "./utils/pump";
+import { parseLocaleNumber, safeParseNumber, toFixedOrZero } from "./utils/number";
 
 declare global {
   interface Window {
@@ -16,75 +23,54 @@ declare global {
 export default function App() {
   const s = useStore();
 
-  // RPC из .env (поддержка двух вариантов имен)
-  const rpcPrimary = (import.meta.env as any).VITE_SOLANA_RPC_PRIMARY ?? (import.meta.env as any).VITE_RPC_PRIMARY;
-  const rpcFallback = (import.meta.env as any).VITE_SOLANA_RPC_FALLBACK_1 ?? (import.meta.env as any).VITE_RPC_FALLBACK;
-
-  const rpcUrl = (rpcPrimary || rpcFallback || "") as string;
-  const connection = useMemo(() => (rpcUrl ? new Connection(rpcUrl, { commitment: "processed" }) : undefined), [rpcUrl]);
+  // Smart RPC: primary + fallbacks with health-based failover
+  const [activeRpcUrl, setActiveRpcUrl] = useState<string>(() => getActiveRpcUrl());
+  const connection = useMemo(() => getActiveConnection(), [activeRpcUrl]);
 
   // RPC status for header
   const [rpcOk, setRpcOk] = useState<boolean | null>(null);
   const rpcHost = useMemo(() => {
-    try { return rpcUrl ? new URL(rpcUrl).host : ""; } catch { return rpcUrl || ""; }
-  }, [rpcUrl]);
+    try { return activeRpcUrl ? new URL(activeRpcUrl).host : ""; } catch { return activeRpcUrl || ""; }
+  }, [activeRpcUrl]);
   useEffect(() => {
     let stop = false;
-    (async () => {
-      if (!connection) { setRpcOk(null); return; }
-      try { await connection.getSlot("processed"); if (!stop) setRpcOk(true); }
-      catch { if (!stop) setRpcOk(false); }
-    })();
-    const id = setInterval(async () => {
-      if (!connection) return;
-      try { await connection.getSlot("processed"); if (!stop) setRpcOk(true); }
-      catch { if (!stop) setRpcOk(false); }
-    }, 20000);
+    // expose connection globally for light refreshes
+    (window as any).__conn = connection;
+    const check = async () => {
+      try {
+        logger.info("Boot: checking RPC health…");
+        await healthcheckAndMaybeFailover();
+        if (!stop) {
+          setRpcOk(true);
+          const url = getActiveRpcUrl();
+          if (url && url !== activeRpcUrl) setActiveRpcUrl(url);
+        }
+      } catch {
+        if (!stop) setRpcOk(false);
+      }
+    };
+    check();
+    const id = setInterval(check, 15000);
     return () => { stop = true; clearInterval(id); };
-  }, [connection]);
+  }, [connection, activeRpcUrl]);
 
   // авто-тикеры — чаще для цены
   useEffect(() => {
     if (!connection) return;
-    const id = setInterval(() => s.tickReal(), 3_000); // было 5s
-    const id2 = setInterval(() => s.refreshBalances(connection), 5_000);
-    // NEW: авто-адаптация профилей ботов
-    const id3 = setInterval(() => s.autoTick(), 5_000);
+    const id = setInterval(() => s.tickReal(), 2_000);
+    const id2 = setInterval(() => s.refreshBalances(connection), 3_000);
     return () => {
       clearInterval(id);
       clearInterval(id2);
-      clearInterval(id3);
     };
   }, [connection, s]);
 
   // Phantom
   const [walletPubkey, setWalletPubkey] = useState<string>("");
-
-  // NEW: подписка на события кошелька (переключение аккаунта/отключение и т.п.)
-  useEffect(() => {
-    const p = window.solana;
-    if (!p) return;
-    const onConnect = () => setWalletPubkey(p.publicKey?.toString() || "");
-    const onDisconnect = () => setWalletPubkey("");
-    const onAccountChanged = (pubkey: any) => setWalletPubkey(pubkey ? pubkey.toString() : "");
-    try {
-      p.on?.("connect", onConnect);
-      p.on?.("disconnect", onDisconnect);
-      p.on?.("accountChanged", onAccountChanged);
-      if (p.isConnected && p.publicKey) setWalletPubkey(p.publicKey.toString());
-    } catch {}
-    return () => {
-      try {
-        p.off?.("connect", onConnect);
-        p.off?.("disconnect", onDisconnect);
-        p.off?.("accountChanged", onAccountChanged);
-      } catch {}
-    };
-  }, []);
-
   const connectWallet = async () => {
     const p = window.solana;
     if (!p || !p.isPhantom) {
+      logger.warn("Phantom not detected");
       alert("Установите Phantom");
       return;
     }
@@ -140,8 +126,7 @@ export default function App() {
         tx.feePayer = fromPk;
         tx.recentBlockhash = (await connection!.getLatestBlockhash()).blockhash;
         const signed = await window.solana.signTransaction(tx);
-        const sig = await connection!.sendRawTransaction(signed.serialize(), { skipPreflight: true });
-        // NEW: быстрое подтверждение
+        const sig = await connection!.sendRawTransaction(signed.serialize(), { skipPreflight: true, maxRetries: 3 });
         await confirmSigHttp(connection!, sig);
         s.addLog("ok", `Funded ${b.name}: ${perBot.toFixed(6)} SOL (${sig})`);
       } catch (e: any) {
@@ -188,7 +173,9 @@ export default function App() {
       }
       try {
         const { getKeypair } = await import("./utils/keyring");
-        dest = getKeypair(id).publicKey.toBase58();
+        const kp = getKeypair(id);
+        if (!kp) { alert("Нет ключа Treasury"); return; }
+        dest = kp.publicKey.toBase58();
       } catch {
         alert("Не удалось получить адрес Treasury");
         return;
@@ -231,10 +218,15 @@ export default function App() {
             Price <b>{s.price.toFixed(9)}</b> | Equity{" "}
             <b>{s.bots.reduce((a, b) => a + b.solBalance, 0).toFixed(3)} SOL</b>
           </div>
-          {!rpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
-          {rpcUrl && (
+          {!activeRpcUrl && <span style={{ color: "#ffb86c" }}>RPC не задан в .env</span>}
+          {activeRpcUrl && (
             <span style={{ color: rpcOk ? "#8aff8a" : rpcOk === false ? "#ff6b6b" : "#97a6ba", fontSize: 12 }}>
               RPC {rpcHost} {rpcOk === null ? "…" : rpcOk ? "ok" : "fail"}
+              {" · p95Tx "}{getTxTelemetry().p95_ms}{" ms"}
+              {" · p95Confirm "}{getRpcTelemetry().p95ConfirmMs}{" ms"}
+              {" · failRate "}{(getRpcTelemetry() as any).failRate?.toFixed?.(2)}
+              {" · cu≥"}{Number((import.meta.env as any).VITE_PRIORITY_FEE_MIN ?? 1000)}{"µ/CU"}
+              {" · pf≥"}{Number((import.meta.env as any).VITE_PRIORITY_FEE_BASE ?? 0.000015)}{" SOL"}
             </span>
           )}
         </div>
@@ -263,7 +255,96 @@ export default function App() {
           <span style={{ color: "#97a6ba", fontSize: 12 }}>
             net: rps {getNetMetrics().rps} | q {getNetMetrics().queued} | in {getNetMetrics().inflight}
           </span>
+          <button onClick={() => { if (connection) s.refreshBalances(connection); }} style={btnSm}>Refresh balances</button>
+          {/* Аллокация 70/30 контролы */}
+          <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Alloc:</span>
           <input
+            id="alloc-target"
+            name="allocTarget"
+            type="number"
+            min={0.05}
+            max={0.95}
+            step={0.01}
+            value={s.allocTarget}
+            onChange={(e) => s.setAlloc(safeParseNumber(e.target.value), s.allocMin, s.allocMax)}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Target token allocation (0..1)"
+          />
+          <input
+            id="alloc-min"
+            name="allocMin"
+            type="number"
+            min={0.05}
+            max={0.98}
+            step={0.01}
+            value={s.allocMin}
+            onChange={(e) => s.setAlloc(s.allocTarget, safeParseNumber(e.target.value), s.allocMax)}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Min token allocation (rebalance buy)"
+          />
+          <input
+            id="alloc-max"
+            name="allocMax"
+            type="number"
+            min={0.06}
+            max={0.98}
+            step={0.01}
+            value={s.allocMax}
+            onChange={(e) => s.setAlloc(s.allocTarget, s.allocMin, safeParseNumber(e.target.value))}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Max token allocation (rebalance sell)"
+          />
+          {/* Шаг сделок */}
+          <span style={{ marginLeft: 12, color: "#97a6ba", fontSize: 12 }}>Step:</span>
+          <input
+            id="trade-step-min"
+            name="tradeStepMinSol"
+            type="number"
+            min={0.00005}
+            step={0.00005}
+            value={s.tradeStepMinSol}
+            onChange={(e) => s.setTradeStep(safeParseNumber(e.target.value), s.tradeStepMaxSol, s.tradeSlicesMax, s.tradeJitterPct)}
+            style={{ width: 80, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Min SOL per sub-order"
+          />
+          <input
+            id="trade-step-max"
+            name="tradeStepMaxSol"
+            type="number"
+            min={0.0001}
+            step={0.0001}
+            value={s.tradeStepMaxSol}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, safeParseNumber(e.target.value), s.tradeSlicesMax, s.tradeJitterPct)}
+            style={{ width: 80, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Max SOL per sub-order"
+          />
+          <input
+            id="trade-slices-max"
+            name="tradeSlicesMax"
+            type="number"
+            min={1}
+            max={5}
+            step={1}
+            value={s.tradeSlicesMax}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, safeParseNumber(e.target.value), s.tradeJitterPct)}
+            style={{ width: 60, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Max slices per order"
+          />
+          <input
+            id="trade-jitter-pct"
+            name="tradeJitterPct"
+            type="number"
+            min={0}
+            max={0.5}
+            step={0.01}
+            value={s.tradeJitterPct}
+            onChange={(e) => s.setTradeStep(s.tradeStepMinSol, s.tradeStepMaxSol, s.tradeSlicesMax, safeParseNumber(e.target.value))}
+            style={{ width: 70, background: "#0b0e1a", color: "#e2e8f0", border: "1px solid #283042", borderRadius: 6, padding: "4px 6px" }}
+            title="Random jitter of step size (0..0.5)"
+          />
+          <input
+            id="token-url"
+            name="tokenUrl"
             placeholder="Вставь ссылку BonkFun / LetsBonk (или mint)"
             value={s.tokenUrl}
             onChange={(e) => s.setTokenUrl(e.target.value)}
@@ -272,6 +353,27 @@ export default function App() {
           <button onClick={() => s.tickReal()} style={btn}>
             Refresh price
           </button>
+          {/* explicit wire-up to robust price feed with parsing */}
+          <button
+            onClick={async () => {
+              try {
+                const mint = parsePumpMint(s.tokenUrl) || s.tokenMint;
+                if (!mint) { s.addLog("warn", "Price: mint не распознан"); return; }
+                const ac = new AbortController();
+                setTimeout(() => ac.abort(), 2500);
+                const res = await getTokenPriceSOL(mint, ac.signal);
+                if (res.price && isFinite(res.price)) {
+                  useStore.setState({ price: res.price });
+                  s.addLog("ok", `Price updated (${res.source}) ${res.price}`);
+                } else {
+                  s.addLog("warn", `Price N/A (${res.reason || 'unknown'})`);
+                }
+              } catch (e: any) {
+                s.addLog("err", `Refresh price error: ${e?.message || String(e)}`);
+              }
+            }}
+            style={btnSm}
+          >Quick price</button>
           <div style={{ opacity: 0.7 }}>{s.tokenMint ? `mint: ${s.tokenMint}` : "mint не распознан"}</div>
         </div>
 
@@ -280,23 +382,25 @@ export default function App() {
           <div style={{ fontWeight: 600, marginBottom: 8 }}>Create Pump.fun token + авто-покупка ботами</div>
           <div style={row}>
             <span>Name</span>
-            <input value={cName} onChange={(e) => setCName(e.target.value)} style={{ ...input, width: 160 }} />
+            <input id="create-name" name="name" value={cName} onChange={(e) => setCName(e.target.value)} style={{ ...input, width: 160 }} />
             <span>Symbol</span>
-            <input value={cSymbol} onChange={(e) => setCSymbol(e.target.value)} style={{ ...input, width: 120 }} />
+            <input id="create-symbol" name="symbol" value={cSymbol} onChange={(e) => setCSymbol(e.target.value)} style={{ ...input, width: 120 }} />
             <span>Image URL</span>
-            <input value={cImage} onChange={(e) => setCImage(e.target.value)} style={{ ...input, width: 260 }} />
+            <input id="create-image" name="image" value={cImage} onChange={(e) => setCImage(e.target.value)} style={{ ...input, width: 260 }} />
           </div>
           <div style={row}>
             <span>Desc</span>
-            <input value={cDesc} onChange={(e) => setCDesc(e.target.value)} style={{ ...input, width: 420 }} />
+            <input id="create-desc" name="description" value={cDesc} onChange={(e) => setCDesc(e.target.value)} style={{ ...input, width: 420 }} />
             <span>Decimals</span>
-            <input type="number" value={cDec} onChange={(e) => setCDec(+e.target.value)} style={{ ...input, width: 80 }} />
+            <input id="create-decimals" name="decimals" type="number" value={cDec} onChange={(e) => setCDec(safeParseNumber(e.target.value, 6))} style={{ ...input, width: 80 }} />
             <span>Initial buy (SOL)</span>
             <input
+              id="create-initial-buy"
+              name="initialBuy"
               type="number"
               step="0.001"
               value={cInitialBuy}
-              onChange={(e) => setCInitialBuy(+e.target.value)}
+              onChange={(e) => setCInitialBuy(safeParseNumber(e.target.value, 0))}
               style={{ ...input, width: 120 }}
             />
             <button onClick={createPump} style={btn}>
@@ -309,14 +413,18 @@ export default function App() {
         <div style={row}>
           <span>Slippage (bps)</span>
           <input
+            id="slippage-bps"
+            name="slippageBps"
             type="number"
             step="1"
             value={s.slippageBps}
-            onChange={(e) => useStore.setState({ slippageBps: Math.max(0, Number(e.target.value) || 0) })}
+            onChange={(e) => useStore.setState({ slippageBps: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 90 }}
           />
           <label style={toggle}>
             <input
+              id="use-random-size"
+              name="useRandomSize"
               type="checkbox"
               checked={s.useRandomSize}
               onChange={(e) => useStore.setState({ useRandomSize: e.target.checked })}
@@ -325,18 +433,22 @@ export default function App() {
           </label>
           <span>min</span>
           <input
+            id="trade-range-min"
+            name="tradeRangeMin"
             type="number"
             step="0.001"
             value={s.tradeRange.minSol}
-            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, minSol: Number(e.target.value) || 0 } })}
+            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, minSol: safeParseNumber(e.target.value, 0) } })}
             style={{ ...input, width: 90 }}
           />
           <span>max</span>
           <input
+            id="trade-range-max"
+            name="tradeRangeMax"
             type="number"
             step="0.001"
             value={s.tradeRange.maxSol}
-            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, maxSol: Number(e.target.value) || 0 } })}
+            onChange={(e) => useStore.setState({ tradeRange: { ...s.tradeRange, maxSol: safeParseNumber(e.target.value, 0) } })}
             style={{ ...input, width: 90 }}
           />
         </div>
@@ -345,6 +457,8 @@ export default function App() {
         <div style={row}>
           <label style={toggle}>
             <input
+              id="smart-mm-enabled"
+              name="smartMMEnabled"
               type="checkbox"
               checked={s.smartMM.enabled}
               onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, enabled: e.target.checked } })}
@@ -353,38 +467,48 @@ export default function App() {
           </label>
           <span>minBps</span>
           <input
+            id="smart-mm-min-bps"
+            name="smartMMMinBps"
             type="number"
             value={s.smartMM.minBps}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, minBps: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, minBps: safeParseNumber(e.target.value, 20) } })}
             style={{ ...input, width: 80 }}
           />
           <span>maxBps</span>
           <input
+            id="smart-mm-max-bps"
+            name="smartMMMaxBps"
             type="number"
             value={s.smartMM.maxBps}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, maxBps: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, maxBps: safeParseNumber(e.target.value, 200) } })}
             style={{ ...input, width: 80 }}
           />
           <span>α</span>
           <input
+            id="smart-mm-alpha"
+            name="smartMMAlpha"
             type="number"
             step="0.05"
             value={s.smartMM.alpha}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, alpha: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, alpha: safeParseNumber(e.target.value, 0.6) } })}
             style={{ ...input, width: 80 }}
           />
           <span>TWAP</span>
           <input
+            id="smart-mm-twap-sec"
+            name="smartMMTwapSec"
             type="number"
             value={s.smartMM.twapSec}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSec: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSec: safeParseNumber(e.target.value, 120) } })}
             style={{ ...input, width: 80 }}
           />
           <span>slices</span>
           <input
+            id="smart-mm-twap-slices"
+            name="smartMMTwapSlices"
             type="number"
             value={s.smartMM.twapSlices}
-            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSlices: +e.target.value } })}
+            onChange={(e) => useStore.setState({ smartMM: { ...s.smartMM, twapSlices: safeParseNumber(e.target.value, 4) } })}
             style={{ ...input, width: 80 }}
           />
           <span style={{ opacity: 0.75 }}>now bps: {s.getSmartBps()}</span>
@@ -393,23 +517,27 @@ export default function App() {
         {/* Комиссионный резерв / Treasury */}
         <div style={row}>
           <label style={toggle}>
-            <input type="checkbox" checked={s.autoTopUp} onChange={(e) => useStore.setState({ autoTopUp: e.target.checked })} />
+            <input id="auto-top-up" name="autoTopUp" type="checkbox" checked={s.autoTopUp} onChange={(e) => useStore.setState({ autoTopUp: e.target.checked })} />
             Auto top-up
           </label>
           <span>Min fee (SOL)</span>
           <input
+            id="min-fee-sol"
+            name="minFeeSol"
             type="number"
             step="0.001"
             value={s.minFeeSol}
-            onChange={(e) => useStore.setState({ minFeeSol: Math.max(0, +e.target.value || 0) })}
+            onChange={(e) => useStore.setState({ minFeeSol: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 90 }}
           />
           <span>Top-up to</span>
           <input
+            id="top-up-to-sol"
+            name="topUpToSol"
             type="number"
             step="0.001"
             value={s.topUpToSol}
-            onChange={(e) => useStore.setState({ topUpToSol: Math.max(0, +e.target.value || 0) })}
+            onChange={(e) => useStore.setState({ topUpToSol: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 90 }}
           />
           <TreasurySetter />
@@ -419,10 +547,12 @@ export default function App() {
         <div style={row}>
           <span>Fund total (SOL)</span>
           <input
+            id="fund-total"
+            name="fundTotal"
             type="number"
             step="0.001"
             value={fundTotal}
-            onChange={(e) => setFundTotal(+e.target.value)}
+            onChange={(e) => setFundTotal(safeParseNumber(e.target.value, 0))}
             style={{ ...input, width: 120 }}
           />
           <button onClick={fundAllEqually} style={btn}>
@@ -430,7 +560,7 @@ export default function App() {
           </button>
 
           <label style={{ ...toggle, marginLeft: 8 }}>
-            <input type="checkbox" checked={warmAfterFund} onChange={(e) => setWarmAfterFund(e.target.checked)} />
+            <input id="warm-after-fund" name="warmAfterFund" type="checkbox" checked={warmAfterFund} onChange={(e) => setWarmAfterFund(e.target.checked)} />
             Warm-up after fund (mainnet)
           </label>
           <button onClick={mainnetWarm} style={btn}>
@@ -441,18 +571,20 @@ export default function App() {
         <div style={row}>
           <span>Drain keep (SOL)</span>
           <input
+            id="drain-min-keep-sol"
+            name="drainMinKeepSol"
             type="number"
             step="0.001"
             value={s.drainMinKeepSol}
-            onChange={(e) => useStore.setState({ drainMinKeepSol: Math.max(0, +e.target.value || 0) })}
+            onChange={(e) => useStore.setState({ drainMinKeepSol: Math.max(0, safeParseNumber(e.target.value, 0)) })}
             style={{ ...input, width: 110 }}
           />
           <label style={toggle}>
-            <input type="radio" name="drainTo" checked={drainTo === "wallet"} onChange={() => setDrainTo("wallet")} />
+            <input id="drain-to-wallet" type="radio" name="drainTo" checked={drainTo === "wallet"} onChange={() => setDrainTo("wallet")} />
             to Wallet
           </label>
           <label style={toggle}>
-            <input type="radio" name="drainTo" checked={drainTo === "treasury"} onChange={() => setDrainTo("treasury")} />
+            <input id="drain-to-treasury" type="radio" name="drainTo" checked={drainTo === "treasury"} onChange={() => setDrainTo("treasury")} />
             to Treasury
           </label>
           <button onClick={drainAll} style={btn}>
@@ -476,6 +608,14 @@ export default function App() {
 
         {/* SELL ALL */}
         <div style={row}>
+          <label style={toggle}>
+            <input id="sell-dest-wallet" type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'wallet'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'wallet' } })} />
+            to Wallet
+          </label>
+          <label style={toggle}>
+            <input id="sell-dest-treasury" type="radio" name="sellDest" checked={(useStore.getState().sellAllState.destination || 'wallet') === 'treasury'} onChange={() => useStore.setState({ sellAllState: { ...useStore.getState().sellAllState, destination: 'treasury' } })} />
+            to Treasury
+          </label>
           <button
             onClick={async () => {
               if (!ensureConnection()) return;
@@ -483,14 +623,53 @@ export default function App() {
                 alert("Подключите Phantom");
                 return;
               }
-              await s.sellAllToWalletOnPump(connection!, walletPubkey);
+              const dest = (useStore.getState().sellAllState.destination || 'wallet');
+              if (dest === 'wallet') {
+                await s.sellAllToWalletOnPump(connection!, walletPubkey);
+              } else {
+                await s.sellAllParallel(connection!, { to: 'treasury' });
+              }
             }}
             style={btn}
           >
-            Sell ALL via my wallet
+            Sell ALL
           </button>
-          <span style={{ opacity: 0.75 }}>Боты переведут токены на твой кошелёк и кошелёк продаст всё разом</span>
+          <span style={{ opacity: 0.75 }}>Боты переведут токены на выбранный адрес и затем продадут всё разом</span>
+          {s.sellAllState.status === 'running' && (
+            <button onClick={() => s.cancelSellAll()} style={btnDanger}>Cancel</button>
+          )}
         </div>
+
+        {s.sellAllState.status !== 'idle' && s.sellAllState.id && (
+          <div style={{ marginTop: 8, padding: 10, border: "1px dashed #2a3350", borderRadius: 10 }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>
+              Sell ALL · {s.sellAllState.destination} · {s.sellAllState.status} · op {s.sellAllState.id}
+            </div>
+            <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Token | Transfer ✓ | Swap ✓ | Retries | ms | Sig</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(120px,1fr) 100px 100px 80px 100px 220px', gap: 6, alignItems: 'center' }}>
+              <div style={{ fontWeight: 600 }}>Bot</div>
+              <div style={{ fontWeight: 600 }}>Transfer</div>
+              <div style={{ fontWeight: 600 }}>Swap</div>
+              <div style={{ fontWeight: 600 }}>Retries</div>
+              <div style={{ fontWeight: 600 }}>ms</div>
+              <div style={{ fontWeight: 600 }}>Signature</div>
+              {s.bots.map((b) => {
+                const p = s.sellAllState.progressByBot[b.id] || ({} as any);
+                return (
+                  <React.Fragment key={b.id}>
+                    <div>{b.name}</div>
+                    <div style={{ color: p.transferred ? '#8aff8a' : '#97a6ba' }}>{p.transferred ? '✓' : '…'}</div>
+                    <div style={{ color: p.swapped ? '#8aff8a' : '#97a6ba' }}>{p.swapped ? '✓' : '-'}</div>
+                    <div>{p.retries ?? 0}</div>
+                    <div>{p.ms ?? ''}</div>
+                    <div style={{ fontFamily: 'monospace' }}>{p.signature ? `${String(p.signature).slice(0,8)}…` : (p.error ? 'err' : '')}</div>
+                  </React.Fragment>
+                );
+              })}
+            </div>
+            {s.sellAllState.msg && <div style={{ marginTop: 6, color: s.sellAllState.status === 'error' ? '#ff6b6b' : '#97a6ba' }}>{s.sellAllState.msg}</div>}
+          </div>
+        )}
 
         {/* Глобальные действия — видны всегда */}
         <div style={row}>
@@ -515,7 +694,7 @@ export default function App() {
 
       {/* График */}
       <div style={{ marginTop: 12, border: "1px solid #283042", borderRadius: 10, overflow: "hidden" }}>
-        <CandleTV candles={s.candles} price={s.price} />
+        <CandleTV />
       </div>
 
       {/* Боты */}
@@ -530,35 +709,42 @@ export default function App() {
               Copy
             </button>
 
-            <select value={b.strategy} onChange={(e) => s.updateBot(b.id, { strategy: e.target.value as any })} style={select}>
+            <select id={`bot-table-${b.id}-strategy`} name="strategy" value={b.strategy} onChange={(e) => s.updateBot(b.id, { strategy: e.target.value as any })} style={select}>
               <option value="trend">trend</option>
               <option value="revert">revert</option>
               <option value="scalper">scalper</option>
+              <option value="momentum">momentum</option>
+              <option value="range">range</option>
+              <option value="maker">maker</option>
             </select>
 
             <span>Budget (SOL)</span>
             <input
+              id={`bot-table-${b.id}-budget`}
+              name="budget"
               type="number"
               step="0.001"
               value={b.budgetSol}
-              onChange={(e) => s.updateBot(b.id, { budgetSol: +e.target.value })}
+              onChange={(e) => s.updateBot(b.id, { budgetSol: safeParseNumber(e.target.value, 0) })}
               style={{ ...input, width: 90, opacity: s.useRandomSize ? 0.75 : 1 }}
             />
 
             <span>Speed (ms)</span>
             <input
+              id={`bot-table-${b.id}-speed`}
+              name="speed"
               type="number"
               step="100"
               value={b.speedMs}
-              onChange={(e) => s.updateBot(b.id, { speedMs: Math.max(200, +e.target.value || 0) })}
+              onChange={(e) => s.updateBot(b.id, { speedMs: Math.max(200, safeParseNumber(e.target.value, 0)) })}
               style={{ ...input, width: 90 }}
             />
 
             <label style={toggle}>
-              <input type="checkbox" checked={b.aiEnabled} onChange={(e) => s.updateBot(b.id, { aiEnabled: e.target.checked })} /> AI
+              <input id={`bot-table-${b.id}-ai`} name="aiEnabled" type="checkbox" checked={b.aiEnabled} onChange={(e) => s.updateBot(b.id, { aiEnabled: e.target.checked })} /> AI
             </label>
             <label style={toggle}>
-              <input type="checkbox" checked={!!b.manualLock} onChange={(e) => s.updateBot(b.id, { manualLock: e.target.checked })} /> Manual
+              <input id={`bot-table-${b.id}-manual`} name="manualLock" type="checkbox" checked={!!b.manualLock} onChange={(e) => s.updateBot(b.id, { manualLock: e.target.checked })} /> Manual
               lock
             </label>
 
@@ -580,15 +766,26 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 8, fontSize: 13, opacity: 0.85 }}>
-            fills: {b.fills} &nbsp; | &nbsp; avg: {b.avgSol.toFixed(9)} &nbsp; | &nbsp; realized:{" "}
-            <span style={{ color: "#23d18b" }}>{b.realized.toFixed(5)} SOL</span> &nbsp; | &nbsp; unrlzd:{" "}
-            <span style={{ color: "#23d18b" }}>{b.unrealized.toFixed(5)} SOL</span> &nbsp; | &nbsp; SOL {b.solBalance.toFixed(4)} | TOK{" "}
-            {b.tokenBalance.toFixed(3)} &nbsp; | &nbsp; last: {b.last || "hold"}
+            {(() => {
+              const fills = b.fills ?? 0;
+              const avg = (b.avgSol ?? 0).toFixed(9);
+              const realized = toFixedOrZero(b.realized, 5);
+              const unrl = toFixedOrZero(b.unrealized, 5);
+              const sol = (b.solBalance ?? 0).toFixed(4);
+              const tok = (b.tokenBalance ?? 0).toFixed(3);
+              return (
+                <>
+                  fills: {fills} &nbsp; | &nbsp; avg: {avg} &nbsp; | &nbsp; realized:{" "}
+                  <span style={{ color: "#23d18b" }}>{realized} SOL</span> &nbsp; | &nbsp; unrlzd:{" "}
+                  <span style={{ color: "#23d18b" }}>{unrl} SOL</span> &nbsp; | &nbsp; SOL {sol} | TOK {tok} &nbsp; | &nbsp; last: {b.last || "hold"}
+                </>
+              );
+            })()}
           </div>
 
-          {b.solBalance < s.minFeeSol && (
+          {(b.solBalance ?? 0) < s.minFeeSol && (
             <div style={{ marginTop: 6, color: "#ffb86c" }}>
-              Внимание: на боте мало SOL (есть {b.solBalance.toFixed(6)}, минимум {s.minFeeSol}).{" "}
+              Внимание: на боте мало SOL (есть {(b.solBalance ?? 0).toFixed(6)}, минимум {s.minFeeSol}).{" "}
               {s.autoTopUp && s.treasuryKeyId ? "Auto top-up включён." : "Включите auto top-up или пополните вручную."}
             </div>
           )}
@@ -622,8 +819,10 @@ function TreasurySetter() {
   const [secret, setSecret] = useState("");
   return (
     <>
-      <input placeholder="Treasury name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 160 }} />
+      <input id="treasury-name" name="treasuryName" placeholder="Treasury name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 160 }} />
       <input
+        id="treasury-secret"
+        name="treasurySecret"
         placeholder="Treasury secret (base58/base64)"
         value={secret}
         onChange={(e) => setSecret(e.target.value)}
@@ -649,8 +848,10 @@ function ImportBot() {
   const [secret, setSecret] = useState("");
   return (
     <>
-      <input placeholder="Bot name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 140 }} />
+      <input id="import-bot-name" name="botName" placeholder="Bot name" value={name} onChange={(e) => setName(e.target.value)} style={{ ...input, width: 140 }} />
       <input
+        id="import-bot-secret"
+        name="botSecret"
         placeholder="Bot secret (base58/base64)"
         value={secret}
         onChange={(e) => setSecret(e.target.value)}
