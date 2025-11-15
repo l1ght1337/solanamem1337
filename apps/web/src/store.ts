@@ -117,7 +117,7 @@ async function waitForDestTokens(
   decimals: number,
   opts?: { timeoutMs?: number; everyMs?: number; abort?: AbortSignal },
 ): Promise<{ amount: number; classic: number; v2022: number }> {
-  const timeoutMs = Math.max(2500, opts?.timeoutMs ?? 9000);
+  const timeoutMs = Math.max(5000, opts?.timeoutMs ?? 22_000);
   const everyMs = Math.max(200, opts?.everyMs ?? 350);
   const stopAt = Date.now() + timeoutMs;
 
@@ -854,10 +854,8 @@ export type Store = {
         swapped: boolean;
         signature?: string;
         retries: number;
-          rawAmount?: string;
         ms?: number;
         error?: string;
-          skipped?: boolean;
       }
     >;
     msg?: string;
@@ -1982,12 +1980,12 @@ export const useStore = create<Store>()(
               } catch {}
             }
 
-              const bots = get().bots.slice();
-              const rawMaxPar = Number(
-                (import.meta as any).env?.VITE_MAX_PARALLEL_SENDS ?? 16,
-              );
-              const maxPar = Math.min(32, Math.max(1, rawMaxPar));
-              const limit = createLimiter(maxPar);
+            const bots = get().bots.slice();
+            const maxPar = Math.max(
+              1,
+              Number((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS ?? 10),
+            );
+            const limit = createLimiter(maxPar);
             const dstOwner =
               dest.to === "wallet"
                 ? new PublicKey((dest as any).walletPubkey)
@@ -2088,16 +2086,6 @@ export const useStore = create<Store>()(
                       });
                       state.addLog("info", msg);
                     };
-
-                    if (
-                      (Number(b.posToken ?? 0) <= 0 &&
-                        Number(b.tokenBalance ?? 0) <= 0)
-                    ) {
-                      markSkip(
-                        `Sell ALL: ${b.name} — posToken=0 & tokenBalance=0 (skip)`,
-                      );
-                      return;
-                    }
 
                     const safeBalance = await getSPLBalance(
                       connectionTyped,
@@ -2258,7 +2246,6 @@ export const useStore = create<Store>()(
                     transferred: true,
                     signature: sig,
                     retries: 0,
-                    rawAmount: amountRaw.toString(),
                     ms: elapsed,
                   } as any;
                   set({
@@ -2301,8 +2288,8 @@ export const useStore = create<Store>()(
                 .filter(Boolean) as string[];
               if (sigs.length) {
                 await confirmManyHttp(connection, sigs, {
-                  pollMs: 150,
-                  timeoutMs: 15000,
+                  pollMs: 250,
+                  timeoutMs: 25000,
                   searchTransactionHistory: true,
                 });
               }
@@ -2312,90 +2299,70 @@ export const useStore = create<Store>()(
             }
 
             // --- после confirmManyHttp(...) перед сборкой payload на продажу:
-              try {
-                await new Promise((r) => setTimeout(r, 80));
-              } catch {}
+            try {
+              await new Promise((r) => setTimeout(r, 350));
+            } catch {}
 
-              const dec = decimals ?? 9;
-              const progressSnapshot = get().sellAllState.progressByBot || {};
-              const rawFromBots = Object.values(progressSnapshot)
-                .map((p: any) => {
-                  try {
-                    return BigInt(p?.rawAmount ?? "0");
-                  } catch {
-                    return 0n;
-                  }
-                })
-                .reduce((acc, val) => acc + val, 0n);
-              const fallbackAmountTok =
-                Number(rawFromBots) / Math.pow(10, dec);
+          // SELLALL-FIX: устойчивое ожидание прихода токенов и чтение classic+2022
+          const deadline = Date.now() + 8000; // ждём до 8 c обновления RPC
+          let rawTotal: bigint = 0n;
+          let seenClassic = false,
+            seen2022 = false;
 
-              const { amount, classic, v2022 } = await waitForDestTokens(
+          do {
+              const res = await readOwnerTokenRaw(
                 connectionTyped,
                 dstOwner,
                 mintPk,
-                dec,
-                { timeoutMs: 4000, everyMs: 200, abort: ac.signal },
               );
+            rawTotal = res.raw;
+            seenClassic = res.hasClassic || seenClassic;
+            seen2022 = res.has2022 || seen2022;
+            if (rawTotal > 0n) break;
+            await new Promise((r) => setTimeout(r, 250));
+          } while (Date.now() < deadline);
 
-              let amountTok = amount;
-              if (!Number.isFinite(amountTok) || amountTok <= 0) {
-                try {
-                  const rawSnapshot = await readOwnerTokenRaw(
-                    connectionTyped,
-                    dstOwner,
-                    mintPk,
-                  );
-                  amountTok =
-                    Number(rawSnapshot.raw) / Math.pow(10, dec);
-                } catch {}
-              }
+          const dec = decimals ?? 9;
+          const amountTok = Number(rawTotal) / Math.pow(10, dec);
 
-              if (!Number.isFinite(amountTok) || amountTok <= 0) {
-                amountTok = fallbackAmountTok;
-              }
-              if (!Number.isFinite(amountTok)) amountTok = 0;
+            get().addLog(
+              "info",
+              `Sell ALL: dst raw=${rawTotal.toString()} (classic=${seenClassic ? "yes" : "no"}; t22=${seen2022 ? "yes" : "no"}; dec=${dec})`,
+            );
 
-              let approxRaw = 0n;
-              if (Number.isFinite(amount) && amount > 0) {
-                const estRaw = Math.round(
-                  Math.max(0, amount) * Math.pow(10, dec),
-                );
-                if (Number.isFinite(estRaw) && estRaw >= 0) {
-                  const safeRaw = Math.min(Number.MAX_SAFE_INTEGER, estRaw);
-                  approxRaw = BigInt(safeRaw);
-                }
-              }
+            if (!Number.isFinite(amountTok) || amountTok <= 0) {
+              set((st) => ({
+                sellAllState: {
+                  ...st.sellAllState,
+                  status: "done",
+                  msg: "No tokens to sell",
+                },
+              }));
+              await get().refreshBalances(connection);
+              return;
+            }
 
-              get().addLog(
-                "info",
-                `Sell ALL: dst raw≈${approxRaw.toString()} (classic=${classic > 0 ? "yes" : "no"}; t22=${v2022 > 0 ? "yes" : "no"}; dec=${dec})`,
-              );
+            let amountRounded = +amountTok.toFixed(Math.min(6, dec));
 
-              const dustThr =
-                1 / Math.pow(10, Math.min(6, Math.max(0, dec)));
-              if (amountTok <= dustThr && fallbackAmountTok <= dustThr) {
-                set((st) => ({
-                  sellAllState: {
-                    ...st.sellAllState,
-                    status: "done",
-                    msg: "No tokens to sell",
-                  },
-                }));
-                await get().refreshBalances(connection);
-                return;
-              }
+            const dustThr =
+              1 / Math.pow(10, Math.min(6, Math.max(0, dec)));
+            if (amountTok <= dustThr) {
+              set((st) => ({
+                sellAllState: {
+                  ...st.sellAllState,
+                  status: "done",
+                  msg: "No tokens to sell",
+                },
+              }));
+              await get().refreshBalances(connection);
+              return;
+            }
 
-              let amountRounded = +amountTok.toFixed(Math.min(6, dec));
-              if (amountRounded < dustThr && amountTok > dustThr) {
-                amountRounded = dustThr;
-              }
-              get().addLog(
-                "info",
-                `Sell ALL: aggregated amount=${amountRounded.toFixed(
-                  Math.min(6, dec),
-                )} TOK`,
-              );
+          if (amountRounded < dustThr) amountRounded = dustThr;
+          get().addLog(
+            "info",
+            `Sell ALL: aggregated amount=${amountRounded.toFixed(Math.min(6, dec))} TOK`,
+          );
 
             const priorityFeeSol = Math.max(
               Number((import.meta as any).env?.VITE_PRIORITY_FEE_MIN ?? 1500) /
@@ -3089,20 +3056,10 @@ export const useStore = create<Store>()(
             return;
           }
 
-            for (let i = 0; i < s.bots.length; i++) {
-              const b = s.bots[i];
-              try {
-                if (
-                  Number(b.posToken ?? 0) <= 0 &&
-                  Number(b.tokenBalance ?? 0) <= 0
-                ) {
-                  s.addLog(
-                    "info",
-                    `Sell ALL: ${b.name} — posToken=0 & tokenBalance=0 (skip)`,
-                  );
-                  continue;
-                }
-                const kp = getKeypair(b.keyId);
+          for (let i = 0; i < s.bots.length; i++) {
+            const b = s.bots[i];
+            try {
+              const kp = getKeypair(b.keyId);
               // Определяем используемую программу по существующему ATA (без getAccountInfo на mint)
               const srcClassic = await getAssociatedTokenAddress(
                 mintPk,
@@ -3224,25 +3181,44 @@ export const useStore = create<Store>()(
           }
 
             try {
-              const { amount } = await waitForDestTokens(
-                connection as Connection,
-                walletPk,
+              const walletClassic = await getAssociatedTokenAddress(
                 mintPk,
-                decimals,
-                { timeoutMs: 4000, everyMs: 200 },
+                walletPk,
+                false,
+                TOKEN_PROGRAM_ID,
               );
-              const dustThr =
-                1 /
-                Math.pow(10, Math.min(6, Math.max(0, decimals)));
-              if (amount <= dustThr) {
+              const wallet22 = await getAssociatedTokenAddress(
+                mintPk,
+                walletPk,
+                false,
+                TOKEN_2022_PROGRAM_ID,
+              );
+
+              const [walletClassicInfo, wallet22Info] = await connection.getMultipleAccountsInfo([
+                walletClassic,
+                wallet22,
+              ]);
+              const decodeAmount = (acc: any): bigint => {
+                try {
+                  if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                  const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                  const lo = view.getUint32(0, true);
+                  const hi = view.getUint32(4, true);
+                  return (BigInt(hi) << 32n) + BigInt(lo);
+                } catch {
+                  return 0n;
+                }
+              };
+              const rawClassic = decodeAmount(walletClassicInfo);
+              const raw22 = decodeAmount(wallet22Info);
+              const rawSum = rawClassic + raw22;
+              const amountTok = Number(rawSum) / Math.pow(10, decimals);
+              if (amountTok <= 0) {
                 s.addLog("info", "Sell ALL: на кошельке нет токенов для продажи");
                 return;
               }
 
-              let amountRounded = +amount.toFixed(Math.min(6, decimals));
-              if (amountRounded < dustThr && amount > dustThr) {
-                amountRounded = dustThr;
-              }
+              const amountRounded = +amountTok.toFixed(Math.min(6, decimals));
               s.addLog("info", `Sell ALL: на кошельке ~${amountRounded} TOK перед продажей`);
               const vtx = await buildTradeTxPumpLocal({
                 publicKey: walletPubkey,
