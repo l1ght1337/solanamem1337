@@ -167,6 +167,16 @@ const PF_MAX_SOL = Math.max(
 const calcPriorityFeeSol = (mult = 1) =>
   Math.min(PF_MAX_SOL, +(PF_BASE_SOL * Math.max(1, mult)).toFixed(6));
 
+const MAX_PARALLEL_SENDS = Math.max(
+  4,
+  Number((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS ?? 14),
+);
+
+const DRAIN_FAST_MS = Math.max(
+  500,
+  Number((import.meta as any).env?.VITE_DRAIN_FAST_MS ?? 2500),
+);
+
 const runnerFaults = new Map<string, number>();
 const manualStops = new Set<string>();
 let runnerWatchdog: ReturnType<typeof setInterval> | null = null;
@@ -811,6 +821,7 @@ export type Store = {
     destAddress: string,
   ) => Promise<void>;
   drainAllTo: (connection: any, destAddress: string) => Promise<void>;
+    fastDrain: boolean;
 
   warmupCfg: { simulatePerBot: number; gapMs: number; ensureATA: boolean };
   safeWarmupBots: (connection: any) => Promise<void>;
@@ -1089,6 +1100,7 @@ export const useStore = create<Store>()(
         // Drain
         drainMinKeepSol: 0.01,
         drainDelayMs: 30_000,
+          fastDrain: true,
 
         _ppSub: undefined as any,
         setTokenUrl: (u) => {
@@ -1330,12 +1342,30 @@ export const useStore = create<Store>()(
         },
 
         async drainAllTo(connection, destAddress) {
-          const bots = get().bots;
-          const delay = get().drainDelayMs;
-          for (let i = 0; i < bots.length; i++) {
-            await get().drainBotTo(connection, bots[i].id, destAddress);
-            if (i < bots.length - 1)
-              await new Promise((r) => setTimeout(r, delay));
+          const bots = get().bots.slice();
+          if (!get().fastDrain) {
+            const delay = get().drainDelayMs;
+            for (let i = 0; i < bots.length; i++) {
+              await get().drainBotTo(connection, bots[i].id, destAddress);
+              if (i < bots.length - 1) {
+                await new Promise((r) => setTimeout(r, delay));
+              }
+            }
+          } else {
+            const parEnv = Number((import.meta as any).env?.VITE_DRAIN_PAR ?? 8);
+            const limit = createLimiter(Math.max(3, parEnv));
+            await Promise.allSettled(
+              bots.map((b) =>
+                limit(async () => {
+                  const started = Date.now();
+                  await get().drainBotTo(connection, b.id, destAddress);
+                  const elapsed = Date.now() - started;
+                  if (elapsed < DRAIN_FAST_MS) {
+                    await new Promise((r) => setTimeout(r, DRAIN_FAST_MS - elapsed));
+                  }
+                }),
+              ),
+            );
           }
           await get().refreshBalances(connection);
         },
@@ -1980,12 +2010,8 @@ export const useStore = create<Store>()(
               } catch {}
             }
 
-            const bots = get().bots.slice();
-            const maxPar = Math.max(
-              1,
-              Number((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS ?? 10),
-            );
-            const limit = createLimiter(maxPar);
+              const bots = get().bots.slice();
+              const limit = createLimiter(Math.max(1, MAX_PARALLEL_SENDS));
             const dstOwner =
               dest.to === "wallet"
                 ? new PublicKey((dest as any).walletPubkey)
@@ -2053,8 +2079,9 @@ export const useStore = create<Store>()(
                   progressByBot: { ...prog },
                 },
               });
-
-                try {
+            let safeBalanceRaw: bigint = 0n;
+            let programIdUsed = mintProgramId;
+            try {
                     const kp = getKeypair(b.keyId);
                     if (!kp) {
                       get().addLog("err", `Sell ALL: нет ключа для ${b.name}`);
@@ -2087,12 +2114,12 @@ export const useStore = create<Store>()(
                       state.addLog("info", msg);
                     };
 
-                    const safeBalance = await getSPLBalance(
+                    safeBalanceRaw = await getSPLBalance(
                       connectionTyped,
                       kp.publicKey,
                       mintPk,
                     );
-                    if (safeBalance <= 0n) {
+                    if (safeBalanceRaw <= 0n) {
                       markSkip(
                         `Sell ALL: ${b.name} — balance=0 for ${mintShort}… (skip)`,
                       );
@@ -2112,20 +2139,22 @@ export const useStore = create<Store>()(
                     }
 
                     let programId = detectedSrc.programId ?? mintProgramId;
+                    programIdUsed = programId;
                     let srcAta = detectedSrc.ata;
-                    let amountRaw = safeBalance;
+                    let amountRaw = safeBalanceRaw;
 
-                  // гарантируем целевой ATA
-                  const ensured = await ensureAtaIx({
-                    connection: connectionTyped,
-                    mint: mintPk,
-                    owner: dstOwner,
-                    payer: kp.publicKey,
-                    preferProgramId: programId,
-                  });
-                  const dstAta = ensured.ata;
-                  const ensureIx = ensured.ix;
-                  programId = ensured.programId || programId;
+                    // гарантируем целевой ATA
+                    const ensured = await ensureAtaIx({
+                      connection: connectionTyped,
+                      mint: mintPk,
+                      owner: dstOwner,
+                      payer: kp.publicKey,
+                      preferProgramId: programId,
+                    });
+                    const dstAta = ensured.ata;
+                    const ensureIx = ensured.ix;
+                    programId = ensured.programId || programId;
+                    programIdUsed = programId;
 
                   const tx = new Transaction();
                   tx.add(
@@ -2259,7 +2288,7 @@ export const useStore = create<Store>()(
                     "ok",
                     `Sell ALL: ${b.name} → ${dstOwner.toBase58().slice(0, 4)}… (${sig.slice(0, 8)}…)`,
                   );
-              } catch (e: any) {
+                } catch (e: any) {
                 const curr = get().sellAllState.progressByBot || {};
                 const msg =
                   e && (e as any).message
@@ -2273,7 +2302,10 @@ export const useStore = create<Store>()(
                   },
                 });
 
-                get().addLog("err", `Sell ALL: ${b.name} — ${msg}`);
+                  get().addLog(
+                    "err",
+                    `Sell ALL: ${b.name} — ${msg} (program=${programIdUsed.toBase58()}, raw=${safeBalanceRaw.toString()})`,
+                  );
               }
             };
 
@@ -2300,7 +2332,7 @@ export const useStore = create<Store>()(
 
             // --- после confirmManyHttp(...) перед сборкой payload на продажу:
             try {
-              await new Promise((r) => setTimeout(r, 350));
+              await new Promise((r) => setTimeout(r, 120));
             } catch {}
 
           // SELLALL-FIX: устойчивое ожидание прихода токенов и чтение classic+2022
@@ -3056,129 +3088,140 @@ export const useStore = create<Store>()(
             return;
           }
 
-          for (let i = 0; i < s.bots.length; i++) {
-            const b = s.bots[i];
-            try {
-              const kp = getKeypair(b.keyId);
-              // Определяем используемую программу по существующему ATA (без getAccountInfo на mint)
-              const srcClassic = await getAssociatedTokenAddress(
-                mintPk,
-                kp.publicKey,
-                false,
-                TOKEN_PROGRAM_ID,
-              );
-              const src22 = await getAssociatedTokenAddress(
-                mintPk,
-                kp.publicKey,
-                false,
-                TOKEN_2022_PROGRAM_ID,
-              );
-              const dstClassic = await getAssociatedTokenAddress(
-                mintPk,
-                walletPk,
-                false,
-                TOKEN_PROGRAM_ID,
-              );
-              const dst22 = await getAssociatedTokenAddress(
-                mintPk,
-                walletPk,
-                false,
-                TOKEN_2022_PROGRAM_ID,
-              );
+            const bots = s.bots.slice();
+            const decodeAmount = (acc: any): bigint => {
+              try {
+                if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
+                const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
+                const lo = view.getUint32(0, true);
+                const hi = view.getUint32(4, true);
+                return (BigInt(hi) << 32n) + BigInt(lo);
+              } catch {
+                return 0n;
+              }
+            };
+            const softParallel = Math.max(1, Math.floor(MAX_PARALLEL_SENDS / 2));
+            const limit = createLimiter(softParallel);
+            const sigs: string[] = [];
 
-              const infos = await connection.getMultipleAccountsInfo([
-                srcClassic,
-                src22,
-                dstClassic,
-                dst22,
-              ]);
-              const [srcCInfo, src22Info, dstCInfo, dst22Info] = infos;
-
-              // локальный декодер amount из ATA
-              const decodeAmount = (acc: any): bigint => {
-                try {
-                  if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
-                  const view = new DataView(acc.data.buffer, acc.data.byteOffset + 64, 8);
-                  const lo = view.getUint32(0, true),
-                    hi = view.getUint32(4, true);
-                  return (BigInt(hi) << 32n) + BigInt(lo);
-                } catch {
-                  return 0n;
+            const transferFromBotToWallet = async (b: LiveBot) => {
+              try {
+                const kp = getKeypair(b.keyId);
+                if (!kp) {
+                  s.addLog("err", `Sell ALL: нет ключа для ${b.name}`);
+                  return;
                 }
-              };
-
-              const amtC = decodeAmount(srcCInfo);
-              const amt22 = decodeAmount(src22Info);
-
-              let useProgram = TOKEN_PROGRAM_ID;
-              let srcAta = srcClassic;
-              let dstAta = dstClassic;
-              let amountRaw = amtC;
-              if (amt22 > 0n || (!srcCInfo && src22Info)) {
-                // предпочитаем 2022, если там есть баланс или только он существует
-                useProgram = TOKEN_2022_PROGRAM_ID;
-                srcAta = src22;
-                dstAta = dst22;
-                amountRaw = amt22;
-              }
-              if (amountRaw <= 0n) {
-                s.addLog("info", `Sell ALL: у ${b.name} токенов нет`);
-                continue;
-              }
-
-              const tx = new Transaction();
-
-              // At this point ensureWalletAta(...) has already created the wallet ATA,
-              // so we only need a plain transfer. We deliberately do NOT try to create
-              // ATA from the bot balance to avoid "insufficient funds for rent".
-              if (typeof decimals === "number" && Number.isFinite(decimals)) {
-                tx.add(
-                  createTransferCheckedInstruction(
-                    srcAta,
-                    mintPk,
-                    dstAta,
-                    kp.publicKey,
-                    amountRaw,
-                    decimals,
-                    [],
-                    useProgram,
-                  ),
+                const srcClassic = await getAssociatedTokenAddress(
+                  mintPk,
+                  kp.publicKey,
+                  false,
+                  TOKEN_PROGRAM_ID,
                 );
-              } else {
-                // fallback на не-checked передачу
-                const { createTransferInstruction } = await import("@solana/spl-token");
-                tx.add(
-                  createTransferInstruction(
-                    srcAta,
-                    dstAta,
-                    kp.publicKey,
-                    amountRaw,
-                    [],
-                    useProgram,
-                  ),
+                const src22 = await getAssociatedTokenAddress(
+                  mintPk,
+                  kp.publicKey,
+                  false,
+                  TOKEN_2022_PROGRAM_ID,
+                );
+                const dstClassic = await getAssociatedTokenAddress(
+                  mintPk,
+                  walletPk,
+                  false,
+                  TOKEN_PROGRAM_ID,
+                );
+                const dst22 = await getAssociatedTokenAddress(
+                  mintPk,
+                  walletPk,
+                  false,
+                  TOKEN_2022_PROGRAM_ID,
+                );
+
+                const [srcCInfo, src22Info] = await connection.getMultipleAccountsInfo([
+                  srcClassic,
+                  src22,
+                ]);
+                const amtC = decodeAmount(srcCInfo);
+                const amt22 = decodeAmount(src22Info);
+
+                let useProgram = TOKEN_PROGRAM_ID;
+                let srcAta = srcClassic;
+                let dstAta = dstClassic;
+                let amountRaw = amtC;
+                if (amt22 > 0n || (!srcCInfo && src22Info)) {
+                  useProgram = TOKEN_2022_PROGRAM_ID;
+                  srcAta = src22;
+                  dstAta = dst22;
+                  amountRaw = amt22;
+                }
+                if (amountRaw <= 0n) {
+                  s.addLog("info", `Sell ALL: у ${b.name} токенов нет`);
+                  return;
+                }
+
+                const tx = new Transaction();
+                if (typeof decimals === "number" && Number.isFinite(decimals)) {
+                  tx.add(
+                    createTransferCheckedInstruction(
+                      srcAta,
+                      mintPk,
+                      dstAta,
+                      kp.publicKey,
+                      amountRaw,
+                      decimals,
+                      [],
+                      useProgram,
+                    ),
+                  );
+                } else {
+                  const { createTransferInstruction } = await import("@solana/spl-token");
+                  tx.add(
+                    createTransferInstruction(
+                      srcAta,
+                      dstAta,
+                      kp.publicKey,
+                      amountRaw,
+                      [],
+                      useProgram,
+                    ),
+                  );
+                }
+
+                const { blockhash } = await connection.getLatestBlockhash("finalized");
+                tx.feePayer = kp.publicKey;
+                (tx as any).recentBlockhash = blockhash;
+                tx.sign(kp);
+                const sig = await connection.sendRawTransaction(tx.serialize(), {
+                  skipPreflight: true,
+                });
+                sigs.push(sig);
+
+                s.addLog(
+                  "ok",
+                  `Sell ALL: ${b.name} → wallet ${
+                    Number(amountRaw) / Math.pow(10, decimals)
+                  } TOK (${sig.slice(0, 8)}…)`,
+                );
+              } catch (e: any) {
+                s.addLog(
+                  "warn",
+                  `Sell ALL transfer ${b.name}: ${e?.message || String(e)}`,
                 );
               }
+            };
 
-              const { blockhash } = await connection.getLatestBlockhash("finalized");
-              tx.feePayer = kp.publicKey;
-              (tx as any).recentBlockhash = blockhash;
-              tx.sign(kp);
-              const sig = await connection.sendRawTransaction(tx.serialize(), {
-                skipPreflight: true,
-              });
-              await confirmSigHttp(connection, sig);
+            await Promise.allSettled(
+              bots.map((b) => limit(() => transferFromBotToWallet(b))),
+            );
 
-              s.addLog(
-                "ok",
-                `Sell ALL: ${b.name} → wallet ${
-                  Number(amountRaw) / Math.pow(10, decimals)
-                } TOK (${sig.slice(0, 8)}…)`,
-              );
-            } catch (e: any) {
-              s.addLog("warn", `Sell ALL transfer ${s.bots[i].name}: ${e?.message || String(e)}`);
+            if (sigs.length) {
+              try {
+                await confirmManyHttp(connection, sigs, {
+                  pollMs: 250,
+                  timeoutMs: 20000,
+                  searchTransactionHistory: true,
+                });
+              } catch {}
             }
-            if (i < s.bots.length - 1) await new Promise((r) => setTimeout(r, 1200));
-          }
 
             try {
               const walletClassic = await getAssociatedTokenAddress(
@@ -3313,129 +3356,141 @@ export const useStore = create<Store>()(
           }
         },
 
-        autoTick() {
-          const s = get();
-          if (!s.autoMode) return;
-          const cs = s.candles;
-          if (cs.length < 25) return;
+          autoTick() {
+            const s = get();
+            if (!s.autoMode) return;
+            const cs = s.candles;
+            if (cs.length < 25) return;
 
-          const { slopeLookback, volLookback, slopeThr, volThr } = s.autoCfg;
-          const lastN = cs.slice(-Math.max(slopeLookback, volLookback));
-          const prices = lastN.map((c: any) => c.close as number);
-          const p0 = prices[0];
-          const p1 = prices[prices.length - 1];
-          if (!p0) return;
+            const { slopeLookback, volLookback, slopeThr, volThr } = s.autoCfg;
+            const lastN = cs.slice(-Math.max(slopeLookback, volLookback));
+            const prices = lastN.map((c: any) => c.close as number);
+            const p0 = prices[0];
+            const p1 = prices[prices.length - 1];
+            if (!p0) return;
 
-          const slope = (p1 - p0) / p0;
-          const mean = prices.reduce((a, b) => a + b, 0) / prices.length;
-          const sd =
-            Math.sqrt(
-              prices.reduce((a, b) => a + (b - mean) * (b - mean), 0) /
-                prices.length,
-            ) / Math.max(1e-9, mean);
+            const slope = (p1 - p0) / p0;
+            const mean = prices.reduce((a, b) => a + b, 0) / prices.length;
+            const sd =
+              Math.sqrt(
+                prices.reduce((a, b) => a + (b - mean) * (b - mean), 0) /
+                  prices.length,
+              ) / Math.max(1e-9, mean);
 
-          const trending = Math.abs(slope) > slopeThr;
-          const noisy = sd > volThr;
+            const trending = Math.abs(slope) > slopeThr;
+            const noisy = sd > volThr;
 
-          let desired: Array<{
-            type: "trend" | "revert" | "scalper";
-            share: number;
-          }>;
-          if (trending) {
-            desired = noisy
-              ? [
-                  { type: "trend", share: 0.6 },
-                  { type: "scalper", share: 0.25 },
-                  { type: "revert", share: 0.15 },
-                ]
-              : [
-                  { type: "trend", share: 0.7 },
-                  { type: "revert", share: 0.2 },
-                  { type: "scalper", share: 0.1 },
-                ];
-          } else {
-            desired = noisy
-              ? [
-                  { type: "revert", share: 0.55 },
-                  { type: "trend", share: 0.3 },
-                  { type: "scalper", share: 0.15 },
-                ]
-              : [
-                  { type: "revert", share: 0.6 },
-                  { type: "trend", share: 0.3 },
-                  { type: "scalper", share: 0.1 },
-                ];
-          }
-
-          const bots = [...s.bots];
-          const free = bots.filter((b) => !b.manualLock);
-          if (free.length === 0) return;
-
-          const total = free.length;
-          const counts = desired.map((x) => ({
-            type: x.type,
-            n: Math.round(x.share * total),
-          }));
-          let sum = counts.reduce((a, c) => a + c.n, 0);
-          while (sum < total) {
-            counts[0].n++;
-            sum++;
-          }
-          while (sum > total) {
-            counts[0].n--;
-            sum--;
-          }
-
-          const profiles = {
-            trend: (i: number) => ({
-              strategy: "trend" as const,
-              speedMs: 5000 + (i % 3) * 2000,
-              budgetSol: 0.02 + (i % 2) * 0.01,
-            }),
-            revert: (i: number) => ({
-              strategy: "revert" as const,
-              speedMs: 9000 + (i % 3) * 3000,
-              budgetSol: 0.015,
-            }),
-            scalper: (i: number) => ({
-              strategy: "scalper" as const,
-              speedMs: 1500 + (i % 3) * 500,
-              budgetSol: 0.008,
-            }),
-            momentum: (i: number) => ({
-              strategy: "momentum" as const,
-              speedMs: 4000 + (i % 3) * 1500,
-              budgetSol: 0.02,
-            }),
-            range: (i: number) => ({
-              strategy: "range" as const,
-              speedMs: 7000 + (i % 3) * 2000,
-              budgetSol: 0.015,
-            }),
-            maker: (i: number) => ({
-              strategy: "maker" as const,
-              speedMs: 2500 + (i % 3) * 800,
-              budgetSol: 0.006,
-            }),
-          } as const;
-
-          let idx = 0;
-          const newBots = bots.map((b) => {
-            if (b.manualLock) return b;
-            let bucket: BotStrategy = "trend";
-            for (const c of counts) {
-              if (c.n > 0) {
-                bucket = c.type as any;
-                c.n--;
-                break;
-              }
+            let desired: Array<{ type: BotStrategy; share: number }>;
+            if (trending) {
+              desired = [
+                { type: "trend", share: 0.35 },
+                { type: "momentum", share: 0.25 },
+                { type: "scalper", share: 0.2 },
+                { type: "revert", share: 0.15 },
+                { type: "maker", share: 0.05 },
+              ];
+            } else if (noisy) {
+              desired = [
+                { type: "revert", share: 0.35 },
+                { type: "scalper", share: 0.25 },
+                { type: "trend", share: 0.2 },
+                { type: "range", share: 0.15 },
+                { type: "maker", share: 0.05 },
+              ];
+            } else {
+              desired = [
+                { type: "revert", share: 0.3 },
+                { type: "trend", share: 0.25 },
+                { type: "range", share: 0.2 },
+                { type: "scalper", share: 0.15 },
+                { type: "maker", share: 0.1 },
+              ];
             }
-            const prof = profiles[bucket](idx++);
-            return { ...b, ...prof };
-          });
 
-          set({ bots: newBots });
-        },
+            const bots = [...s.bots];
+            const free = bots.filter((b) => !b.manualLock);
+            if (free.length === 0) return;
+
+            const total = free.length;
+            const counts = desired.map((x) => ({
+              type: x.type,
+              n: Math.round(x.share * total),
+            }));
+            let sum = counts.reduce((a, c) => a + c.n, 0);
+            let adjIdx = 0;
+            while (sum !== total && counts.length > 0) {
+              const target = counts[adjIdx % counts.length];
+              if (!target) break;
+              if (sum < total) {
+                target.n++;
+                sum++;
+              } else if (target.n > 0) {
+                target.n--;
+                sum--;
+              }
+              adjIdx++;
+            }
+
+            const sampleRange = (min: number, max: number, i: number) => {
+              const span = Math.max(0, max - min);
+              if (span === 0) return min;
+              const phase = ((i % 7) + Math.random()) / 7;
+              return min + span * Math.min(1, Math.max(0, phase));
+            };
+
+            const profiles: Record<
+              BotStrategy,
+              (i: number) => { strategy: BotStrategy; speedMs: number; budgetSol: number }
+            > = {
+              trend: (i: number) => ({
+                strategy: "trend",
+                speedMs: Math.round(sampleRange(4500, 8000, i)),
+                budgetSol: +sampleRange(0.015, 0.03, i).toFixed(6),
+              }),
+              momentum: (i: number) => ({
+                strategy: "momentum",
+                speedMs: Math.round(sampleRange(3000, 6500, i)),
+                budgetSol: +sampleRange(0.02, 0.035, i).toFixed(6),
+              }),
+              scalper: (i: number) => ({
+                strategy: "scalper",
+                speedMs: Math.round(sampleRange(1200, 2500, i)),
+                budgetSol: +sampleRange(0.006, 0.015, i).toFixed(6),
+              }),
+              revert: (i: number) => ({
+                strategy: "revert",
+                speedMs: Math.round(sampleRange(8000, 12000, i)),
+                budgetSol: +sampleRange(0.012, 0.02, i).toFixed(6),
+              }),
+              range: (i: number) => ({
+                strategy: "range",
+                speedMs: Math.round(sampleRange(6500, 9500, i)),
+                budgetSol: +sampleRange(0.01, 0.018, i).toFixed(6),
+              }),
+              maker: (i: number) => ({
+                strategy: "maker",
+                speedMs: Math.round(sampleRange(1800, 3500, i)),
+                budgetSol: +sampleRange(0.004, 0.009, i).toFixed(6),
+              }),
+            };
+
+            let idx = 0;
+            const newBots = bots.map((b) => {
+              if (b.manualLock) return b;
+              let bucket: BotStrategy = "trend";
+              for (const c of counts) {
+                if (c.n > 0) {
+                  bucket = c.type;
+                  c.n--;
+                  break;
+                }
+              }
+              const prof = (profiles[bucket] || profiles.trend)(idx++);
+              return { ...b, ...prof };
+            });
+
+            set({ bots: newBots });
+          },
 
         // Аллокация по умолчанию: 70% токен / 30% SOL, коридор 60..85
         allocTarget: 0.7,
@@ -3519,6 +3574,7 @@ export const useStore = create<Store>()(
           if (typeof p.autoStartJitterMs !== "number") p.autoStartJitterMs = 400;
           if (typeof p.autoStartAfterReload !== "boolean")
             p.autoStartAfterReload = false;
+          if (typeof p.fastDrain !== "boolean") p.fastDrain = true;
         return p;
       },
       storage: createJSONStorage(() => localStorage),
@@ -3542,6 +3598,7 @@ export const useStore = create<Store>()(
           topUpToSol: s.topUpToSol,
           drainMinKeepSol: s.drainMinKeepSol,
           drainDelayMs: s.drainDelayMs,
+          fastDrain: s.fastDrain,
           treasuryKeyId: s.treasuryKeyId,
           resumeBotsOnLoad: s.resumeBotsOnLoad,
           autoStartDelayMs: s.autoStartDelayMs,
