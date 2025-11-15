@@ -12,8 +12,14 @@ import { safeMultiply, safeAdd } from "../utils/number";
 import { confirmSigHttp } from "../utils/confirm";
 
 /* ───────────────────────────── Types ───────────────────────────── */
-type BotStrategy = "trend" | "revert" | "scalper";
-type InternalStrategy = BotStrategy | "momentum" | "range" | "maker";
+type BotStrategy =
+  | "trend"
+  | "revert"
+  | "scalper"
+  | "momentum"
+  | "range"
+  | "maker";
+type InternalStrategy = BotStrategy;
 
 type LiveBot = {
   id: string;
@@ -289,7 +295,7 @@ function capsForStrategy(s: InternalStrategy) {
     case "momentum":
       return {
         buySlice: 0.0018,
-        sellPct: 0.12,
+        sellPct: 0.1,
         stepMulMin: 1.1,
         stepMulMax: 1.3,
       };
@@ -302,7 +308,7 @@ function capsForStrategy(s: InternalStrategy) {
       };
     case "maker":
       return {
-        buySlice: 0.0006,
+        buySlice: 0.0005,
         sellPct: 0.06,
         stepMulMin: 0.4,
         stepMulMax: 0.5,
@@ -1504,8 +1510,9 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
 
       priceHist.push(p);
       if (priceHist.length > 120) priceHist.shift();
-      const fast = ctx.changeFast?.(12) ?? 0;
-      const ch1m = ctx.change1m();
+    const fast = ctx.changeFast?.(12) ?? 0;
+    const ch1m = ctx.change1m();
+    const volScore = Math.max(Math.abs(fast), Math.abs(ch1m));
 
       const { a: allocTok, total } = alloc(p);
       const portfolioNow = bot.solBalance + bot.posToken * p;
@@ -1879,20 +1886,25 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
             const r = (p - avg) / Math.max(1e-9, avg);
             return r >= 0.012 || r <= -0.005;
           })();
-          if (wantSell || allocTok > MAX_ALLOC || protect) {
-            const desiredTokVal = TARGET_ALLOC * total;
-            const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
-            const part = Math.min(
-              bot.posToken,
-              roundTok(
-                Math.max(bot.posToken * 0.12, (excessVal * 0.45) / p),
+            if (wantSell || allocTok > MAX_ALLOC || protect) {
+              const desiredTokVal = TARGET_ALLOC * total;
+              const excessVal = Math.max(0, bot.posToken * p - desiredTokVal);
+              let part = Math.min(
+                bot.posToken,
+                roundTok(
+                  Math.max(bot.posToken * 0.12, (excessVal * 0.45) / p),
+                  getDec(),
+                ),
+              );
+              const maxSlice = roundTok(
+                Math.max(0, bot.posToken * (0.2 + Math.random() * 0.05)),
                 getDec(),
-              ),
-            );
-            if (part > 0) {
-              const sold = await trade("sell", 0, { sellTokens: part });
-              if (sold) did = true;
-            }
+              );
+              if (maxSlice > 0) part = Math.min(part, maxSlice);
+              if (part > 0) {
+                const sold = await trade("sell", 0, { sellTokens: part });
+                if (sold) did = true;
+              }
           } else if (bot.posToken > 0 && buysInRow >= 2) {
             const shave = roundTok(
               Math.max(
@@ -1999,64 +2011,70 @@ export function runBot(connection: Connection, bot: LiveBot, ctx: RunCtx) {
           break;
         }
         case "maker": {
-          if (!protect && allocTok < MAX_ALLOC && haveSol) {
-            const size = Math.min(pickStep() * 0.6, baseSize);
-            if (Math.random() < 0.6 && size >= EXEC_MIN_SOL) {
-              const bought = await twapBuy(size);
-              if (bought) {
-                did = true;
-                break;
+            const shortVol = Math.abs(fast);
+            const buyProb = Math.min(
+              0.6,
+              0.2 + shortVol * 6 + Math.max(0, fast) * 4 + volScore * 2,
+            );
+            const sellProb = Math.min(
+              0.6,
+              0.2 + volScore * 4 + Math.max(0, -fast) * 6,
+            );
+            if (!protect && allocTok < MAX_ALLOC && haveSol) {
+              const size = Math.min(pickStep() * 0.6, baseSize);
+              if (size >= EXEC_MIN_SOL && Math.random() < buyProb) {
+                const bought = await twapBuy(size);
+                if (bought) {
+                  did = true;
+                  break;
+                }
               }
             }
-          }
-          if (
-            bot.posToken > 0 &&
-            (allocTok > TARGET_ALLOC || protect || Math.random() < 0.35)
-          ) {
-            const part = roundTok(
-              Math.max(bot.posToken * 0.07, bot.posToken * Math.random() * 0.1),
-              getDec(),
-            );
-            if (part > 0) {
-              const sold = await trade("sell", 0, { sellTokens: part });
-              if (sold) did = true;
+            const wantMakerSell =
+              allocTok > TARGET_ALLOC || protect || Math.random() < sellProb;
+            if (bot.posToken > 0 && wantMakerSell) {
+              const part = roundTok(
+                Math.max(bot.posToken * 0.07, bot.posToken * Math.random() * 0.1),
+                getDec(),
+              );
+              if (part > 0) {
+                const sold = await trade("sell", 0, { sellTokens: part });
+                if (sold) did = true;
+              }
+            } else if (!did && bot.posToken > 0 && !deferredSell) {
+              const planned = roundTok(
+                Math.max(
+                  bot.posToken * 0.03,
+                  bot.posToken * 0.02 + Math.random() * bot.posToken * 0.03,
+                ),
+                getDec(),
+              );
+              scheduleSell(planned, 1200, 2600);
             }
-          } else if (!did && bot.posToken > 0 && !deferredSell) {
-            const planned = roundTok(
-              Math.max(
-                bot.posToken * 0.03,
-                bot.posToken * 0.02 + Math.random() * bot.posToken * 0.03,
-              ),
-              getDec(),
-            );
-            scheduleSell(planned, 1200, 2600);
-          }
           break;
         }
       }
 
-      if (!did) {
-        // универсальное бритьё позиции для сглаживания
-        if (bot.posToken > 0) {
-          const sinceSell = Date.now() - (lastSellTs || 0);
-          if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
-            const shave = roundTok(
-              Math.max(
-                bot.posToken * 0.05,
-                bot.posToken * 0.05 + Math.random() * bot.posToken * 0.04,
-              ),
-              getDec(),
-            );
-            if (shave > 0) {
-              const sold = await trade("sell", 0, { sellTokens: shave });
-              if (sold) {
-                pending = false;
-                const jitter = 200 + Math.floor(Math.random() * 300);
-                return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+        if (!did) {
+          // универсальное бритьё позиции для сглаживания
+          if (bot.posToken > 0) {
+            const sinceSell = Date.now() - (lastSellTs || 0);
+            if (buysInRow >= 2 || sinceSell > Math.max(7000, bot.speedMs * 2)) {
+              const minShave = bot.posToken * 0.03;
+              const maxShave = bot.posToken * 0.07;
+              const rawShave =
+                minShave + Math.random() * Math.max(0, maxShave - minShave);
+              const shave = roundTok(rawShave, getDec());
+              if (shave > 0) {
+                const sold = await trade("sell", 0, { sellTokens: shave });
+                if (sold) {
+                  pending = false;
+                  const jitter = 200 + Math.floor(Math.random() * 300);
+                  return setTimeout(loop, Math.max(400, bot.speedMs) + jitter);
+                }
               }
             }
           }
-        }
         const idleNow = Date.now();
           if (idleNow - lastIdleBalanceRefreshAt >= IDLE_BAL_REFRESH_MS) {
             try {
