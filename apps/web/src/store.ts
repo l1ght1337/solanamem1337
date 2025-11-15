@@ -169,7 +169,20 @@ const calcPriorityFeeSol = (mult = 1) =>
 
 const MAX_PARALLEL_SENDS = Math.max(
   4,
-  Number((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS ?? 14),
+  Number((import.meta as any).env?.VITE_MAX_PARALLEL_SENDS ?? 20),
+);
+
+const SELL_WALLET_PAR = Math.max(
+  2,
+  Math.min(
+    MAX_PARALLEL_SENDS,
+    Number((import.meta as any).env?.VITE_SELL_WALLET_PAR ?? 10),
+  ),
+);
+
+const DRAIN_PARALLEL = Math.max(
+  2,
+  Number((import.meta as any).env?.VITE_DRAIN_PAR ?? 8),
 );
 
 const DRAIN_FAST_MS = Math.max(
@@ -229,6 +242,106 @@ export type LiveBot = {
   lastError?: string;
     hb?: number;
 };
+
+function assignHypeProfile(bots: LiveBot[]): LiveBot[] {
+  if (!Array.isArray(bots) || bots.length === 0) return bots;
+  const unlocked = bots
+    .map((bot, idx) => ({ bot, idx }))
+    .filter(({ bot }) => !bot.manualLock);
+  if (unlocked.length === 0) return bots;
+
+  const total = unlocked.length;
+  const scale = total / 50;
+  const plan = {
+    sniper: Math.max(1, Math.round(5 * scale)),
+    core: Math.max(1, Math.round(20 * scale)),
+    revert: Math.max(1, Math.round(15 * scale)),
+    maker: Math.max(1, Math.round(10 * scale)),
+  };
+  const order = ["sniper", "core", "revert", "maker"] as const;
+  let sum = order.reduce((acc, key) => acc + plan[key], 0);
+  while (sum > total) {
+    for (const key of [...order].reverse()) {
+      if (plan[key] > 1 && sum > total) {
+        plan[key]--;
+        sum--;
+      }
+    }
+  }
+  while (sum < total) {
+    for (const key of order) {
+      if (sum >= total) break;
+      plan[key]++;
+      sum++;
+    }
+  }
+
+  const buckets = [
+    ...Array(plan.sniper).fill("sniper"),
+    ...Array(plan.core).fill("core"),
+    ...Array(plan.revert).fill("revert"),
+    ...Array(plan.maker).fill("maker"),
+  ] as Array<"sniper" | "core" | "revert" | "maker">;
+  if (!buckets.length) return bots;
+
+  const sample = (min: number, max: number) =>
+    min + Math.random() * Math.max(0, max - min);
+
+  const patchFor = (bucket: "sniper" | "core" | "revert" | "maker", idx: number) => {
+    switch (bucket) {
+      case "sniper": {
+        const strategy: BotStrategy = idx % 2 === 0 ? "momentum" : "trend";
+        return {
+          strategy,
+          speedMs: Math.round(sample(1500, 2500)),
+          budgetSol: +sample(0.025, 0.045).toFixed(6),
+        };
+      }
+      case "core": {
+        const strategy: BotStrategy = idx % 3 === 0 ? "range" : "trend";
+        return {
+          strategy,
+          speedMs: Math.round(sample(4000, 8000)),
+          budgetSol: +sample(0.015, 0.03).toFixed(6),
+        };
+      }
+      case "revert": {
+        const strategy: BotStrategy = idx % 2 === 0 ? "revert" : "scalper";
+        return {
+          strategy,
+          speedMs: Math.round(sample(2800, 5200)),
+          budgetSol: +sample(0.009, 0.018).toFixed(6),
+        };
+      }
+      case "maker":
+      default:
+        return {
+          strategy: "maker",
+          speedMs: Math.round(sample(6000, 11000)),
+          budgetSol: +sample(0.004, 0.0075).toFixed(6),
+        };
+    }
+  };
+
+  let bucketIdx = 0;
+  let changed = false;
+  const next = bots.map((bot) => {
+    if (bot.manualLock) return bot;
+    const bucket = buckets[bucketIdx % buckets.length];
+    bucketIdx++;
+    const patch = patchFor(bucket, bucketIdx);
+    if (
+      bot.strategy === patch.strategy &&
+      Math.abs(bot.speedMs - patch.speedMs) < 1 &&
+      Math.abs((bot.budgetSol ?? 0) - patch.budgetSol) < 1e-6
+    ) {
+      return bot;
+    }
+    changed = true;
+    return { ...bot, ...patch };
+  });
+  return changed ? next : bots;
+}
 
 type Log = { ts: string; level: "info" | "ok" | "warn" | "err"; msg: string };
 const now = () => new Date().toLocaleTimeString();
@@ -1099,7 +1212,7 @@ export const useStore = create<Store>()(
 
         // Drain
         drainMinKeepSol: 0.01,
-        drainDelayMs: 30_000,
+        drainDelayMs: 4_500,
           fastDrain: true,
 
         _ppSub: undefined as any,
@@ -1342,31 +1455,43 @@ export const useStore = create<Store>()(
         },
 
         async drainAllTo(connection, destAddress) {
-          const bots = get().bots.slice();
-          if (!get().fastDrain) {
-            const delay = get().drainDelayMs;
-            for (let i = 0; i < bots.length; i++) {
-              await get().drainBotTo(connection, bots[i].id, destAddress);
-              if (i < bots.length - 1) {
-                await new Promise((r) => setTimeout(r, delay));
-              }
-            }
-          } else {
-            const parEnv = Number((import.meta as any).env?.VITE_DRAIN_PAR ?? 8);
-            const limit = createLimiter(Math.max(3, parEnv));
-            await Promise.allSettled(
-              bots.map((b) =>
-                limit(async () => {
-                  const started = Date.now();
-                  await get().drainBotTo(connection, b.id, destAddress);
-                  const elapsed = Date.now() - started;
-                  if (elapsed < DRAIN_FAST_MS) {
-                    await new Promise((r) => setTimeout(r, DRAIN_FAST_MS - elapsed));
-                  }
-                }),
-              ),
-            );
+          const state = get();
+          const bots = state.bots.slice();
+          if (bots.length === 0) {
+            await state.refreshBalances(connection);
+            return;
           }
+
+          const baseParallel = Math.max(2, Math.min(12, DRAIN_PARALLEL));
+          const fast = state.fastDrain;
+          const limit = createLimiter(
+            fast ? baseParallel : Math.max(1, Math.ceil(baseParallel / 2)),
+          );
+          const targetDelay = fast
+            ? DRAIN_FAST_MS
+            : Math.max(2_000, state.drainDelayMs);
+          const startJitter = fast
+            ? Math.min(600, Math.floor(targetDelay * 0.35))
+            : Math.min(1_500, Math.floor(targetDelay * 0.5));
+
+          await Promise.allSettled(
+            bots.map((b, idx) =>
+              limit(async () => {
+                if (!fast && idx > 0 && startJitter > 0) {
+                  await new Promise((r) =>
+                    setTimeout(r, Math.floor(Math.random() * startJitter)),
+                  );
+                }
+                const started = Date.now();
+                await get().drainBotTo(connection, b.id, destAddress);
+                const elapsed = Date.now() - started;
+                const pad = Math.max(0, targetDelay - elapsed);
+                if (pad > 0) {
+                  await new Promise((r) => setTimeout(r, pad));
+                }
+              }),
+            ),
+          );
           await get().refreshBalances(connection);
         },
 
@@ -1841,7 +1966,16 @@ export const useStore = create<Store>()(
             } catch (e: any) {
               s.addLog("warn", `startAll pre-refresh: ${e?.message || e}`);
             }
-            const decimals = s._mintDecimals ?? 9;
+            try {
+              const nextBots = assignHypeProfile(get().bots);
+              if (nextBots !== get().bots) {
+                set({ bots: nextBots });
+                get().addLog("info", "startAll: распределены профили ботов");
+              }
+            } catch (e: any) {
+              get().addLog("warn", `startAll assign profiles: ${e?.message || e}`);
+            }
+            const decimals = get()._mintDecimals ?? 9;
             const price = s.price || 0;
             const wsProvider = s.external.provider || "none";
             s.addLog(
@@ -2332,7 +2466,7 @@ export const useStore = create<Store>()(
 
             // --- после confirmManyHttp(...) перед сборкой payload на продажу:
             try {
-              await new Promise((r) => setTimeout(r, 120));
+              await new Promise((r) => setTimeout(r, 110));
             } catch {}
 
           // SELLALL-FIX: устойчивое ожидание прихода токенов и чтение classic+2022
@@ -3088,6 +3222,19 @@ export const useStore = create<Store>()(
             return;
           }
 
+            const walletAtaClassic = await getAssociatedTokenAddress(
+              mintPk,
+              walletPk,
+              false,
+              TOKEN_PROGRAM_ID,
+            );
+            const walletAta2022 = await getAssociatedTokenAddress(
+              mintPk,
+              walletPk,
+              false,
+              TOKEN_2022_PROGRAM_ID,
+            );
+
             const bots = s.bots.slice();
             const decodeAmount = (acc: any): bigint => {
               try {
@@ -3100,8 +3247,11 @@ export const useStore = create<Store>()(
                 return 0n;
               }
             };
-            const softParallel = Math.max(1, Math.floor(MAX_PARALLEL_SENDS / 2));
-            const limit = createLimiter(softParallel);
+            const walletTransferPar = Math.max(
+              1,
+              Math.min(MAX_PARALLEL_SENDS, SELL_WALLET_PAR),
+            );
+            const limit = createLimiter(walletTransferPar);
             const sigs: string[] = [];
 
             const transferFromBotToWallet = async (b: LiveBot) => {
@@ -3123,18 +3273,8 @@ export const useStore = create<Store>()(
                   false,
                   TOKEN_2022_PROGRAM_ID,
                 );
-                const dstClassic = await getAssociatedTokenAddress(
-                  mintPk,
-                  walletPk,
-                  false,
-                  TOKEN_PROGRAM_ID,
-                );
-                const dst22 = await getAssociatedTokenAddress(
-                  mintPk,
-                  walletPk,
-                  false,
-                  TOKEN_2022_PROGRAM_ID,
-                );
+                  const dstClassic = walletAtaClassic;
+                  const dst22 = walletAta2022;
 
                 const [srcCInfo, src22Info] = await connection.getMultipleAccountsInfo([
                   srcClassic,
@@ -3223,24 +3363,12 @@ export const useStore = create<Store>()(
               } catch {}
             }
 
-            try {
-              const walletClassic = await getAssociatedTokenAddress(
-                mintPk,
-                walletPk,
-                false,
-                TOKEN_PROGRAM_ID,
-              );
-              const wallet22 = await getAssociatedTokenAddress(
-                mintPk,
-                walletPk,
-                false,
-                TOKEN_2022_PROGRAM_ID,
-              );
-
-              const [walletClassicInfo, wallet22Info] = await connection.getMultipleAccountsInfo([
-                walletClassic,
-                wallet22,
-              ]);
+              try {
+                const [walletClassicInfo, wallet22Info] =
+                  await connection.getMultipleAccountsInfo([
+                    walletAtaClassic,
+                    walletAta2022,
+                  ]);
               const decodeAmount = (acc: any): bigint => {
                 try {
                   if (!acc || !acc.data || acc.data.byteLength < 72) return 0n;
@@ -3575,6 +3703,13 @@ export const useStore = create<Store>()(
           if (typeof p.autoStartAfterReload !== "boolean")
             p.autoStartAfterReload = false;
           if (typeof p.fastDrain !== "boolean") p.fastDrain = true;
+          if (
+            typeof p.drainDelayMs !== "number" ||
+            !Number.isFinite(p.drainDelayMs) ||
+            p.drainDelayMs > 20_000
+          ) {
+            p.drainDelayMs = 4_500;
+          }
         return p;
       },
       storage: createJSONStorage(() => localStorage),
